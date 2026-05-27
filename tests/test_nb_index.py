@@ -307,16 +307,24 @@ class TestIndexLocation:
         # Create 'sub' so the path is structurally valid before resolve().
         (tmp_path / "sub").mkdir(exist_ok=True)
         dotdot = tmp_path / "sub" / ".." / "nb.ipynb"
-        # The dotdot string resolves to the same real file; --force ensures a rebuild.
+        # Capture the inode before the second run; os.replace() creates a new inode
+        # on write, so a changed inode proves the second run actually wrote to idx1.
+        inode_before_second = idx1.stat().st_ino
         r2 = run_indexer(dotdot, extra_args=["--force"])
         assert r2.returncode == 0, (
             f"Indexing via non-canonical path must succeed: {r2.stderr}"
         )
-        # The index must be written to the same location (same inode after a second write
-        # would be different, but the PATH must be the same file we already know about).
-        idx2 = index_path_for(nb)  # canonical form
-        assert idx2 == idx1, "Both path forms must produce the same index path"
-        assert idx2.exists(), "Index must exist after second run"
+        # The index must still be at the canonical location and have been refreshed.
+        assert idx1.exists(), "Index must exist after second run"
+        # os.replace() allocates a new inode — if the inode changed, the second run
+        # wrote to the correct (canonical) path and did not create a separate file.
+        assert idx1.stat().st_ino != inode_before_second, (
+            "Second run must have written a new index file at the canonical location "
+            "(inode must change after os.replace())"
+        )
+        # Sanity: no extra index JSON outside .nb_index/
+        extra = [p for p in tmp_path.rglob("*.json") if p.parent.name != ".nb_index"]
+        assert extra == [], f"Unexpected JSON files outside .nb_index/: {extra}"
 
     def test_containment_invariant_index_inside_nb_index(self, tmp_path):
         """§1.7: the constructed index path must always be inside .nb_index/, never above it.
@@ -851,10 +859,12 @@ class TestSectionExtraction:
     def test_h3_does_not_close_h2_section(self, tmp_path):
         """§5.3: deeper heading does not close a shallower section"""
         cells = [
-            markdown_cell("## Main", cell_id="m0"),
-            code_cell("x = 1", cell_id="c1"),
-            markdown_cell("### Sub", cell_id="m2"),
-            code_cell("y = 2", cell_id="c3"),
+            markdown_cell("## Main", cell_id="m0"),    # idx 0
+            code_cell("x = 1", cell_id="c1"),          # idx 1  → section "Main"
+            markdown_cell("### Sub", cell_id="m2"),    # idx 2
+            code_cell("y = 2", cell_id="c3"),          # idx 3  → section "Sub"
+            markdown_cell("## Main2", cell_id="m4"),   # idx 4  — same level as Main, closes Sub
+            code_cell("z = 3", cell_id="c5"),          # idx 5  → section "Main2"
         ]
         nb = make_notebook(cells, tmp_path=tmp_path)
         run_indexer(nb)
@@ -864,6 +874,11 @@ class TestSectionExtraction:
         # Cells[3] (under h3) are in section "Sub" (the innermost heading).
         assert data["cells"][3]["section"] == "Sub", (
             "Cell under h3 must be in the h3 sub-section, not the parent h2 section"
+        )
+        # A second h2 must close the h3 sub-section.
+        # A wrong stack-pop implementation would assign "Main" or "Sub" here.
+        assert data["cells"][5]["section"] == "Main2", (
+            "Cell under ## Main2 must be in 'Main2', not the preceding h3 sub-section"
         )
 
 
@@ -1217,12 +1232,17 @@ class TestOutputStorage:
         assert "world" in cell.get("output_text", "")
 
     def test_ansi_stripped_from_output_text(self, tmp_path):
-        """A4 pipeline step 4: ANSI sequences must not appear in stored output_text"""
+        """A4 pipeline step 4: ANSI sequences stripped, non-ANSI content preserved"""
         ansi_output = "\x1b[31mred\x1b[0m\n"
         cell = self._run(
             [code_cell("x", outputs=[stream_output(ansi_output)])],
             tmp_path
         )
+        # Positive: the visible content must survive stripping
+        assert "red" in cell.get("output_text", ""), (
+            "Non-ANSI content must be preserved after stripping"
+        )
+        # Negative: no escape sequences must remain
         assert "\x1b[" not in cell.get("output_text", ""), (
             "ANSI escape sequences must be stripped from stored output_text"
         )
@@ -1295,14 +1315,18 @@ class TestWriteIntegration:
         stub, log = self._mock_indexer(tmp_path)
         write_copy = self._patch_write_script_path(tmp_path, stub)
         nb_path = tmp_path / "nb.ipynb"
-        # First create the notebook
+        # Create the notebook and insert a cell so patch/delete have a valid target.
         subprocess.run(
             [PYTHON, str(write_copy), str(nb_path), "create", "--python"],
             capture_output=True
         )
-        # Write a source file for patch
         src = tmp_path / "src.py"
         src.write_text("x = 42\n", encoding="utf-8")
+        subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "insert", "0", "code", "-f", str(src)],
+            capture_output=True
+        )
+        # Now patch cell 0 (which exists)
         r = subprocess.run(
             [PYTHON, str(write_copy), str(nb_path), "patch", "0", "-f", str(src)],
             capture_output=True, text=True
@@ -1333,8 +1357,15 @@ class TestWriteIntegration:
         stub, log = self._mock_indexer(tmp_path)
         write_copy = self._patch_write_script_path(tmp_path, stub)
         nb_path = tmp_path / "nb.ipynb"
+        # Create the notebook and insert a cell so delete has a valid target.
         subprocess.run(
             [PYTHON, str(write_copy), str(nb_path), "create", "--python"],
+            capture_output=True
+        )
+        src = tmp_path / "src.py"
+        src.write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "insert", "0", "code", "-f", str(src)],
             capture_output=True
         )
         r = subprocess.run(
@@ -1357,6 +1388,11 @@ class TestWriteIntegration:
         )
         src = tmp_path / "src.py"
         src.write_text("x = 1\n", encoding="utf-8")
+        # Insert a cell first so patch has a valid target.
+        subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "insert", "0", "code", "-f", str(src)],
+            capture_output=True
+        )
         r = subprocess.run(
             [PYTHON, str(write_copy), str(nb_path), "patch", "0", "-f", str(src)],
             capture_output=True, text=True
@@ -1376,6 +1412,11 @@ class TestWriteIntegration:
         )
         src = tmp_path / "src.py"
         src.write_text("x = 1\n", encoding="utf-8")
+        # Insert a cell first so patch has a valid target (create makes a 0-cell notebook).
+        subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "insert", "0", "code", "-f", str(src)],
+            capture_output=True
+        )
         subprocess.run(
             [PYTHON, str(write_copy), str(nb_path), "patch", "0", "-f", str(src)],
             capture_output=True
@@ -1638,12 +1679,23 @@ class TestEdgeCases:
         )
 
     def test_no_orphaned_tmp_files_after_rapid_writes(self, tmp_path):
-        """§14.6: rapid successive index writes must not leave .nb_tmp files"""
+        """§14.6: rapid successive index writes must not leave any temporary files.
+
+        We check for ALL non-.json files in .nb_index/ — this catches .nb_tmp, .tmp,
+        .json.tmp, randomly-named temp files, and any other intermediate suffix the
+        implementation might use, not just the single *.nb_tmp pattern.
+        """
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         for _ in range(5):
             run_indexer(nb, extra_args=["--force"])
-        tmp_files = list((tmp_path / ".nb_index").glob("*.nb_tmp"))
-        assert tmp_files == [], f"Orphaned tmp files found: {tmp_files}"
+        nb_index_dir = tmp_path / ".nb_index"
+        non_json = [
+            p for p in nb_index_dir.iterdir()
+            if p.suffix != ".json"
+        ]
+        assert non_json == [], (
+            f"Orphaned non-JSON files found in .nb_index/: {non_json}"
+        )
 
     def test_cells_have_i_field(self, tmp_path):
         """Schema: each cell entry must have an 'i' field (cell index)"""
@@ -1664,16 +1716,30 @@ class TestEdgeCases:
         assert data["cells"][1]["type"] == "markdown"
 
     def test_schema_tolerates_unknown_top_level_keys(self, tmp_path):
-        """Schema compat: unknown keys in index must not cause nb-read/nb-search to crash"""
+        """Schema compat: unknown keys in index must not cause the indexer to crash.
+
+        The only code path that READS the existing index is the staleness check.
+        We inject an unknown key, then re-run WITHOUT --force so the staleness check
+        must parse the modified JSON.  The notebook is unchanged, so the indexer should
+        determine it is fresh, exit 0, and leave the file untouched (unknown key survives).
+        """
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         run_indexer(nb)
         idx = index_path_for(nb)
         data = load_index(idx)
         data["_future_extension"] = "some_value"
         idx.write_text(json.dumps(data), encoding="utf-8")
-        # Re-index should overwrite it (this also verifies no crash on read)
-        r = run_indexer(nb, extra_args=["--force"])
-        assert r.returncode == 0
+        # Re-run without --force: notebook unchanged → staleness check reads modified JSON
+        # → must tolerate unknown key and exit 0 without crashing.
+        r = run_indexer(nb)
+        assert r.returncode == 0, (
+            f"Indexer must not crash when index has unknown top-level keys: {r.stderr}"
+        )
+        # The indexer found it fresh and did NOT rebuild, so our injected key survives.
+        surviving = json.loads(idx.read_text(encoding="utf-8"))
+        assert surviving.get("_future_extension") == "some_value", (
+            "Indexer must not overwrite a fresh index; unknown keys must survive a no-op run"
+        )
 
     def test_derived_fields_not_stored_in_index(self, tmp_path):
         """Schema: symbol_index, import_index, and sections are NOT stored in the JSON"""

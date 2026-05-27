@@ -177,15 +177,18 @@ class TestWalkStrategy:
         link = tmp_path / "linked"
         link.symlink_to(real, target_is_directory=True)
         r = run_search(["symlinked", str(tmp_path)])
-        # The real_dir result may appear (it was indexed there) but the symlinked
-        # path must NOT produce a second result.
-        if r.returncode == 0:
-            matching_lines = [l for l in r.stdout.splitlines()
-                              if "symlinked" in l or "nb.ipynb" in l]
-            assert len(matching_lines) <= 1, (
-                f"followlinks=False must prevent duplicate results via symlink; "
-                f"got {len(matching_lines)} lines:\n{r.stdout}"
-            )
+        # The notebook was indexed under real_dir/, so the token IS findable.
+        assert r.returncode == 0, (
+            "Token indexed under real_dir/ must be found; "
+            f"got exit {r.returncode}; stderr: {r.stderr!r}"
+        )
+        # The symlinked path must NOT produce a second result — followlinks=False.
+        matching_lines = [l for l in r.stdout.splitlines()
+                          if "symlinked" in l or "nb.ipynb" in l]
+        assert len(matching_lines) <= 1, (
+            f"followlinks=False must prevent duplicate results via symlink; "
+            f"got {len(matching_lines)} lines:\n{r.stdout}"
+        )
 
     def test_walk_depth_limit(self, tmp_path):
         """§14.9: .nb_index/ at level > 20 must NOT be found"""
@@ -549,9 +552,14 @@ class TestSectionFilter:
             code_cell("shared_token = False\n", cell_id="c3"),
         ]
         make_indexed_project(tmp_path, [("nb.ipynb", cells)])
-        # Search with section filter — should only return c1 (in Data Loading), not c3
+        # Search with section filter — should return c1 (Data Loading) but NOT c3 (Analysis)
         r = run_search(["shared_token", "--section", "Data Loading", str(tmp_path)])
-        # c3 (cell index 3) must NOT appear in results
+        # Positive check first: c1 must be found (otherwise the assertion below is vacuous)
+        assert r.returncode == 0, (
+            "--section filter must still return cell 1 (in 'Data Loading'); "
+            f"got exit {r.returncode}; stderr: {r.stderr!r}"
+        )
+        # Negative check: c3 (cell index 3, in 'Analysis') must NOT appear
         assert ":3:" not in r.stdout, (
             "--section filter must exclude cells from other sections; "
             f"cell 3 (Analysis section) appeared in output: {r.stdout!r}"
@@ -620,8 +628,8 @@ class TestStaleUnindexed:
         os.utime(nb_path, (t, t))
         r = run_search(["stale_token", str(tmp_path)])
         # §12.6: warn AND still return results (exit 0, results in stdout)
-        assert "STALE" in r.stderr, (
-            f"Expected [STALE] warning on stderr for stale index: {r.stderr!r}"
+        assert "[STALE]" in r.stderr, (
+            f"Expected '[STALE]' warning on stderr for stale index: {r.stderr!r}"
         )
         assert r.returncode == 0, (
             "Stale index search must still return results (exit 0), "
@@ -799,14 +807,12 @@ class TestSymbolsJsonFastPath:
         nb_idx = tmp_path / ".nb_index" / "nb.ipynb.json"
         if not nb_idx.exists():
             pytest.skip("Per-notebook index file not found")
-        # Make symbols.json appear stale: set its generated_at to a past time and
-        # bump the per-notebook index mtime so it's newer.
-        sym_data = json.loads(symbols_path.read_text(encoding="utf-8"))
-        sym_data["generated_at"] = "2000-01-01T00:00:00Z"
-        # Also update max_indexed_at to a past value to ensure freshness check fails
-        sym_data["max_indexed_at"] = "2000-01-01T00:00:00Z"
-        symbols_path.write_text(json.dumps(sym_data), encoding="utf-8")
-        future = symbols_path.stat().st_mtime + 100
+        # Isolate the mtime-scan staleness signal (§12.2 step 2):
+        # leave generated_at and max_indexed_at intact (step 1 passes: generated_at >
+        # max_indexed_at in a fresh index), but set nb_idx's mtime to 100 s in the
+        # future so it is newer than symbols.json's generated_at wall-clock timestamp.
+        import time as _time
+        future = _time.time() + 100
         os.utime(nb_idx, (future, future))
         r = run_search(["--symbol", "fallback_func", str(tmp_path)])
         # Must still find the symbol via serial scan fallback

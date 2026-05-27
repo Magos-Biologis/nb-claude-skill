@@ -954,7 +954,10 @@ finds a newer index file. The same version-compatibility rules apply as for
 per-notebook indices (unknown version → skip + warn, fallback to serial scan).
 
 ### 12.3 Import lookup `--import`
-Finds cells where `import_index` key starts with the queried module name.
+Finds cells where `import_index` key matches the queried module name using
+**module-boundary prefix matching**: key `k` matches query `q` iff `k == q` OR
+`k.startswith(q + ".")`.  This ensures `"sklearn"` matches `"sklearn"` and
+`"sklearn.linear_model"` but does **not** match `"sklearnx"` or `"sklearn_extra"`.
 
 ### 12.4 Output format: one result per line
 `relative/path.ipynb:N: first source line`
