@@ -129,7 +129,13 @@ def _remove_nb_guard_entries(settings: dict) -> None:
             entry["hooks"] = filtered_hooks
             new_pre.append(entry)
         # If all hooks in this entry were nb-guard, drop the whole entry
-    settings.setdefault("hooks", {})["PreToolUse"] = new_pre
+
+    hooks = settings.setdefault("hooks", {})
+    if new_pre:
+        hooks["PreToolUse"] = new_pre
+    else:
+        # Drop the key entirely so we don't leave an empty PreToolUse list
+        hooks.pop("PreToolUse", None)
 
 
 def _add_nb_guard_entry(settings: dict, guard_cmd: str) -> None:
@@ -167,11 +173,9 @@ def main():
         if f.is_file() and f.suffix in (".py", ".sh"):
             shutil.copy2(f, scripts_dst / f.name)
 
-    # tests/
+    # tests/ — dirs_exist_ok=True avoids the TOCTOU window of rmtree+copytree
     tests_dst = skill_dir / "tests"
-    if tests_dst.exists():
-        shutil.rmtree(tests_dst)
-    shutil.copytree(REPO_ROOT / "tests", tests_dst)
+    shutil.copytree(REPO_ROOT / "tests", tests_dst, dirs_exist_ok=True)
 
     # Make scripts executable on POSIX
     if sys.platform != "win32":

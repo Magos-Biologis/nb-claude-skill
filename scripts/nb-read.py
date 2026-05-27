@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 nb-read.py — token-efficient Jupyter notebook reader.
 
 Usage:
@@ -11,8 +11,15 @@ Options:
   --cells N,M,K     Show specific cells (e.g. --cells 0,2,5)
   --type TYPE       Filter by cell type: code | markdown | raw
   --truncate N      Truncate cell source at N lines (default: 80, 0 = unlimited)
-  --no-safe         Disable source sanitisation and │ line-prefix (raw output)
+  --no-safe         Disable source sanitisation and │ line-prefix (raw output).
+                    WARNING: disabling safe mode passes ANSI escape sequences and
+                    raw control characters from untrusted notebook content through
+                    to the terminal unchanged. Use only with trusted notebooks.
 """
+# NOTE: raw docstring (r"""...""") prevents \p \a invalid-escape warnings on
+# Python 3.12+ / 3.14.
+
+from __future__ import annotations
 
 import json
 import sys
@@ -27,23 +34,33 @@ MAX_RANGE_SIZE = 10_000             # guard against billion-element set allocati
 # ANSI sanitisation
 # ---------------------------------------------------------------------------
 
-# Comprehensive ECMA-48 regex: covers standard CSI, private-mode CSI (?/>),
-# OSC sequences (capped at 512 chars), Fe escape sequences, single-char escapes.
-_ANSI_RE_FULL = re.compile(
+# ---------------------------------------------------------------------------
+# ANSI / control-character sanitisation
+#
+# Comprehensive ECMA-48 regex.  Branch ORDER matters — OSC must precede Fe
+# because ']' (0x5D) would otherwise match the Fe range [\-_] (0x5C-0x5F).
+#
+#   OSC  \x1b ] body BEL|ST     — terminal title injection etc.
+#   Fe   \x1b [@-Z\^_]          — 2-char Fe sequences (excludes ] and [)
+#   CSI  \x1b [ params final    — colour, cursor, private-mode (?/>) etc.
+#   misc \x1b <any other char>  — remaining 2-char escapes
+#
+# Applied to any user-controlled string before echoing.
+# ---------------------------------------------------------------------------
+_ANSI_RE = re.compile(
     r'\x1b(?:'
-    r'[@-Z\\-_]'                             # Fe: ESC @..Z, ESC \, ESC _
+    r'\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)'  # OSC first (body + required terminator)
+    r'|[@-Z\\^_]'                            # Fe: @-Z, \(ST), ^(PM), _(APC) — no ]
     r'|\[[0-?]*[ -/]*[@-~]'                  # CSI: covers ?, >, = params
-    r'|\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)?' # OSC: cap at 512 chars
     r'|[^@-_]'                               # other 2-char escapes
     r')'
 )
-# Strip ANSI escape sequences from strings sourced from untrusted notebook metadata
-_ANSI_RE = _ANSI_RE_FULL  # same regex used for both metadata and source in safe mode
+_CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')  # C0 controls + DEL
 
 
-def _sanitise(s):
-    """Strip ANSI/CSI/OSC sequences from untrusted strings."""
-    return _ANSI_RE.sub('', str(s))
+def _sanitise(s: str) -> str:
+    """Strip ANSI sequences then any remaining control characters."""
+    return _CTRL_RE.sub('', _ANSI_RE.sub('', str(s)))
 
 
 # ---------------------------------------------------------------------------

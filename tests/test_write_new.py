@@ -173,16 +173,14 @@ class TestPermissionErrorMessage:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
-        p = _make_nb([{"cell_path": "code", "source": ["x"]}], tmp_path)
-
-        orig_replace = os.replace
-
         def raise_permission(*a, **kw):
             raise PermissionError("Access is denied")
 
         p_path = _make_nb([{"cell_type": "code", "source": ["x"]}], tmp_path,
                            name="locked.ipynb")
-        nb = mod.load(p_path)
+        nb, _lock = mod.load(p_path)
+        if _lock is not None:
+            _lock.close()  # release flock before we re-open for the mock test
         with mock.patch("os.replace", side_effect=raise_permission):
             with pytest.raises(SystemExit) as exc_info:
                 mod.save(p_path, nb)

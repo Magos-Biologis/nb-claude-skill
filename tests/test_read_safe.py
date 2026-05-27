@@ -279,8 +279,10 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        # No output summary keyword expected
-        assert "output" not in r.stdout.lower() or "0 output" not in r.stdout.lower()
+        # No output summary keyword expected (outputs=[] → no summary line).
+        # Check for the specific summary pattern, not just "output" (the tmp path
+        # may contain "output" in the directory name).
+        assert "output(s)" not in r.stdout.lower() and "not shown" not in r.stdout.lower()
 
     def test_output_summary_not_shown_for_markdown_cell(self, tmp_path):
         """Markdown cells have no outputs field; no summary line must appear."""

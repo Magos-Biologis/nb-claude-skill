@@ -115,7 +115,11 @@ def main():
             entry = dict(entry)
             entry["hooks"] = filtered
             new_pre.append(entry)
-    settings.setdefault("hooks", {})["PreToolUse"] = new_pre
+    hooks = settings.setdefault("hooks", {})
+    if new_pre:
+        hooks["PreToolUse"] = new_pre
+    else:
+        hooks.pop("PreToolUse", None)
 
     _save_settings(settings_path, settings)
 

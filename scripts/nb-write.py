@@ -86,40 +86,86 @@ def _check_path(path):
 
 
 def load(path):
+    """
+    Load notebook JSON from *path* and return ``(nb, lock_fd)``.
+
+    On POSIX, *lock_fd* is an open file object holding a LOCK_EX flock on a
+    companion ``<notebook>.nblock`` lock file.  This lock **must** be released
+    (by calling ``lock_fd.close()``) only *after* ``save()`` has completed its
+    ``os.replace()``.  Pass it to ``save(path, nb, lock_fd=lock_fd)``.
+
+    Why a separate lock file?  ``os.replace()`` (atomic rename) swaps the
+    inode at *path*.  A flock held on the original notebook inode would be
+    released when we close that fd, but a racing process that opened the
+    file *before* the rename is still pointing at the old inode and would get
+    its lock immediately — then read stale data.  Locking a stable companion
+    file avoids this inode-swap hazard.
+
+    On Windows (no fcntl), *lock_fd* is ``None``.
+    """
     _check_path(path)
+
+    # Acquire exclusive lock on a companion lock file BEFORE reading the
+    # notebook so that the lock scope covers the full read-modify-write cycle.
+    lock_fd = None
+    if _have_flock:
+        lpath = path + ".nblock"
+        try:
+            lf = open(lpath, "a")  # "a" creates if absent without truncating
+        except OSError as e:
+            die(f"cannot open lock file '{lpath}': {e}")
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+        except OSError as e:
+            lf.close()
+            die(f"cannot acquire lock on '{lpath}': {e}")
+        lock_fd = lf
+
     try:
         size = os.path.getsize(path)
     except FileNotFoundError:
+        if lock_fd:
+            lock_fd.close()
         die(f"file not found: {path}")
     except OSError as e:
+        if lock_fd:
+            lock_fd.close()
         die(f"cannot stat '{path}': {e}")
     if size > MAX_FILE_SIZE:
+        if lock_fd:
+            lock_fd.close()
         die(f"file too large ({size:,} bytes). Max is {MAX_FILE_SIZE:,} bytes.")
     try:
         # utf-8-sig handles UTF-8 BOM transparently
         with open(path, encoding="utf-8-sig") as f:
-            if _have_flock:
-                # Hold exclusive lock through the read so concurrent load+save
-                # cycles are serialised.  Lock file keeps us from closing the
-                # notebook fd before the rename.
-                fcntl.flock(f, fcntl.LOCK_EX)
-            return json.load(f)
-            # lock released when 'f' is closed at end of with-block
+            nb = json.load(f)
+        return nb, lock_fd
     except FileNotFoundError:
+        if lock_fd:
+            lock_fd.close()
         die(f"file not found: {path}")
     except UnicodeDecodeError:
+        if lock_fd:
+            lock_fd.close()
         die(f"cannot read '{path}': file is not valid UTF-8. "
             f"Jupyter notebooks must be UTF-8 encoded.")
     except json.JSONDecodeError as e:
+        if lock_fd:
+            lock_fd.close()
         die(f"invalid JSON in {path}: {e}")
 
 
-def save(path, nb):
+def save(path, nb, lock_fd=None):
     """
     Atomic write: write to a temp file in the same directory, fsync, then
     os.replace() (POSIX atomic rename). No .bak created — the atomicity
     guarantee is that the file is either the old version or the new version,
     never a partial write.
+
+    *lock_fd* — if not None, the open file object returned by ``load()``
+    holding a POSIX LOCK_EX flock.  It is closed (releasing the lock)
+    *after* os.replace() succeeds so the lock spans the full read-modify-write
+    cycle.
     """
     dir_ = os.path.dirname(os.path.abspath(path))
     tmp_path = None
@@ -150,6 +196,14 @@ def save(path, nb):
             except OSError:
                 pass
         die(f"failed to write {path}: {e}")
+    finally:
+        # Release the exclusive lock after the rename so the entire
+        # read-modify-write cycle is serialised.
+        if lock_fd is not None:
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
     print(f"✓ Written {path}", file=sys.stderr)
 
 
@@ -336,7 +390,7 @@ def main():
         cmd_create(path)
         return
 
-    nb = load(path)
+    nb, lock_fd = load(path)
 
     if op == "patch":
         if not rest:
@@ -371,7 +425,7 @@ def main():
     else:
         die(f"unknown operation '{op}', must be create | patch | insert | delete.")
 
-    save(path, nb)
+    save(path, nb, lock_fd=lock_fd)
 
 
 if __name__ == "__main__":

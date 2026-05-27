@@ -6,6 +6,7 @@ Exit 0 = allow, exit 1 = block.
 
 All tests are red until scripts/nb-guard.py is created.
 """
+from __future__ import annotations
 
 import json
 import subprocess

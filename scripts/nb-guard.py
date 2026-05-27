@@ -1,37 +1,49 @@
 #!/usr/bin/env python3
-"""
-nb-guard.py — PreToolUse hook that blocks direct Read/Edit/Write/MultiEdit
+r"""
+nb-guard.py -- PreToolUse hook that blocks direct Read/Edit/Write/MultiEdit
 on .ipynb files and redirects Claude to the nb skill scripts.
 
-Cross-platform replacement for nb-guard.sh. Requires only Python stdlib —
+Cross-platform replacement for nb-guard.sh. Requires only Python stdlib --
 no jq, no bash, works on Linux, macOS, and Windows.
 
 Exit codes:
-  0 — non-.ipynb target (or fail-open on parse error): allow the operation
-  1 — .ipynb target detected: block and print redirect message on stdout
+  0 -- non-.ipynb target (or fail-open on parse error): allow the operation
+  1 -- .ipynb target detected: block and print redirect message on stdout
 
 Invocation (written into settings.json by install.py):
   Linux/macOS:  python3 /abs/path/to/nb-guard.py
   Windows:      python  C:\abs\path\to\nb-guard.py
 """
+# NOTE: raw docstring (r"""...""") above prevents \p \a invalid-escape warnings
+# on Python 3.12+ / 3.14.
+
+from __future__ import annotations
 
 import json
 import os
 import re
+import shlex
 import sys
 
 # ---------------------------------------------------------------------------
 # ANSI / control-character sanitisation
-# Comprehensive ECMA-48 regex: covers standard CSI, private-mode CSI (?/>),
-# OSC sequences, Fe escape sequences, and single-char escapes.
+#
+# Comprehensive ECMA-48 regex.  Branch ORDER matters — OSC must precede Fe
+# because ']' (0x5D) would otherwise match the Fe range [\-_] (0x5C-0x5F).
+#
+#   OSC  \x1b ] body BEL|ST     — terminal title injection etc.
+#   Fe   \x1b [@-Z\^_]          — 2-char Fe sequences (excludes ] and [)
+#   CSI  \x1b [ params final    — colour, cursor, private-mode (?/>) etc.
+#   misc \x1b <any other char>  — remaining 2-char escapes
+#
 # Applied to any user-controlled string before echoing.
 # ---------------------------------------------------------------------------
 _ANSI_RE = re.compile(
     r'\x1b(?:'
-    r'[@-Z\\-_]'                            # Fe: ESC @..Z, ESC \, ESC _
-    r'|\[[0-?]*[ -/]*[@-~]'                 # CSI: covers ?, >, = params
-    r'|\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)?' # OSC: cap at 512 chars
-    r'|[^@-_]'                              # other 2-char escapes
+    r'\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)'  # OSC first (body + required terminator)
+    r'|[@-Z\\^_]'                            # Fe: @-Z, \(ST), ^(PM), _(APC) — no ]
+    r'|\[[0-?]*[ -/]*[@-~]'                  # CSI: covers ?, >, = params
+    r'|[^@-_]'                               # other 2-char escapes
     r')'
 )
 _CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')  # C0 controls + DEL
@@ -54,8 +66,8 @@ def _nb_scripts_dir() -> str:
 
 def _python_cmd() -> str:
     """Return 'python3' or 'python' depending on what's available."""
-    import shutil
-    return "python3" if shutil.which("python3") else "python"
+    import shutil as _shutil
+    return "python3" if _shutil.which("python3") else "python"
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +92,10 @@ def _extract_ipynb_path(data: dict) -> str:
                 return fp
         return ""
     else:
-        fp = ti.get("file_path") or ti.get("path") or ""
+        # Use explicit None-check to avoid silently skipping empty-string file_path
+        fp = ti.get("file_path")
+        if fp is None:
+            fp = ti.get("path")
         return fp if isinstance(fp, str) else ""
 
 
@@ -115,14 +130,21 @@ def main() -> None:
     if safe_tool not in KNOWN_TOOLS:
         sys.exit(0)
 
+    # Use shlex.quote for both the script path and the file path so the printed
+    # command is safe to paste into a shell and cannot be used for injection via
+    # a crafted filename containing $(), backticks, or other metacharacters.
+    read_cmd  = f"{py} {shlex.quote(nb_scripts + '/nb-read.py')} {shlex.quote(safe_file)}"
+    write_cmd = (f"{py} {shlex.quote(nb_scripts + '/nb-write.py')} {shlex.quote(safe_file)}"
+                 f" patch <index> -f <source_file>")
+
     if safe_tool == "Read":
         print("Blocked: do not use Read on .ipynb files — raw JSON is ~15x more tokens than needed.")
         print("Use the nb skill instead:")
-        print(f'  {py} "{nb_scripts}/nb-read.py" "{safe_file}"')
+        print(f"  {read_cmd}")
     else:  # Edit | Write | MultiEdit
         print(f"Blocked: do not use {safe_tool} on .ipynb files directly.")
         print("Use the nb skill instead:")
-        print(f'  {py} "{nb_scripts}/nb-write.py" "{safe_file}" patch <index> -f <source_file>')
+        print(f"  {write_cmd}")
 
     sys.exit(1)
 

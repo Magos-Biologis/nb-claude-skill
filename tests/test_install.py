@@ -6,6 +6,7 @@ All tests red until install.py / uninstall.py are created.
 Tests run against a temporary fake "claude config dir" so they don't
 touch the real ~/.claude or settings.json.
 """
+from __future__ import annotations
 
 import json
 import os
