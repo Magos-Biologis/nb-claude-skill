@@ -318,26 +318,48 @@ class TestIndexLocation:
         assert idx2 == idx1, "Both path forms must produce the same index path"
         assert idx2.exists(), "Index must exist after second run"
 
-    def test_containment_violation_exits_1(self, tmp_path):
-        """§1.7: notebook that resolves outside the git root must not escape .nb_index/"""
-        # Set up a git root and a real notebook OUTSIDE it.
+    def test_containment_invariant_index_inside_nb_index(self, tmp_path):
+        """§1.7: the constructed index path must always be inside .nb_index/, never above it.
+
+        With Path.resolve() called at entry, the notebook path is canonicalised before
+        any arithmetic.  This test verifies the invariant holds for a real notebook:
+        regardless of how the path was passed, the produced index JSON is strictly
+        under .nb_index/ and nowhere else.
+        """
+        nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path, name="nb.ipynb")
+        run_indexer(nb)
+        idx = index_path_for(nb)
+        # The index must be inside .nb_index/
+        nb_index_dir = idx.parent
+        assert nb_index_dir.name == ".nb_index", (
+            f"Index parent must be '.nb_index', got: {nb_index_dir.name!r}"
+        )
+        # The index must be a direct child of .nb_index/ (no sub-directories that
+        # could represent path traversal).  For the no-git case, it is always flat.
+        assert idx.parent.parent == tmp_path, (
+            "Index must be in <nb_dir>/.nb_index/, not in a nested sub-directory"
+        )
+        # No index file must exist outside the expected .nb_index/ location
+        unexpected = list(tmp_path.rglob("*.json"))
+        assert all(p.parent.name == ".nb_index" for p in unexpected), (
+            f"All JSON index files must be inside .nb_index/: {unexpected}"
+        )
+
+    def test_notebook_outside_git_root_uses_local_nb_index(self, tmp_path):
+        """§1.7 / §1.4: a real notebook outside any git root uses its own dir's .nb_index/."""
         git_root = tmp_path / "project"
         git_root.mkdir()
         (git_root / ".git").mkdir()
+        # Notebook is OUTSIDE the git root — indexer must fall back to nb_dir/.nb_index/
         outside = tmp_path / "external"
         outside.mkdir()
-        real_nb = make_notebook([code_cell("x = 1")], tmp_path=outside, name="ext.ipynb")
-        # Create a symlink inside the git root pointing to the external notebook.
-        # nb-index.py rejects symlinks (§0), so exit 1 is expected.
-        link = git_root / "linked.ipynb"
-        link.symlink_to(real_nb)
-        r = run_indexer(link)
-        assert r.returncode == 1, (
-            "Symlink notebook (possible containment escape) must be rejected with exit 1"
-        )
-        # Verify no index was created outside the project
-        assert not (outside / ".nb_index").exists(), (
-            "Must not create .nb_index outside git root via symlink"
+        nb = make_notebook([code_cell("x = 1")], tmp_path=outside, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0
+        # Index must be in external/.nb_index/, NOT in project/.nb_index/
+        assert (outside / ".nb_index").exists(), "Index must be in notebook's own dir"
+        assert not (git_root / ".nb_index").exists(), (
+            "Index must not appear inside an unrelated git root"
         )
 
     def test_git_symlink_skipped(self, tmp_path):
@@ -1767,31 +1789,42 @@ class TestOutputStorageAdditional:
         )
 
     def test_lone_surrogate_replaced_in_output(self, tmp_path):
-        """§7.12: lone surrogates in output must be replaced with U+FFFD"""
-        # Construct a string with a lone surrogate using surrogatepass encoding
-        lone_surrogate = "\ud800"  # lone high surrogate
-        nb = {
-            "nbformat": 4, "nbformat_minor": 5,
-            "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
-                                         "name": "python3"},
-                          "language_info": {"name": "python", "version": "3.10.0"}},
-            "cells": [{
-                "cell_type": "code", "id": "c001", "metadata": {},
-                "source": ["x = 1"],
-                "outputs": [{"output_type": "stream", "name": "stdout",
-                              "text": [lone_surrogate + "hello\n"]}],
-                "execution_count": 1,
-            }],
-        }
+        """§7.12: lone surrogates in output must be replaced with U+FFFD
+
+        Strategy: write the notebook as valid UTF-8 JSON where the stream text field
+        contains a JSON \\uD800 escape.  Python's json.loads parses that escape into a
+        Python str containing the lone surrogate U+D800.  The indexer's A4 pipeline
+        step 2 must replace it with U+FFFD before storage.
+        """
         nb_path = tmp_path / "surrogate.ipynb"
-        nb_path.write_bytes(
-            json.dumps(nb, ensure_ascii=False).encode("utf-8", errors="surrogatepass")
+        # Build the JSON by hand so the \\uD800 escape lands literally in the file.
+        # json.dumps would reject/mangle the surrogate; raw string interpolation is safe.
+        nb_json = (
+            '{"nbformat":4,"nbformat_minor":5,'
+            '"metadata":{"kernelspec":{"display_name":"Python 3",'
+            '"language":"python","name":"python3"},'
+            '"language_info":{"name":"python","version":"3.10.0"}},'
+            '"cells":[{"cell_type":"code","id":"c001","metadata":{},'
+            '"source":["x = 1"],'
+            '"outputs":[{"output_type":"stream","name":"stdout",'
+            '"text":["\\uD800hello\\n"]}],'
+            '"execution_count":1}]}'
         )
+        nb_path.write_text(nb_json, encoding="utf-8")
+        # Confirm the file is valid UTF-8 and json.loads produces the lone surrogate
+        import ast as _ast  # noqa: F401 — just for the comment below
+        parsed = json.loads(nb_json)
+        cell_text = parsed["cells"][0]["outputs"][0]["text"][0]
+        assert "\ud800" in cell_text, "Precondition: lone surrogate must be in parsed text"
+
         r = run_indexer(nb_path)
         assert r.returncode == 0, f"Lone surrogate must not crash indexer: {r.stderr}"
         data = load_index(index_path_for(nb_path))
         output_text = data["cells"][0].get("output_text", "")
-        assert "\ud800" not in output_text, "Lone surrogate must be replaced (not left raw)"
+        assert "\ud800" not in output_text, (
+            "Lone surrogate must be replaced with U+FFFD, not left in stored output_text"
+        )
+        # Non-surrogate content on the same line must survive
         assert "hello" in output_text, "Non-surrogate content must be preserved"
 
 

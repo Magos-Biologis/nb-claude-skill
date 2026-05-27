@@ -842,6 +842,33 @@ class TestSymbolsJsonFastPath:
             "Missing symbols.json must fall back to serial scan"
         )
 
+    def test_symbols_json_future_version_falls_back_to_serial(self, tmp_path):
+        """§13.7: nb-search with version>1 symbols.json must fall back to serial scan.
+
+        This is distinct from the nb-index.py rebuild test: here we verify that
+        nb-search.py itself ignores the cache and still returns correct results via
+        the per-notebook index serial scan.
+        """
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("def version_compat_func():\n    pass\n")])
+        ])
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json yet")
+        # Overwrite with a future-version payload that has no 'version_compat_func' entry
+        future_payload = {"version": 999, "generated_at": "2099-01-01T00:00:00Z",
+                          "max_indexed_at": "2099-01-01T00:00:00Z",
+                          "symbols": {}, "imports": {}}
+        symbols_path.write_text(json.dumps(future_payload), encoding="utf-8")
+        # nb-search must not crash and must fall back to per-notebook serial scan
+        r = run_search(["--symbol", "version_compat_func", str(tmp_path)])
+        assert "Traceback" not in r.stderr
+        assert r.returncode == 0, (
+            "Version-999 symbols.json must cause fallback to serial scan; "
+            f"expected symbol found via serial scan (exit 0), got {r.returncode}; "
+            f"stderr: {r.stderr!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # §12.10 — Streaming output (results printed as found, not buffered)
