@@ -98,6 +98,13 @@ mtime is a cheap pre-filter. The hash is the authoritative freshness
 check and handles FAT32/NFS/Docker volume edge cases where mtime is
 unreliable.
 
+**Short-circuit is required:** steps 2 and 3 must cause an early exit
+(→ stale, rebuild) *without* reading the notebook file. Step 4 is the only
+step that opens and reads the notebook. An implementation that always reads
+the notebook to compute SHA-256 regardless of steps 2–3 is non-conforming —
+it eliminates the fast-path benefit for the common case (mtime changed →
+rebuild without hashing).
+
 ### A4 — Output storage
 
 `stream`, `execute_result`, `error`, and `display_data` outputs are
@@ -123,6 +130,13 @@ Exact processing pipeline — implementations must follow this order:
      4096 bytes hard-truncated with suffix `\n[truncated mid-line]`,
      `output_truncated: true`.
 
+**Memory-efficient pipeline:** implementations MAY apply a preliminary
+16 KB byte-cap after step 1 (concatenation) and before steps 2–4.
+This bounds peak memory to 16 KB per cell regardless of output size
+(e.g., 10 MB streaming output). The final 4096-byte cap in step 5 is
+always authoritative. The preliminary cap trades a small amount of
+content (bytes 4097–16384 that survive sanitisation) for bounded memory.
+
 Binary outputs (`image/png`, `application/json`, etc.) are not stored;
 `has_output: true` and the type in `output_types` are still recorded.
 
@@ -132,7 +146,10 @@ if any text outputs are present, their combined text is stored in
 type to `output_types` regardless.
 
 All index JSON is written with `ensure_ascii=False` to avoid 6× size
-inflation on Unicode/CJK output text.
+inflation on Unicode/CJK output text. Use `json.dump(obj, file_object,
+ensure_ascii=False)` (streaming directly to the temp file) rather than
+`json.dumps` (which builds the full string in memory before writing).
+This avoids a 2–3× peak-memory spike during serialisation.
 
 ### A5 — Symbol extraction
 
@@ -208,21 +225,29 @@ for index size and search performance.
 `nb-write.py` spawns `nb-index.py` after every successful `save()` for
 `patch`, `insert`, and `delete` operations.
 
-The absolute path to `nb-index.py` is resolved **once at module import
-time** using:
+The unresolved sibling path is defined once at module import time (cheap
+attribute access, no syscall):
 
 ```python
-_NB_INDEX_SCRIPT = (Path(__file__).parent / "nb-index.py").resolve()
+_NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved
 ```
+
+The resolved path is computed **at call time** (inside the `if` guard),
+not at import time. Resolving at import time would capture the inode of
+the current `nb-index.py` file; if it is later replaced (hot-reload, symlink
+swap), the import-time-resolved path points to the old inode while the
+existence check passes for the new one.
 
 The Popen call must be:
 
 ```python
-_NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved
-if _NB_INDEX_SIBLING.exists():   # follows symlinks; use unresolved path so
-                                  # a symlink "nb-index.py -> real.py" is found
+_NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-level
+
+# … inside the post-save code path …
+if _NB_INDEX_SIBLING.exists():   # follows symlinks; correct for symlink nb-index.py
+    _script = _NB_INDEX_SIBLING.resolve()   # resolved HERE, at call time
     subprocess.Popen(
-        [sys.executable, str(_NB_INDEX_SCRIPT), str(Path(nb_path).resolve())],
+        [sys.executable, str(_script), str(Path(nb_path).resolve())],
         shell=False,          # NEVER shell=True — path may contain metacharacters
         close_fds=True,
         stdout=subprocess.DEVNULL,
@@ -234,11 +259,10 @@ else:
 ```
 
 The existence check uses the **unresolved sibling path** so that a symlink
-`nb-index.py -> real_script.py` is treated as present even if the resolved
-target is later replaced. The resolved `_NB_INDEX_SCRIPT` is used only as
-the Popen argument to prevent symlink TOCTOU on exec.
+`nb-index.py -> real_script.py` is treated as present. The `.resolve()` call
+immediately before `Popen` closes the TOCTOU window to the irreducible minimum.
 
-If `_NB_INDEX_SCRIPT` does not exist, a stderr warning is printed but
+If `_NB_INDEX_SIBLING` does not exist, a stderr warning is printed but
 the write operation is unaffected (indexing is best-effort).
 
 **Optimistic concurrency:** At the start of the index write, re-stat
@@ -274,7 +298,8 @@ is best-effort.
                                          // found; absolute resolved path otherwise.
                                          // Always forward slashes, even on Windows.
   "indexed_at": "2025-05-27T14:00:00Z",  // ISO 8601 UTC — generated with:
-                                         // datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                                         // datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                         // (datetime.utcnow() is deprecated in Python 3.12+)
   "notebook_mtime": 1748354400.123,
   "notebook_size":  28672,
   "nb_content_hash": "a3f2c1d4e5b6c7d8",
@@ -320,21 +345,13 @@ is best-effort.
     }
   ],
 
-  // Section boundaries (derived from markdown headings)
-  "sections": [
-    {"heading": "Data Loading", "level": 2, "first_cell": 1, "last_cell": 5},
-    {"heading": "Analysis",     "level": 2, "first_cell": 6, "last_cell": 14}
-  ],
-
-  // Inverted indices for fast lookup
-  "symbol_index": {
-    "load_data": [0],
-    "df":        [0, 3, 7]
-  },
-  "import_index": {
-    "pandas": [0],
-    "numpy":  [0]
-  }
+  // "sections" and "symbol_index"/"import_index" are NOT stored in the JSON.
+  // They are DERIVED AT LOAD TIME from the "cells" array:
+  //   - sections: single O(C) pass with a heading-stack (see §5.3 algorithm)
+  //   - symbol_index: {name → [cell_i, …]} built by inverting cells[*].symbols_defined
+  //   - import_index: {name → [cell_i, …]} built by inverting cells[*].symbols_imported
+  // Storing them would double the JSON size for symbol data and risk divergence.
+  // Callers that need fast lookup build the in-memory dict once after loading.
 }
 ```
 
@@ -568,6 +585,14 @@ heading whose level number is ≤ the current section's level number (e.g. an
 h2 section closes when the next h1 or h2 heading is encountered; an h1 section
 closes only when another h1 is encountered). The last section extends to the
 final cell of the notebook.
+
+**Required algorithm — O(C) single-pass with a heading stack:**
+Iterate `cells` once. Maintain a stack of open headings. When a heading cell
+is encountered, pop all stack entries whose `level >= current level`, close
+their `last_cell = i - 1`, then push the new heading. After iterating, close
+all remaining stack entries with `last_cell = len(cells) - 1`. Assign
+`cells[i]["section"]` from the top of the stack as each non-heading cell is
+processed. This is O(C) and must not be implemented as a nested scan (O(C²)).
 
 ### 5.4 Empty sections list when no headings
 `"sections": []`.
@@ -910,14 +935,23 @@ See §12.13.
 ### 12.2 Symbol lookup `--symbol`
 Finds cells where `symbol_index` contains the queried name.
 
-**Fast path:** when `symbols.json` is present at the index root and its
-`generated_at` timestamp is **strictly greater than** the `indexed_at` of
-**every** per-notebook index file currently on disk in the project, use it
-for O(1) lookup. This comparison must be re-evaluated on every query —
-not cached. Fall back to serial per-notebook index scan when `symbols.json`
-is absent, stale, or corrupt. The same version-compatibility rules apply
-as for per-notebook indices (unknown version → skip + warn, fallback to
-serial scan).
+**Fast path:** when `symbols.json` is present at the index root, use the
+stored `max_indexed_at` field for an O(1) freshness check:
+
+1. Read `symbols.json` (one file open).
+2. Compare `symbols.json["generated_at"]` against `symbols.json["max_indexed_at"]`:
+   `generated_at` must be strictly greater (i.e., `symbols.json` was built
+   after all the per-notebook indices it covers).
+3. Additionally, check that no per-notebook `.json` file in the index
+   directory has an `os.path.getmtime` newer than `generated_at`. Use a
+   single `os.scandir` call on the `.nb_index/` directory — this is O(N)
+   syscalls but no JSON parsing.
+
+This avoids opening and parsing N per-notebook index files just to validate
+the cache. Fall back to serial per-notebook index scan when `symbols.json`
+is absent, its `max_indexed_at` field is missing/invalid, or the mtime scan
+finds a newer index file. The same version-compatibility rules apply as for
+per-notebook indices (unknown version → skip + warn, fallback to serial scan).
 
 ### 12.3 Import lookup `--import`
 Finds cells where `import_index` key starts with the queried module name.
@@ -998,6 +1032,10 @@ derived cache mapping symbol names to all locations across the project.
 {
   "version": 1,
   "generated_at": "2025-05-27T14:00:00Z",
+  "max_indexed_at": "2025-05-27T13:59:00Z",  // max indexed_at across all per-notebook
+                                               // indices included in this file.
+                                               // Used for O(1) freshness check in §12.2
+                                               // (avoids opening N index files per query).
   "symbols": {
     "polarise":        ["analysis.ipynb:22"],
     "bistability":     ["analysis.ipynb:34", "plots.ipynb:5"]
