@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = "/home/anakin/.claude/skills/nb/scripts/nb-read.py"
+SCRIPT = str(Path(__file__).parent.parent / "scripts" / "nb-read.py")
 
 
 # ---------------------------------------------------------------------------

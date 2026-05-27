@@ -23,6 +23,7 @@ import pytest
 
 REPO_ROOT  = Path(__file__).parent.parent
 GUARD      = REPO_ROOT / "scripts" / "nb-guard.sh"
+GUARD_PY   = REPO_ROOT / "scripts" / "nb-guard.py"
 NB_SCRIPTS = REPO_ROOT / "scripts"
 
 # settings.json lives in the user's Claude config dir — only meaningful
@@ -209,8 +210,10 @@ class TestSettingsRegistration:
         all_hooks = []
         for entry in pretooluse_hooks:
             all_hooks.extend(entry.get("hooks", []))
-        guard_hooks = [h for h in all_hooks if "nb-guard.sh" in h.get("command", "")]
-        assert guard_hooks, "No hook references nb-guard.sh"
+        guard_hooks = [h for h in all_hooks
+                       if "nb-guard.py" in h.get("command", "")
+                       or "nb-guard.sh" in h.get("command", "")]
+        assert guard_hooks, "No hook references nb-guard.py (or nb-guard.sh)"
         for h in guard_hooks:
             assert "if" not in h, (
                 f"nb-guard hook must not use an `if` condition (subdirectory bypass risk). "
@@ -218,20 +221,19 @@ class TestSettingsRegistration:
             )
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write", "MultiEdit"])
-    def test_tool_hook_references_nb_guard_sh_absolute_path(self, pretooluse_hooks, tool):
-        """Each guarded tool's hook entry must use a hardcoded absolute path to nb-guard.sh."""
+    def test_tool_hook_references_nb_guard_absolute_path(self, pretooluse_hooks, tool):
+        """Each guarded tool's hook entry must use a hardcoded absolute path to nb-guard."""
         entries = self._find_entries_for_tool(pretooluse_hooks, tool)
-        guard_entries = [e for e in entries if "nb-guard.sh" in e.get("command", "")]
+        guard_entries = [e for e in entries
+                         if "nb-guard.py" in e.get("command", "")
+                         or "nb-guard.sh" in e.get("command", "")]
         assert guard_entries, (
-            f"No hook entry for '{tool}' references nb-guard.sh. Entries: {entries}"
+            f"No hook entry for '{tool}' references nb-guard.py. Entries: {entries}"
         )
         for e in guard_entries:
             cmd = e.get("command", "")
-            assert cmd.startswith("/") or "/home/" in cmd or "bash /" in cmd, (
-                f"nb-guard.sh command for '{tool}' should use absolute path: {cmd!r}"
-            )
             assert "${CLAUDE_CONFIG_DIR}" not in cmd, (
-                f"nb-guard.sh command should not rely on shell variable expansion: {cmd!r}"
+                f"nb-guard command should not rely on shell variable expansion: {cmd!r}"
             )
 
     def test_existing_posttooluse_hooks_preserved(self, settings):

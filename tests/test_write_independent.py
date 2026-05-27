@@ -17,7 +17,7 @@ import pytest
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT = "/home/anakin/.claude/skills/nb/scripts/nb-write.py"
+SCRIPT = str(Path(__file__).parent.parent / "scripts" / "nb-write.py")
 PYTHON = "python3"
 
 
