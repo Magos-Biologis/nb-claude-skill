@@ -46,7 +46,9 @@ If not (walk exhausted or hit boundary):
            <notebook-dir>/.nb_index/<notebook-basename>.json
            e.g. standalone/.nb_index/analysis.ipynb.json
 
-After constructing the candidate index path, verify containment:
+After constructing the candidate index path, verify **index-path
+containment** (distinct from the notebook-path search-root validation
+in §12.12):
   assert Path(index_path).resolve().is_relative_to(
       Path(index_dir).resolve()
   )
@@ -216,7 +218,9 @@ _NB_INDEX_SCRIPT = (Path(__file__).parent / "nb-index.py").resolve()
 The Popen call must be:
 
 ```python
-if _NB_INDEX_SCRIPT.exists():
+_NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved
+if _NB_INDEX_SIBLING.exists():   # follows symlinks; use unresolved path so
+                                  # a symlink "nb-index.py -> real.py" is found
     subprocess.Popen(
         [sys.executable, str(_NB_INDEX_SCRIPT), str(Path(nb_path).resolve())],
         shell=False,          # NEVER shell=True — path may contain metacharacters
@@ -225,9 +229,14 @@ if _NB_INDEX_SCRIPT.exists():
         stderr=subprocess.DEVNULL,
     )
 else:
-    print(f"[warn] nb-index.py not found at {_NB_INDEX_SCRIPT}; "
+    print(f"[warn] nb-index.py not found at {_NB_INDEX_SIBLING}; "
           f"skipping auto-index", file=sys.stderr)
 ```
+
+The existence check uses the **unresolved sibling path** so that a symlink
+`nb-index.py -> real_script.py` is treated as present even if the resolved
+target is later replaced. The resolved `_NB_INDEX_SCRIPT` is used only as
+the Popen argument to prevent symlink TOCTOU on exec.
 
 If `_NB_INDEX_SCRIPT` does not exist, a stderr warning is printed but
 the write operation is unaffected (indexing is best-effort).
@@ -244,6 +253,11 @@ modified during indexing may produce a transiently stale index that will
 be detected and rebuilt on next access.' The lock on the notebook's
 `.nblock` file (from nb-write.py) ensures sequential writes; the
 optimistic check is a second-layer defence for external modifications.
+
+**Per-notebook index writes do not use flock.** Serialisation for the
+per-notebook `.json` file relies on the optimistic concurrency check above
+plus the `os.replace()` atomicity guarantee. `flock` is used only for
+`symbols.json` (§13.6) because that file is shared across all notebooks.
 
 **Indexing failures must not fail the write:** if the Popen call raises
 or the child exits non-zero, `nb-write.py` continues normally. Indexing
@@ -283,9 +297,9 @@ is best-effort.
       "symbols_imported": ["pandas", "numpy"],
       "symbols_extracted": true,
       "has_output": true,
-      "output_types": ["execute_result"],  // deduplicated, order of first appearance;
-                                           // valid values: stream execute_result error
+      "output_types": ["execute_result"],  // valid values: stream execute_result error
                                            // display_data image/png application/json …
+                                           // (deduplication rule: see §7.10)
       "output_text": "   col_a  col_b\n0  1  2\n...",
       "output_truncated": false
     },
@@ -357,28 +371,6 @@ stderr: one status line on success; error message(s) on failure.
         Best-effort:    "[warn] ..."  for non-fatal issues (gitignore, etc.)
 ```
 
-### 0.1 `_NB_INDEX_SCRIPT` discovery in nb-write.py
-
-The absolute path to `nb-index.py` is computed once at module import time
-in `nb-write.py`:
-
-```python
-_NB_INDEX_SCRIPT = (Path(__file__).parent / "nb-index.py").resolve()
-```
-
-If `_NB_INDEX_SCRIPT` does not exist at that path, the Popen call in §8
-prints a warning to stderr and returns without error. The write operation
-is not affected.
-
-The existence check in the Popen guard uses the **unresolved sibling path**
-so that a symlink `nb-index.py -> real_script.py` is treated as present
-even if the resolved target is later replaced:
-
-```python
-_NB_INDEX_SIBLING = Path(__file__).parent / 'nb-index.py'  # unresolved
-if _NB_INDEX_SIBLING.exists():   # follows symlinks — correct
-    subprocess.Popen([sys.executable, str(_NB_INDEX_SCRIPT), ...])
-```
 
 ---
 
@@ -391,7 +383,10 @@ and `./b.ipynb`) must produce the same index path.
 
 ### 1.2 Git-root detection
 Given a notebook at `/project/data/nb.ipynb` where `/project/.git/`
-exists, `_find_index_dir(nb_path)` returns `/project/.nb_index`.
+exists as a real directory (not a symlink), `_find_index_dir(nb_path)`
+returns `/project/.nb_index`. A `.git` entry is accepted ONLY when
+`(d / ".git").is_dir() and not (d / ".git").is_symlink()` — a symlink
+named `.git` is skipped and the walk continues upward. See A1.
 
 ### 1.3 Git-root with nested notebook
 Given `/project/sub/deep/nb.ipynb` and `/project/.git/`, returns
@@ -491,6 +486,17 @@ index.
 
 ### 3.7 Missing index treated as stale
 `_index_is_stale()` returns `True` when no index file exists.
+
+### 3.8 `source_hash` per cell
+Each cell entry stores `"source_hash"`: the first 8 hex chars of MD5
+applied to the UTF-8 bytes of the cell's `source` text. This is a
+**cell-level** change-detection hint used for future incremental rebuild
+optimisations (out of scope v1 — stored but not acted on). MD5[:8] is
+sufficient here because `source_hash` is not a security boundary; it is
+only a hint compared against itself across runs on the same machine.
+
+Test: after indexing, `cells[i]["source_hash"]` equals
+`hashlib.md5(("".join(cell["source"])).encode()).hexdigest()[:8]`.
 
 ---
 
@@ -629,14 +635,25 @@ All patterns are defined in A5. Tests use the exact regexes from A5.
 Markdown and raw cells produce `symbols_defined: []`,
 `symbols_imported: []`, `symbols_extracted: false`.
 
+
 ### 6.16 Long-line skip (ReDoS protection)
-A cell whose source contains a line of 501 characters must complete
-indexing without timing out. The long line is silently skipped; other
-lines in the cell are still processed.
+A cell whose source contains a line exceeding the per-line character
+limit defined in A5 (currently 500 chars) must complete indexing without
+timing out. The long line is silently skipped; other lines in the cell
+are still processed.
 
 ### 6.17 Adversarial input: no closing delimiter
 A cell source `"library(aaaa..."` (10,000 `a` chars, no `)`) must return
-in < 100 ms. The line exceeds 500 chars and is skipped.
+in < 100 ms. The line exceeds the A5 character limit and is skipped.
+### 6.18 Symbol name length cap (A5 `MAX_SYMBOL_LEN`)
+A code cell containing `A * 257 + " = 1"` (an identifier of 257 chars)
+must produce `symbols_defined: []` — the name exceeds `MAX_SYMBOL_LEN`
+and is discarded. An identifier of exactly 256 chars is retained.
+
+### 6.19 Symbol count cap per cell (A5 `MAX_SYMBOLS_PER_CELL`)
+A code cell with 600 top-level assignments (`a0 = 1` … `a599 = 1`) must
+produce `len(symbols_defined) == 500` — the count is capped at
+`MAX_SYMBOLS_PER_CELL`. No crash, no hang.
 
 ---
 
@@ -676,6 +693,9 @@ bytes hard-truncated, append `\n[truncated mid-line]`,
 ### 7.9 Multiple outputs concatenated in order
 
 ### 7.10 `output_types` deduplicated in order of first appearance
+A cell with outputs `[stream, execute_result, stream, execute_result]`
+must produce `output_types: ["stream", "execute_result"]` — not four
+entries, and not two pairs. Order reflects first occurrence of each type.
 
 ### 7.11 Null bytes stripped from output
 Cell output `"hello\x00world"` → stored as `"helloworld"` (null byte
@@ -709,8 +729,17 @@ The spawned command must be a list `[sys.executable, abs_script, abs_nb]`.
 shell metacharacters (`; & | $ `` > < !`) must be passed as a literal
 argument, not interpreted by a shell.
 
-### 8.2–8.3 Popen after insert and delete
-Same as 8.1.
+### 8.2 Popen after insert
+Same argument list as §8.1: `[sys.executable, abs_script, abs_nb]`,
+`shell=False`, `Path(nb_path).resolve()`. The source file argument
+(`-f <file>`) is passed to `nb-write.py`, not to `nb-index.py`;
+`nb-index.py` receives only the resolved notebook path.
+
+### 8.3 Popen after delete
+Same argument list as §8.1: `[sys.executable, abs_script, abs_nb]`.
+`delete` takes no source argument; `nb-index.py` receives only the
+resolved notebook path. The index is fully rebuilt from the notebook
+after the delete (incremental per-cell optimisation is out of scope, v1).
 
 ### 8.4 `create` does NOT trigger indexing
 No subprocess spawned.
@@ -825,8 +854,12 @@ Format: `[3:code:run=5]`. `run=——` when execution_count is null.
 ### 11.2 Markdown and raw cells show no run field
 
 ### 11.3 Section name in header when index available
-Format: `[6:code:run=3 §Analysis]`. Section name truncated at **20 chars**
-with `…` if longer.
+Format: `[6:code:run=3 §Analysis]`. Section name has a soft maximum of
+**20 chars** with `…` if longer — but the §11.4 hard 72-char line limit
+takes priority: if the 20-char-truncated name would still cause the total
+header to exceed 72 chars, truncate the section name further until
+`bar_len >= 4`. If even 0-char section name cannot fit (cell index is
+very long), omit the section name entirely.
 
 ### 11.4 Hard header line limit
 Total header line length (including `─` bar) must not exceed **72 chars**.
@@ -840,7 +873,7 @@ rule) in the header. No crash from negative bar length.
 
 ### 11.6 Section name absent when index unavailable or stale
 When no fresh index exists, section names are omitted from headers (the
-`§Section` field requires the index). Prints `[STALE INDEX]` to stderr
+`§Section` field requires the index). Prints `[STALE INDEX] <path>` to stderr
 when the index is stale (same rule as §9.4).
 
 ---
@@ -930,6 +963,23 @@ The `is_relative_to` check must occur **after** `Path.resolve()` on
 the joined path — not on the raw string. Null bytes in `notebook_path`
 must cause the entry to be skipped before any path construction.
 
+Path construction depends on whether `notebook_path` is relative or
+absolute:
+
+```python
+np = index["notebook_path"]
+raw = Path(np)
+candidate = raw.resolve() if raw.is_absolute() else (search_root / np).resolve()
+if not candidate.is_relative_to(search_root.resolve()):
+    warn_and_skip()
+    continue
+```
+
+Using `search_root / absolute_path` in pathlib silently discards
+`search_root` (Python behaviour), so absolute paths must be handled
+separately. An absolute `notebook_path` that is not inside `search_root`
+is rejected identically to a traversal attempt.
+
 ### 12.13 Keyword search reads notebook files; symbol/import search reads index only
 For `nb-search.py QUERY` (no flag): open each notebook's `.ipynb` file to
 scan source text. For `--symbol` and `--import`: read only index JSON files
@@ -974,12 +1024,6 @@ nb-search.py works correctly without it.
 ### 13.4 Corrupt symbols.json triggers rebuild from per-notebook indices
 ### 13.5 symbols.json itself is NOT indexed by nb-search (skip it)
 
-### 13.8 Location strings in symbols.json validated on read
-Location strings (e.g. `"analysis.ipynb:22"`) are split on `:` to
-extract the notebook path portion. That path is then validated with
-the same `is_relative_to(search_root.resolve())` check as §12.12.
-A crafted `symbols.json` with `"../../../../etc/passwd:0"` must not
-cause nb-search to open `/etc/passwd`.
 
 ### 13.6 Atomic write with lock for concurrent indexers
 symbols.json is written using the same temp-file + fsync + `os.replace()`
@@ -994,6 +1038,12 @@ will write a consistent version. nb-search falls back to serial scan per
 `version > 1` → log warning to stderr, skip, fall back to serial scan.
 `version` missing or non-integer → treat as corrupt, rebuild from
 per-notebook indices.
+### 13.8 Location strings in symbols.json validated on read
+Location strings (e.g. `"analysis.ipynb:22"`) are split on `:` to
+extract the notebook path portion. That path is then validated with
+the same `is_relative_to(search_root.resolve())` check as §12.12.
+A crafted `symbols.json` with `"../../../../etc/passwd:0"` must not
+cause nb-search to open `/etc/passwd`.
 
 ---
 
@@ -1045,9 +1095,6 @@ After indexing: a code cell with source `["x = 1\n", "y = 2"]` has
 `first_line: "x = 1"`. A markdown cell with source `"## Heading\n..."` has
 `first_line: "## Heading"`. An empty cell has `first_line: "(empty)"`.
 
-### 14.12 `display_data` output treated as text
-A cell with `{"output_type": "display_data", "data": {"text/plain": "fig"}}` →
-`output_text: "fig"`, `has_output: true`, `"display_data"` in `output_types`.
 
 ### 14.13 `--outline` from fresh index never opens notebook file
 Patch a test notebook; index it; use `strace` or mock `open()` to verify
@@ -1076,11 +1123,11 @@ nb-read.py performs the three-signal staleness check (§A3) before
 deciding which path to take for `--outline`, `--outputs`, and `§Section`
 header features:
 
-| Index state | nb-read.py behaviour |
-|-------------|----------------------|
-| Fresh | Use index (no .ipynb open) |
-| Absent | Fall back to notebook |
-| Stale | Fall back to notebook + `[STALE INDEX]` on stderr |
+| Index state | nb-read.py behaviour | nb-search.py behaviour |
+|-------------|----------------------|------------------------|
+| Fresh | Use index (no .ipynb open) | Use index for --symbol/--import; open .ipynb for keyword |
+| Absent | Fall back to notebook | Skip with `[UNINDEXED]` notice (§12.7) |
+| Stale | Fall back + `[STALE INDEX]` stderr | Warn `[STALE]` stderr, return results anyway (§12.6) |
 
 nb-read.py never triggers a synchronous rebuild.
 
