@@ -31,8 +31,13 @@ Walk constraints:
   - Maximum 20 directory levels upward
   - Stop if os.stat().st_dev changes between levels (filesystem boundary)
   - Never follow symlinks during the walk (Path.parents operates on
-    lexical path strings; .git existence check uses os.path.lexists()
-    not os.path.exists() to avoid following symlinks at .git itself)
+    lexical path strings)
+  - .git detection: a directory qualifies as a git root ONLY when
+    `(d / '.git').is_dir() and not (d / '.git').is_symlink()`.
+    A .git symlink (even one pointing to a real git dir) is skipped;
+    walk continues upward. `os.path.lexists()` must NOT be used —
+    it returns True for dangling symlinks, allowing an attacker to
+    forge a git root by placing a .git symlink anywhere on the path.
 
 If found:  <git-root>/.nb_index/<relative-path-to-notebook>.json
            e.g. project/.nb_index/data/exploration.ipynb.json
@@ -60,6 +65,9 @@ directory). Rules:
   warning to stderr and continue. Indexing proceeds regardless.
 - If the entry already exists: do not duplicate it.
 - If no `.gitignore` exists: create one containing `.nb_index/`.
+- **The string written is always the literal `.nb_index/`**, never a
+  path computed from the notebook location. This prevents newline
+  injection if the notebook directory path contains newline characters.
 
 ### A3 — Staleness detection
 
@@ -68,8 +76,11 @@ The index stores three staleness signals:
 ```json
 "notebook_mtime":    1748354400.123,   // float: os.path.getmtime()
 "notebook_size":     28672,            // int:   os.path.getsize()
-"nb_content_hash":   "a3f2c1d4"       // str:   first 8 hex chars of MD5
-                                       //        of raw notebook bytes
+"nb_content_hash":   "a3f2c1d4e5b6c7d8"  // str: first 16 hex chars of SHA-256
+                                           //      of raw notebook bytes
+                                           // (SHA-256[:16] = 64-bit hash space,
+                                           //  not MD5[:8] which is only 32-bit
+                                           //  and brute-forceable in < 1 second)
 ```
 
 Staleness check (in order, cheapest first):
@@ -77,8 +88,8 @@ Staleness check (in order, cheapest first):
 1. If index file is missing → stale (rebuild).
 2. If stored `notebook_mtime` != current mtime → stale (rebuild).
 3. If stored `notebook_size` != current size → stale (rebuild).
-4. If stored `nb_content_hash` != MD5(raw notebook bytes)[:8] → stale
-   (rebuild).
+4. If stored `nb_content_hash` != `hashlib.sha256(raw).hexdigest()[:16]` →
+   stale (rebuild).
 5. All match → fresh (skip rebuild).
 
 mtime is a cheap pre-filter. The hash is the authoritative freshness
@@ -89,18 +100,26 @@ unreliable.
 
 `stream`, `execute_result`, `error`, and `display_data` outputs are
 serialised to plain text and stored in the index. Per-cell cap:
-**4096 bytes** of UTF-8 text. Truncation rules:
+**4096 bytes** of UTF-8 text.
 
-- Concatenate all text outputs for the cell in order.
-- Null bytes (`\x00`) are stripped before capping.
-- Lone surrogate code points are replaced with `�`.
-- If combined text ≤ 4096 bytes: store verbatim, `output_truncated: false`.
-- If combined text > 4096 bytes and a complete line fits before byte
-  4096: store up to and including the last such line, `output_truncated:
-  true`.
-- If no complete line fits (i.e. the first line itself exceeds 4096
-  bytes): store the first 4096 bytes hard-truncated with the suffix
-  `\n[truncated mid-line]`, `output_truncated: true`.
+Exact processing pipeline — implementations must follow this order:
+
+1. Concatenate all text outputs for the cell in order.
+2. Strip null bytes (`\x00`).
+3. Replace lone surrogate code points with `�`.
+4. **ANSI-sanitise:** apply the same `_ANSI_RE` + `_CTRL_RE` stripping
+   used for `first_line`. This prevents terminal-hijack sequences
+   (e.g. xterm title injection `\x1b]0;...\x07`, alternate screen
+   `\x1b[?1049h`) stored in cell output from reaching the terminal
+   when `nb-search.py` prints results or the index is consumed by
+   external tools.
+5. Apply 4096-byte UTF-8 cap to the **fully processed** string:
+   - If ≤ 4096 bytes: store verbatim, `output_truncated: false`.
+   - If > 4096 bytes and a complete line fits before byte 4096: store
+     up to and including the last such line, `output_truncated: true`.
+   - If no complete line fits (first line ≥ 4096 bytes): store the first
+     4096 bytes hard-truncated with suffix `\n[truncated mid-line]`,
+     `output_truncated: true`.
 
 Binary outputs (`image/png`, `application/json`, etc.) are not stored;
 `has_output: true` and the type in `output_types` are still recorded.
@@ -128,10 +147,14 @@ engine).
 # Defined symbols
 DEF_RE    = re.compile(r'^def\s+(\w+)\s*\(', re.MULTILINE)
 CLASS_RE  = re.compile(r'^class\s+(\w+)\s*[:\(]', re.MULTILINE)
-ASSIGN_RE = re.compile(r'^(\w+)\s*(?::[\w\[\], ]+)?\s*=(?!=)', re.MULTILINE)
+ASSIGN_RE = re.compile(r'^(\w+)\s*(?::[\w\[\], ]{0,200})?\s*=(?!=)', re.MULTILINE)
 # Note: ASSIGN_RE uses negative lookahead (?!=) to exclude ==
 # Annotated assignment: x: int = 5  captured as "x"
 # Walrus (:=) is NOT at line start so ASSIGN_RE won't match it
+# The annotation subpattern is capped at 200 chars {0,200} to prevent
+# catastrophic backtracking on lines like "x: int[[[[[..." of ~499 chars
+# (the 500-char line skip protects long lines, but 499-char annotation
+#  with no "=" causes O(n^2) backtracking in the optional group).
 # Post-filter: remove the string "type" from symbols_defined results.
 # (Python 3.12+ soft-keyword: `type Vector = list[float]` would otherwise
 #  capture "type" as a defined symbol, which is wrong.)
@@ -163,6 +186,21 @@ R_LIB_RE  = re.compile(r'(?:library|require)\s*\(\s*["\']?([\w.]+)', re.MULTILIN
 **Unknown language:** `symbols_defined: []`, `symbols_imported: []`,
 `symbols_extracted: false`.
 
+**Symbol name and count caps (all languages):**
+
+```python
+MAX_SYMBOL_LEN   = 256   # captured group longer than this is discarded
+MAX_SYMBOLS_PER_CELL = 500  # cap per cell across all patterns combined
+
+def _cap_symbols(names: list[str]) -> list[str]:
+    return [n for n in names if len(n) <= MAX_SYMBOL_LEN][:MAX_SYMBOLS_PER_CELL]
+```
+
+Apply `_cap_symbols` to `symbols_defined` and `symbols_imported` separately
+after extraction. Without these caps, a notebook cell with 10,000
+single-assignment lines or one 499-char identifier becomes a DoS vector
+for index size and search performance.
+
 ### A6 — Auto-index on write
 
 `nb-write.py` spawns `nb-index.py` after every successful `save()` for
@@ -180,7 +218,7 @@ The Popen call must be:
 ```python
 if _NB_INDEX_SCRIPT.exists():
     subprocess.Popen(
-        [sys.executable, str(_NB_INDEX_SCRIPT), os.path.abspath(nb_path)],
+        [sys.executable, str(_NB_INDEX_SCRIPT), str(Path(nb_path).resolve())],
         shell=False,          # NEVER shell=True — path may contain metacharacters
         close_fds=True,
         stdout=subprocess.DEVNULL,
@@ -197,8 +235,15 @@ the write operation is unaffected (indexing is best-effort).
 **Optimistic concurrency:** At the start of the index write, re-stat
 the notebook. If its mtime/size differ from the values read at the
 start of the indexer run, abort silently — a concurrent indexer started
-later will write a more current index. This bounds concurrent indexer
-count to at most one winner per mtime slot.
+later will write a more current index.
+
+Note: this is a best-effort heuristic, not a hard guarantee. Multiple
+concurrent indexers can all pass the re-stat check if the notebook is
+not modified during the check window. The true invariant is: 'a notebook
+modified during indexing may produce a transiently stale index that will
+be detected and rebuilt on next access.' The lock on the notebook's
+`.nblock` file (from nb-write.py) ensures sequential writes; the
+optimistic check is a second-layer defence for external modifications.
 
 **Indexing failures must not fail the write:** if the Popen call raises
 or the child exits non-zero, `nb-write.py` continues normally. Indexing
@@ -218,7 +263,7 @@ is best-effort.
                                          // datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
   "notebook_mtime": 1748354400.123,
   "notebook_size":  28672,
-  "nb_content_hash": "a3f2c1d4",
+  "nb_content_hash": "a3f2c1d4e5b6c7d8",
 
   "kernel_language": "julia",
   "cell_count": 118,
@@ -324,6 +369,16 @@ _NB_INDEX_SCRIPT = (Path(__file__).parent / "nb-index.py").resolve()
 If `_NB_INDEX_SCRIPT` does not exist at that path, the Popen call in §8
 prints a warning to stderr and returns without error. The write operation
 is not affected.
+
+The existence check in the Popen guard uses the **unresolved sibling path**
+so that a symlink `nb-index.py -> real_script.py` is treated as present
+even if the resolved target is later replaced:
+
+```python
+_NB_INDEX_SIBLING = Path(__file__).parent / 'nb-index.py'  # unresolved
+if _NB_INDEX_SIBLING.exists():   # follows symlinks — correct
+    subprocess.Popen([sys.executable, str(_NB_INDEX_SCRIPT), ...])
+```
 
 ---
 
@@ -704,6 +759,11 @@ within the bracket to keep columns roughly aligned.
 Uses `cells[i].first_line` and `cells[i].status` from the index.
 Must NOT open the `.ipynb` file when a fresh index exists.
 
+`first_line` values must be passed through the ANSI sanitiser before
+terminal output even when read from the index, because index files may
+be externally modified or crafted. `--no-safe` disables this stripping
+(consistent with `--no-safe` on cell source).
+
 ### 9.3 `--outline` falls back to notebook when index absent
 Reads the notebook directly; `first_line` derived from cell source,
 exec counts from `execution_count` fields, status derived per §4.6.
@@ -798,8 +858,11 @@ Walk constraints:
   `.tox`, `.git`, `.hg` (add `--no-skip` flag to override).
 - Max depth: 20 levels from the search root.
 - `notebook_path` field read from any index file is validated: its
-  resolved path must be within the search root or an expected parent
-  directory. Reject (warn + skip) if it escapes.
+  resolved path must satisfy `candidate.is_relative_to(search_root.resolve())`.
+  Reject (warn + skip) if it escapes. The phrase 'expected parent
+  directory' is intentionally absent — only strict containment within
+  the search root is accepted. Null bytes in `notebook_path` must also
+  cause the entry to be skipped (they cannot appear in valid POSIX paths).
 
 ### 12.1 Keyword search across indexed notebooks
 `nb-search.py "process" /path/to/project` finds all cells in indexed
@@ -815,11 +878,13 @@ See §12.13.
 Finds cells where `symbol_index` contains the queried name.
 
 **Fast path:** when `symbols.json` is present at the index root and its
-`generated_at` timestamp is newer than the `indexed_at` of every per-notebook
-index in the project, use it for O(1) lookup. Fall back to serial per-notebook
-index scan when `symbols.json` is absent, stale, or corrupt. The same
-version-compatibility rules apply as for per-notebook indices (unknown version
-→ skip + warn, fallback to serial scan).
+`generated_at` timestamp is **strictly greater than** the `indexed_at` of
+**every** per-notebook index file currently on disk in the project, use it
+for O(1) lookup. This comparison must be re-evaluated on every query —
+not cached. Fall back to serial per-notebook index scan when `symbols.json`
+is absent, stale, or corrupt. The same version-compatibility rules apply
+as for per-notebook indices (unknown version → skip + warn, fallback to
+serial scan).
 
 ### 12.3 Import lookup `--import`
 Finds cells where `import_index` key starts with the queried module name.
@@ -851,6 +916,19 @@ Stop after N results (default: no limit).
 ### 12.12 `notebook_path` field validated against search root
 A crafted index file with `"notebook_path": "../../../../etc/passwd"`
 must not cause nb-search to open that path.
+
+Implementation must use:
+```python
+candidate = (search_root / index["notebook_path"]).resolve()
+if not candidate.is_relative_to(search_root.resolve()):
+    warn_and_skip()
+    continue
+# Only now open `candidate`
+```
+
+The `is_relative_to` check must occur **after** `Path.resolve()` on
+the joined path — not on the raw string. Null bytes in `notebook_path`
+must cause the entry to be skipped before any path construction.
 
 ### 12.13 Keyword search reads notebook files; symbol/import search reads index only
 For `nb-search.py QUERY` (no flag): open each notebook's `.ipynb` file to
@@ -884,10 +962,24 @@ derived cache mapping symbol names to all locations across the project.
 ### 13.1 Created alongside per-notebook index on first index build
 ### 13.2 Updated incrementally when a notebook is re-indexed
 The stale notebook's entries are removed, new entries added.
+
+The `notebook_path` key used for removal must be **recomputed from
+the actual notebook file path** using `_index_file_path()`, not read
+from the existing per-notebook index. Reading the existing index's
+`notebook_path` field for the removal key allows an attacker who can
+write to `.nb_index/` to cause cross-notebook symbol poisoning by
+setting one notebook's `notebook_path` to another notebook's path.
 ### 13.3 Missing symbols.json falls back to serial scan
 nb-search.py works correctly without it.
 ### 13.4 Corrupt symbols.json triggers rebuild from per-notebook indices
 ### 13.5 symbols.json itself is NOT indexed by nb-search (skip it)
+
+### 13.8 Location strings in symbols.json validated on read
+Location strings (e.g. `"analysis.ipynb:22"`) are split on `:` to
+extract the notebook path portion. That path is then validated with
+the same `is_relative_to(search_root.resolve())` check as §12.12.
+A crafted `symbols.json` with `"../../../../etc/passwd:0"` must not
+cause nb-search to open `/etc/passwd`.
 
 ### 13.6 Atomic write with lock for concurrent indexers
 symbols.json is written using the same temp-file + fsync + `os.replace()`
@@ -973,7 +1065,9 @@ byte-for-byte equivalent except for module-level constants.
 
 Implementations must follow exactly the algorithm in §1:
 1. `Path(nb_path).resolve()` first.
-2. Walk upward at most 20 levels, check `os.path.lexists(d / ".git")`,
+2. Walk upward at most 20 levels, check
+   `(d / '.git').is_dir() and not (d / '.git').is_symlink()`
+   (see A1 for why `os.path.lexists()` must NOT be used),
    stop if `st_dev` changes.
 3. Construct index path per §1.5 or §1.6.
 4. Assert containment per §1.7 before any mkdir.
