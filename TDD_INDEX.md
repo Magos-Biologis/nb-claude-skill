@@ -2,6 +2,7 @@
 
 *Revised after three-agent adversarial audit (security · architecture · performance).*
 *See TDD_INDEX_AUDIT.md for the full finding catalogue.*
+*Gap-analysis pass applied — see TDD_INDEX_GAPS.md for the 20-item gap catalogue.*
 
 ---
 
@@ -86,9 +87,9 @@ unreliable.
 
 ### A4 — Output storage
 
-`stream`, `execute_result`, and `error` outputs are serialised to plain
-text and stored in the index. Per-cell cap: **4096 bytes** of UTF-8
-text. Truncation rules:
+`stream`, `execute_result`, `error`, and `display_data` outputs are
+serialised to plain text and stored in the index. Per-cell cap:
+**4096 bytes** of UTF-8 text. Truncation rules:
 
 - Concatenate all text outputs for the cell in order.
 - Null bytes (`\x00`) are stripped before capping.
@@ -103,6 +104,11 @@ text. Truncation rules:
 
 Binary outputs (`image/png`, `application/json`, etc.) are not stored;
 `has_output: true` and the type in `output_types` are still recorded.
+
+Text and binary outputs in the same cell are processed independently:
+if any text outputs are present, their combined text is stored in
+`output_text` subject to the 4 KB cap. Binary outputs add their MIME
+type to `output_types` regardless.
 
 All index JSON is written with `ensure_ascii=False` to avoid 6× size
 inflation on Unicode/CJK output text.
@@ -126,6 +132,9 @@ ASSIGN_RE = re.compile(r'^(\w+)\s*(?::[\w\[\], ]+)?\s*=(?!=)', re.MULTILINE)
 # Note: ASSIGN_RE uses negative lookahead (?!=) to exclude ==
 # Annotated assignment: x: int = 5  captured as "x"
 # Walrus (:=) is NOT at line start so ASSIGN_RE won't match it
+# Post-filter: remove the string "type" from symbols_defined results.
+# (Python 3.12+ soft-keyword: `type Vector = list[float]` would otherwise
+#  capture "type" as a defined symbol, which is wrong.)
 
 # Imported symbols
 IMPORT_RE = re.compile(r'^import\s+([\w.]+)', re.MULTILINE)
@@ -157,21 +166,33 @@ R_LIB_RE  = re.compile(r'(?:library|require)\s*\(\s*["\']?([\w.]+)', re.MULTILIN
 ### A6 — Auto-index on write
 
 `nb-write.py` spawns `nb-index.py` after every successful `save()` for
-`patch`, `insert`, and `delete` operations. The call must be:
+`patch`, `insert`, and `delete` operations.
+
+The absolute path to `nb-index.py` is resolved **once at module import
+time** using:
 
 ```python
-subprocess.Popen(
-    [sys.executable, nb_index_script_abs, os.path.abspath(nb_path)],
-    shell=False,          # NEVER shell=True — path may contain metacharacters
-    close_fds=True,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
+_NB_INDEX_SCRIPT = (Path(__file__).parent / "nb-index.py").resolve()
 ```
 
-Where `nb_index_script_abs` is the absolute path of `nb-index.py` in
-the same `scripts/` directory as `nb-write.py` (resolved at import time,
-not at call time).
+The Popen call must be:
+
+```python
+if _NB_INDEX_SCRIPT.exists():
+    subprocess.Popen(
+        [sys.executable, str(_NB_INDEX_SCRIPT), os.path.abspath(nb_path)],
+        shell=False,          # NEVER shell=True — path may contain metacharacters
+        close_fds=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+else:
+    print(f"[warn] nb-index.py not found at {_NB_INDEX_SCRIPT}; "
+          f"skipping auto-index", file=sys.stderr)
+```
+
+If `_NB_INDEX_SCRIPT` does not exist, a stderr warning is printed but
+the write operation is unaffected (indexing is best-effort).
 
 **Optimistic concurrency:** At the start of the index write, re-stat
 the notebook. If its mtime/size differ from the values read at the
@@ -190,8 +211,11 @@ is best-effort.
 ```jsonc
 {
   "version": 1,                          // integer, not string
-  "notebook_path": "data/explore.ipynb", // relative to git root, or absolute
-  "indexed_at": "2025-05-27T14:00:00Z",  // ISO 8601 UTC
+  "notebook_path": "data/explore.ipynb", // git-root-relative POSIX path when git root
+                                         // found; absolute resolved path otherwise.
+                                         // Always forward slashes, even on Windows.
+  "indexed_at": "2025-05-27T14:00:00Z",  // ISO 8601 UTC — generated with:
+                                         // datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
   "notebook_mtime": 1748354400.123,
   "notebook_size":  28672,
   "nb_content_hash": "a3f2c1d4",
@@ -199,7 +223,7 @@ is best-effort.
   "kernel_language": "julia",
   "cell_count": 118,
 
-  // Per-cell metadata (outline is derived from this at read time — not stored)
+  // Per-cell metadata (outline is derived from this at read time — not stored separately)
   "cells": [
     {
       "i": 0,
@@ -207,12 +231,16 @@ is best-effort.
       "exec": 1,
       "status": "ok",              // "ok" | "error" | "not_run"
       "source_hash": "b2e1a9f3",   // MD5[:8] of cell source text
+      "first_line": "import pandas as pd",  // first non-empty source line, stripped,
+                                            // ANSI-sanitised, max 120 chars
       "section": "Packages",       // null if before first heading
       "symbols_defined": ["load_data", "df"],
       "symbols_imported": ["pandas", "numpy"],
       "symbols_extracted": true,
       "has_output": true,
-      "output_types": ["execute_result"],  // deduplicated, order of first appearance
+      "output_types": ["execute_result"],  // deduplicated, order of first appearance;
+                                           // valid values: stream execute_result error
+                                           // display_data image/png application/json …
       "output_text": "   col_a  col_b\n0  1  2\n...",
       "output_truncated": false
     },
@@ -222,6 +250,7 @@ is best-effort.
       "exec": null,
       "status": null,
       "source_hash": "c4d3e2f1",
+      "first_line": "## Data Loading",     // heading line stored verbatim (after sanitise)
       "section": null,
       "heading": 2,                // present only when type=markdown and first line is a heading
       "heading_text": "Data Loading",
@@ -257,6 +286,44 @@ is best-effort.
 - Missing or non-integer `version` → treat as corrupt, trigger rebuild.
 - Readers must tolerate unknown top-level keys (additionalProperties-
   permissive) to allow forward-compatible additions.
+
+---
+
+## §0 — nb-index.py CLI
+
+```
+Usage: python3 nb-index.py <notebook.ipynb> [--force]
+
+Arguments:
+  <notebook.ipynb>  Resolved path to the notebook to index.
+                    Must end with .ipynb and must not be a symlink.
+  --force           Rebuild the index even if it is already fresh.
+
+Exit codes:
+  0  Index written, already fresh, or best-effort success (gitignore
+     write failed non-fatally — still exits 0).
+  1  Unrecoverable error: bad path, containment assertion failed,
+     notebook unreadable, or I/O error writing index.
+
+stdout: always silent.
+stderr: one status line on success; error message(s) on failure.
+        Staleness skip: "[index] fresh — skipping rebuild"
+        Success:        "[index] wrote <path>"
+        Best-effort:    "[warn] ..."  for non-fatal issues (gitignore, etc.)
+```
+
+### 0.1 `_NB_INDEX_SCRIPT` discovery in nb-write.py
+
+The absolute path to `nb-index.py` is computed once at module import time
+in `nb-write.py`:
+
+```python
+_NB_INDEX_SCRIPT = (Path(__file__).parent / "nb-index.py").resolve()
+```
+
+If `_NB_INDEX_SCRIPT` does not exist at that path, the Popen call in §8
+prints a warning to stderr and returns without error. The write operation
+is not affected.
 
 ---
 
@@ -377,13 +444,26 @@ index.
 The `outline` is derived at read time from the `cells` array — it is
 **not** a separate serialised field.
 
-`_derive_outline(cells)` returns a list of compact dicts, one per cell:
+`_derive_outline(cells)` takes the `cells` list from a loaded index
+(or from a notebook fallback) and returns a compact list, one entry per cell:
 
 ```python
-{"i": 0, "type": "code", "exec": 1, "status": "ok", "line": "import Pkg;"}
+{"i": 0, "type": "code", "exec": 1, "status": "ok",   "line": "import Pkg;"}
 {"i": 1, "type": "markdown", "exec": None, "status": None,
  "line": "# Packages", "heading": 1}
 ```
+
+When reading from the **index**, `line` comes from the stored `first_line`
+field (see Schema). When deriving from a **raw notebook** (fallback path),
+`line` is extracted as the first non-empty line of `cell["source"]`,
+stripped of whitespace, ANSI-sanitised, and truncated to 120 chars.
+
+When reading from the **index**, `status` comes from the stored
+`cells[i].status` field. When deriving from a **raw notebook** (fallback),
+status is computed as:
+- `exec` not null, no error outputs → `"ok"`
+- `exec` not null, outputs contain an error → `"error"`
+- `exec` null → `"not_run"`
 
 ### 4.1 One entry per cell
 `len(_derive_outline(cells))` == `cell_count`.
@@ -403,10 +483,10 @@ Source `["  \n", "x = 1\n", "y = 2"]` → `line: "x = 1"`.
 ### 4.5 Empty cell → `"(empty)"`
 Source `[]` or whitespace-only → `line: "(empty)"`.
 
-### 4.6 Execution status derivation
-- `exec` not null, no error output → `"ok"`
-- `exec` not null, outputs contain an error → `"error"`
-- `exec` is null → `"not_run"`
+### 4.6 Execution status derivation (fallback path only)
+When outline is derived from a raw notebook (no index available), compute
+status per the rules above. When reading from the index, use the stored
+`status` field directly.
 
 ### 4.7 Empty notebook (0 cells)
 `_derive_outline([])` returns `[]` without error.
@@ -421,7 +501,12 @@ a section boundary; heading level = count of `#` chars.
 
 ### 5.2 `sections` ordered by `first_cell` ascending
 
-### 5.3 Section spans to next heading of same or higher level
+### 5.3 Section spans to next heading of equal or greater semantic rank
+A section spans from its heading cell to the cell immediately before the next
+heading whose level number is ≤ the current section's level number (e.g. an
+h2 section closes when the next h1 or h2 heading is encountered; an h1 section
+closes only when another h1 is encountered). The last section extends to the
+final cell of the notebook.
 
 ### 5.4 Empty sections list when no headings
 `"sections": []`.
@@ -549,6 +634,16 @@ before storage. No `UnicodeEncodeError` is raised.
 A cell that prints valid JSON text (`{"key": "val"}`) must have that
 text stored as a JSON string value — not deserialized into a dict.
 
+### 7.14 `display_data` with `text/plain` stored as output text
+`{"output_type": "display_data", "data": {"text/plain": "42"}}` →
+`output_text` includes `"42"`. `display_data` appears in `output_types`.
+
+### 7.15 Mixed text and binary outputs in the same cell
+If a cell has both text outputs (stream/execute_result/error/display_data
+with text/plain) and binary outputs (image/png, etc.), the text portions
+are stored in `output_text` subject to the 4 KB cap, and the binary MIME
+types appear in `output_types`. Neither presence blocks the other.
+
 ---
 
 ## §8 — nb-write.py Integration
@@ -584,34 +679,46 @@ argument with no shell expansion.
 Output format per cell (derived from index or notebook directly):
 
 ```
-[N:type:exec] first_line
+[N:type:run=N] first_line
 ```
 
-Where `exec` is the execution count, right-padded to 4 chars, or `——`
-for not-run cells. Section headings are shown as-is:
+Where `run=N` is the execution count, or `run=——` for not-run/markdown
+cells. Markdown/raw cells omit the `run=` field entirely. No `──` bar
+is added in outline mode (one line per cell). Section headings are shown
+as-is:
 
 ```
 analysis.ipynb | 24 cells | python3
 
-[0 :code:1   ] import pandas as pd
-[1 :md  :——  ] ## Data Loading
-[2 :code:——  ] (empty)
+[0:code:run=1 ] import pandas as pd
+[1:markdown   ] ## Data Loading
+[2:code:run=——] (empty)
 ```
+
+Note: `run=` field only on code cells. Field widths are right-padded
+within the bracket to keep columns roughly aligned.
 
 ### 9.1 `--outline` prints compact one-line-per-cell table
 
 ### 9.2 `--outline` reads from index when fresh
+Uses `cells[i].first_line` and `cells[i].status` from the index.
 Must NOT open the `.ipynb` file when a fresh index exists.
 
 ### 9.3 `--outline` falls back to notebook when index absent
-Reads the notebook directly; exec counts come from `execution_count`
-fields.
+Reads the notebook directly; `first_line` derived from cell source,
+exec counts from `execution_count` fields, status derived per §4.6.
 
-### 9.4 Heading cells visually distinct (no bar, type shown as `md`)
+### 9.4 `--outline` uses notebook (with warning) when index is stale
+When the index exists but is stale (any of the three staleness signals
+differ), nb-read.py prints `[STALE INDEX] <path>` to stderr and falls
+back to reading the notebook directly. No synchronous rebuild is
+triggered.
 
-### 9.5 Compatible with `--cells` filter
+### 9.5 Heading cells visually distinct (no bar, type shown as `markdown`)
 
-### 9.6 `--no-safe` applies the same ANSI stripping to `first_line`
+### 9.6 Compatible with `--cells` filter
+
+### 9.7 `--no-safe` applies the same ANSI stripping to `first_line`
 content as it does to cell source in normal mode. `--outline --no-safe`
 is **valid** and must not error.
 
@@ -632,8 +739,9 @@ is **valid** and must not error.
 ### 10.2 Reads output text from index when fresh
 `.ipynb` not opened for output data.
 
-### 10.3 Falls back to notebook when index absent
-Applies same 4 KB cap at render time.
+### 10.3 Falls back to notebook when index absent or stale
+Applies same 4 KB cap at render time. Prints `[STALE INDEX] <path>`
+to stderr when stale (same rule as §9.4).
 
 ### 10.4 Truncated outputs show truncation notice
 
@@ -644,6 +752,12 @@ Applies same 4 KB cap at render time.
 ---
 
 ## §11 — nb-read.py: Execution metadata in cell header
+
+**Breaking change:** The current header format `[0:code] ────────────────────`
+becomes `[0:code:run=——] ──────────────────` for code cells. Markdown and raw
+cells are unchanged: `[1:markdown] ────────────────────`. The tests in
+`test_read_independent.py` and `test_scripts.py` that assert `"[0:code]"` must
+be updated to `"[0:code:run="` when nb-read.py is modified.
 
 ### 11.1 Execution count in code cell header
 Format: `[3:code:run=5]`. `run=——` when execution_count is null.
@@ -663,6 +777,11 @@ keep the bar ≥ 4 chars.
 ### 11.5 Long section name truncation
 A section heading of 80 chars produces at most `…` (20-char truncation
 rule) in the header. No crash from negative bar length.
+
+### 11.6 Section name absent when index unavailable or stale
+When no fresh index exists, section names are omitted from headers (the
+`§Section` field requires the index). Prints `[STALE INDEX]` to stderr
+when the index is stale (same rule as §9.4).
 
 ---
 
@@ -686,8 +805,21 @@ Walk constraints:
 `nb-search.py "process" /path/to/project` finds all cells in indexed
 notebooks whose source contains `"process"` (case-insensitive).
 
+Keyword search (bare positional query, no `--symbol`/`--import` flag)
+**opens the `.ipynb` file** for each indexed notebook to scan cell source
+text directly. The index is used only to locate which notebooks exist in
+the project and to supply metadata (section, exec status) for result lines.
+See §12.13.
+
 ### 12.2 Symbol lookup `--symbol`
 Finds cells where `symbol_index` contains the queried name.
+
+**Fast path:** when `symbols.json` is present at the index root and its
+`generated_at` timestamp is newer than the `indexed_at` of every per-notebook
+index in the project, use it for O(1) lookup. Fall back to serial per-notebook
+index scan when `symbols.json` is absent, stale, or corrupt. The same
+version-compatibility rules apply as for per-notebook indices (unknown version
+→ skip + warn, fallback to serial scan).
 
 ### 12.3 Import lookup `--import`
 Finds cells where `import_index` key starts with the queried module name.
@@ -720,6 +852,13 @@ Stop after N results (default: no limit).
 A crafted index file with `"notebook_path": "../../../../etc/passwd"`
 must not cause nb-search to open that path.
 
+### 12.13 Keyword search reads notebook files; symbol/import search reads index only
+For `nb-search.py QUERY` (no flag): open each notebook's `.ipynb` file to
+scan source text. For `--symbol` and `--import`: read only index JSON files
+(never open `.ipynb`). This distinction preserves the RAG efficiency goal
+for the common symbol/import lookup case while enabling full-text keyword
+search at the cost of file I/O.
+
 ---
 
 ## §13 — Project-Level Symbol Cache (optional derived file)
@@ -749,6 +888,20 @@ The stale notebook's entries are removed, new entries added.
 nb-search.py works correctly without it.
 ### 13.4 Corrupt symbols.json triggers rebuild from per-notebook indices
 ### 13.5 symbols.json itself is NOT indexed by nb-search (skip it)
+
+### 13.6 Atomic write with lock for concurrent indexers
+symbols.json is written using the same temp-file + fsync + `os.replace()`
+pattern as notebook writes. Before reading and writing symbols.json,
+acquire a `LOCK_EX` flock on `.nb_index/symbols.nblock` (companion lock
+file). Use non-blocking try (`LOCK_EX | LOCK_NB`): if the lock is
+unavailable, skip the symbols.json update silently — the other indexer
+will write a consistent version. nb-search falls back to serial scan per
+§13.3.
+
+### 13.7 Version compatibility
+`version > 1` → log warning to stderr, skip, fall back to serial scan.
+`version` missing or non-integer → treat as corrupt, rebuild from
+per-notebook indices.
 
 ---
 
@@ -795,6 +948,48 @@ must NOT be found (exceeds max depth 20). Walk exits cleanly.
 A project with `node_modules/deep/.nb_index/nb.ipynb.json` must not
 have that index loaded by nb-search.
 
+### 14.11 `first_line` stored correctly for all cell types
+After indexing: a code cell with source `["x = 1\n", "y = 2"]` has
+`first_line: "x = 1"`. A markdown cell with source `"## Heading\n..."` has
+`first_line: "## Heading"`. An empty cell has `first_line: "(empty)"`.
+
+### 14.12 `display_data` output treated as text
+A cell with `{"output_type": "display_data", "data": {"text/plain": "fig"}}` →
+`output_text: "fig"`, `has_output: true`, `"display_data"` in `output_types`.
+
+### 14.13 `--outline` from fresh index never opens notebook file
+Patch a test notebook; index it; use `strace` or mock `open()` to verify
+nb-read.py does NOT open the `.ipynb` during `--outline` when index is fresh.
+
+---
+
+## §15 — Shared Index Discovery Logic
+
+The functions `_find_index_dir(nb_path)` and `_index_file_path(nb_path)`
+are **re-implemented identically** in `nb-index.py`, `nb-read.py`, and
+`nb-search.py`. There is no shared import between scripts (all scripts
+are stdlib-only, standalone executables). The implementations must be
+byte-for-byte equivalent except for module-level constants.
+
+Implementations must follow exactly the algorithm in §1:
+1. `Path(nb_path).resolve()` first.
+2. Walk upward at most 20 levels, check `os.path.lexists(d / ".git")`,
+   stop if `st_dev` changes.
+3. Construct index path per §1.5 or §1.6.
+4. Assert containment per §1.7 before any mkdir.
+
+nb-read.py performs the three-signal staleness check (§A3) before
+deciding which path to take for `--outline`, `--outputs`, and `§Section`
+header features:
+
+| Index state | nb-read.py behaviour |
+|-------------|----------------------|
+| Fresh | Use index (no .ipynb open) |
+| Absent | Fall back to notebook |
+| Stale | Fall back to notebook + `[STALE INDEX]` on stderr |
+
+nb-read.py never triggers a synchronous rebuild.
+
 ---
 
 ## New files
@@ -810,10 +1005,13 @@ have that index loaded by nb-search.
 
 | Path | Changes |
 |------|---------|
-| `scripts/nb-read.py` | `--outline`, `--outputs`, exec+section in header (§9–§11) |
-| `scripts/nb-write.py` | Fire-and-forget `nb-index.py` call after save (§8) |
+| `scripts/nb-read.py` | `--outline`, `--outputs`, exec+section in header (§9–§11); index discovery (§15) |
+| `scripts/nb-write.py` | `_NB_INDEX_SCRIPT` constant (§0.1); fire-and-forget Popen after save (§8) |
 | `SKILL.md` | Rule 0 (index first); `nb-index.py` / `nb-search.py` usage |
-| `tests/test_scripts.py` | Extended for new read flags |
+| `tests/test_scripts.py` | Update `[N:code]` header assertions → `[N:code:run=` (§11 breaking change) |
+| `tests/test_read_independent.py` | Same header format update as above |
+| `install.py` | Copy `nb-index.py` and `nb-search.py` to `scripts_dst`; make executable on POSIX |
+| `uninstall.py` | No functional change; ensure it does not reference removed files |
 
 ## Out of scope (v1)
 
