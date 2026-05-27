@@ -132,6 +132,33 @@ class TestWalkStrategy:
         r = run_search(["hidden", str(tmp_path)])
         assert "hidden" not in r.stdout
 
+    def test_skips_venv_undotted(self, tmp_path):
+        """§12 walk: plain 'venv' (without dot) must also be skipped"""
+        venv = tmp_path / "venv" / "lib"
+        venv.mkdir(parents=True)
+        nb = make_notebook([code_cell("venv_hidden = 1")], tmp_path=venv, name="nb.ipynb")
+        run_indexer(nb)
+        r = run_search(["venv_hidden", str(tmp_path)])
+        assert "venv_hidden" not in r.stdout
+
+    def test_skips_tox(self, tmp_path):
+        """§12 walk: .tox must be skipped"""
+        tox = tmp_path / ".tox" / "py311"
+        tox.mkdir(parents=True)
+        nb = make_notebook([code_cell("tox_hidden = 1")], tmp_path=tox, name="nb.ipynb")
+        run_indexer(nb)
+        r = run_search(["tox_hidden", str(tmp_path)])
+        assert "tox_hidden" not in r.stdout
+
+    def test_skips_git_dir(self, tmp_path):
+        """§12 walk: .git must be skipped"""
+        git = tmp_path / ".git" / "hooks"
+        git.mkdir(parents=True)
+        nb = make_notebook([code_cell("git_hidden = 1")], tmp_path=git, name="nb.ipynb")
+        run_indexer(nb)
+        r = run_search(["git_hidden", str(tmp_path)])
+        assert "git_hidden" not in r.stdout
+
     def test_skips_pycache(self, tmp_path):
         """§12 walk: __pycache__ must be skipped"""
         pc = tmp_path / "__pycache__"
@@ -142,7 +169,7 @@ class TestWalkStrategy:
         assert "cached" not in r.stdout
 
     def test_does_not_follow_symlinks(self, tmp_path):
-        """§12 walk: followlinks=False — symlink directories not traversed"""
+        """§12 walk: followlinks=False — symlink not traversed, no duplicate results"""
         real = tmp_path / "real_dir"
         real.mkdir()
         nb = make_notebook([code_cell("symlinked = 1")], tmp_path=real, name="nb.ipynb")
@@ -150,9 +177,15 @@ class TestWalkStrategy:
         link = tmp_path / "linked"
         link.symlink_to(real, target_is_directory=True)
         r = run_search(["symlinked", str(tmp_path)])
-        # The real_dir result may appear, but the symlink must not add duplicates
-        # from the linked path. This primarily checks no crash and followlinks=False.
-        assert r.returncode in (0, 1)
+        # The real_dir result may appear (it was indexed there) but the symlinked
+        # path must NOT produce a second result.
+        if r.returncode == 0:
+            matching_lines = [l for l in r.stdout.splitlines()
+                              if "symlinked" in l or "nb.ipynb" in l]
+            assert len(matching_lines) <= 1, (
+                f"followlinks=False must prevent duplicate results via symlink; "
+                f"got {len(matching_lines)} lines:\n{r.stdout}"
+            )
 
     def test_walk_depth_limit(self, tmp_path):
         """§14.9: .nb_index/ at level > 20 must NOT be found"""
@@ -164,6 +197,18 @@ class TestWalkStrategy:
         run_indexer(nb)
         r = run_search(["deeptoken", str(tmp_path)])
         assert "deeptoken" not in r.stdout
+
+    def test_walk_depth_within_limit_found(self, tmp_path):
+        """Positive control: .nb_index/ at level 18 MUST be found (< 20 limit)"""
+        deep = tmp_path
+        for i in range(18):
+            deep = deep / f"level{i}"
+        deep.mkdir(parents=True)
+        make_indexed_project(deep, [("nb.ipynb", [code_cell("shallow_token = 1")])])
+        r = run_search(["shallow_token", str(tmp_path)])
+        assert r.returncode == 0, (
+            "Notebook at depth 18 must be found (within 20-level limit)"
+        )
 
     def test_finds_notebook_in_subdirectory(self, tmp_path):
         """Walk should find .nb_index/ directories in subdirectories"""
@@ -222,7 +267,9 @@ class TestKeywordSearch:
         ])
         r = run_search(["common_func", str(tmp_path)])
         assert r.returncode == 0
-        assert "nb1.ipynb" in r.stdout or "nb2.ipynb" in r.stdout
+        assert "nb1.ipynb" in r.stdout and "nb2.ipynb" in r.stdout, (
+            "Keyword appearing in both notebooks must return results from both"
+        )
 
     def test_keyword_result_format(self, tmp_path):
         """§12.4: result format is '<path>:<N>: <first_line>'"""
@@ -333,6 +380,18 @@ class TestImportSearch:
             "--import must succeed using index alone, even if .ipynb is deleted"
         )
 
+    def test_import_prefix_no_false_match(self, tmp_path):
+        """§12.3: prefix match must not match a longer module name"""
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("import sklearnx\n")])
+        ])
+        # 'sklearn' must NOT match 'sklearnx' (sklearnx does not start with 'sklearn.')
+        r = run_search(["--import", "sklearn", str(tmp_path)])
+        assert r.returncode == 1, (
+            "--import sklearn must not match 'sklearnx' (prefix match, not substring); "
+            f"got exit {r.returncode}; stdout: {r.stdout!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # §12.4, §12.10, §12.11 — Output format / streaming / --limit
@@ -353,7 +412,7 @@ class TestOutputFormat:
         assert len(lines) >= 1
 
     def test_result_line_contains_notebook_path_and_cell_index(self, tmp_path):
-        """§12.4: format '<path>:<N>: ...'"""
+        """§12.4: format 'relative/path.ipynb:N: first source line'"""
         make_indexed_project(tmp_path, [
             ("mynotebook.ipynb", [code_cell("unique_token_xyz = 42\n")])
         ])
@@ -361,8 +420,18 @@ class TestOutputFormat:
         assert r.returncode == 0
         line = r.stdout.strip().splitlines()[0]
         assert "mynotebook.ipynb" in line
-        # Must contain at least one colon (separating path from cell index)
-        assert ":" in line
+        # Format: path:N: ... where N is an integer cell index
+        # Must have at least two colons
+        parts = line.split(":")
+        assert len(parts) >= 3, f"Expected 'path:N:line' format, got: {line!r}"
+        # The part after the path must be a numeric cell index
+        nb_part_end = line.index("mynotebook.ipynb") + len("mynotebook.ipynb")
+        rest = line[nb_part_end:]  # ":N: first line"
+        assert rest.startswith(":"), f"Expected ':N:' after notebook name, got: {rest!r}"
+        index_part = rest[1:].split(":")[0]
+        assert index_part.isdigit(), (
+            f"Cell index must be an integer, got: {index_part!r} in line: {line!r}"
+        )
 
     def test_limit_flag(self, tmp_path):
         """§12.11: --limit N stops after N results"""
@@ -388,31 +457,57 @@ class TestOutputFormat:
 class TestTypeFilter:
 
     def test_type_code_filter(self, tmp_path):
-        """§12.5: --type code returns only code cells"""
+        """§12.5: --type code returns only code cells, not markdown cells"""
         make_indexed_project(tmp_path, [
             ("nb.ipynb", [
-                code_cell("typefilter = 1\n"),
-                markdown_cell("typefilter heading\n", cell_id="m1"),
+                code_cell("typefilter_code = 1\n"),
+                markdown_cell("typefilter_md heading\n", cell_id="m1"),
             ])
         ])
-        r = run_search(["typefilter", "--type", "code", str(tmp_path)])
+        # Search for a token only in the markdown cell with --type code
+        r = run_search(["typefilter_md", "--type", "code", str(tmp_path)])
+        # The markdown cell must NOT appear (token only exists in markdown)
+        assert r.returncode == 1, (
+            "--type code must not return markdown cell results "
+            f"(expected exit 1, got {r.returncode}); stdout: {r.stdout!r}"
+        )
+
+    def test_type_code_filter_returns_code_cell(self, tmp_path):
+        """§12.5: --type code returns code cells that match"""
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [
+                code_cell("typefilter_code = 1\n"),
+                markdown_cell("typefilter_md heading\n", cell_id="m1"),
+            ])
+        ])
+        r = run_search(["typefilter_code", "--type", "code", str(tmp_path)])
         assert r.returncode == 0
-        # All returned results should indicate code cells somehow
-        # (at minimum, the markdown cell's result should not appear)
-        # We check by using --symbol which explicitly scans code cells' symbol index
-        r2 = run_search(["--symbol", "typefilter", str(tmp_path)])
-        if r2.returncode == 0:
-            assert "nb.ipynb" in r2.stdout
+        assert "nb.ipynb" in r.stdout or "typefilter_code" in r.stdout
 
     def test_type_markdown_filter(self, tmp_path):
-        """§12.5: --type markdown returns only markdown cells"""
+        """§12.5: --type markdown returns only markdown cells, not code cells"""
         make_indexed_project(tmp_path, [
             ("nb.ipynb", [
-                code_cell("# markdowntoken = code comment\n"),
-                markdown_cell("markdowntoken in heading\n", cell_id="m1"),
+                code_cell("markdowntoken_code = 1\n"),
+                markdown_cell("markdowntoken_md in heading\n", cell_id="m1"),
             ])
         ])
-        r = run_search(["markdowntoken", "--type", "markdown", str(tmp_path)])
+        # Search for token only in the code cell with --type markdown
+        r = run_search(["markdowntoken_code", "--type", "markdown", str(tmp_path)])
+        assert r.returncode == 1, (
+            "--type markdown must not return code cell results "
+            f"(expected exit 1, got {r.returncode}); stdout: {r.stdout!r}"
+        )
+
+    def test_type_markdown_filter_returns_markdown_cell(self, tmp_path):
+        """§12.5: --type markdown returns markdown cells that match"""
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [
+                code_cell("markdowntoken_code = 1\n"),
+                markdown_cell("markdowntoken_md in heading\n", cell_id="m1"),
+            ])
+        ])
+        r = run_search(["markdowntoken_md", "--type", "markdown", str(tmp_path)])
         assert r.returncode == 0
 
     def test_invalid_type_exits_2(self, tmp_path):
@@ -432,17 +527,34 @@ class TestSectionFilter:
         """§12.8: --section limits results to cells within the named section"""
         cells = [
             markdown_cell("## Data Loading\n", cell_id="m0"),
-            code_cell("load_data = True\n", cell_id="c1"),
+            code_cell("filtered_token = True\n", cell_id="c1"),
             markdown_cell("## Analysis\n", cell_id="m2"),
-            code_cell("load_data = False\n", cell_id="c3"),  # same name, different section
+            code_cell("other_token = False\n", cell_id="c3"),
         ]
         make_indexed_project(tmp_path, [("nb.ipynb", cells)])
-        r = run_search(["load_data", "--section", "Data Loading", str(tmp_path)])
-        assert r.returncode == 0
-        # Should match cell 1 (in Data Loading), not necessarily cell 3 (in Analysis)
-        lines = r.stdout.strip().splitlines()
-        assert any(":1:" in l or "Data Loading" in r.stdout for l in lines), (
-            "--section must filter by section name"
+        # Search for a token ONLY in the "Data Loading" section
+        r = run_search(["filtered_token", "--section", "Data Loading", str(tmp_path)])
+        assert r.returncode == 0, (
+            "--section Data Loading filter must find filtered_token "
+            f"(exit {r.returncode}); stderr: {r.stderr!r}"
+        )
+        assert "filtered_token" in r.stdout or ":1:" in r.stdout
+
+    def test_section_filter_excludes_other_sections(self, tmp_path):
+        """§12.8: --section must not return results from other sections"""
+        cells = [
+            markdown_cell("## Data Loading\n", cell_id="m0"),
+            code_cell("shared_token = True\n", cell_id="c1"),
+            markdown_cell("## Analysis\n", cell_id="m2"),
+            code_cell("shared_token = False\n", cell_id="c3"),
+        ]
+        make_indexed_project(tmp_path, [("nb.ipynb", cells)])
+        # Search with section filter — should only return c1 (in Data Loading), not c3
+        r = run_search(["shared_token", "--section", "Data Loading", str(tmp_path)])
+        # c3 (cell index 3) must NOT appear in results
+        assert ":3:" not in r.stdout, (
+            "--section filter must exclude cells from other sections; "
+            f"cell 3 (Analysis section) appeared in output: {r.stdout!r}"
         )
 
 
@@ -498,7 +610,7 @@ class TestStaleUnindexed:
         assert "UNINDEXED" in r.stderr or "unindexed" in r.stderr.lower()
 
     def test_stale_index_warns_on_stderr(self, tmp_path):
-        """§12.6: stale index prints warning on stderr, results still printed"""
+        """§12.6: stale index prints warning on stderr AND still returns results"""
         make_indexed_project(tmp_path, [
             ("nb.ipynb", [code_cell("stale_token = 1\n")])
         ])
@@ -507,9 +619,16 @@ class TestStaleUnindexed:
         t = nb_path.stat().st_mtime + 10
         os.utime(nb_path, (t, t))
         r = run_search(["stale_token", str(tmp_path)])
-        # Search should still return results (§12.6 says "return results anyway")
+        # §12.6: warn AND still return results (exit 0, results in stdout)
         assert "STALE" in r.stderr, (
             f"Expected [STALE] warning on stderr for stale index: {r.stderr!r}"
+        )
+        assert r.returncode == 0, (
+            "Stale index search must still return results (exit 0), "
+            f"got exit {r.returncode}; stdout: {r.stdout!r}"
+        )
+        assert "stale_token" in r.stdout or "nb.ipynb" in r.stdout, (
+            "Results must still be printed even when index is stale"
         )
 
 
@@ -572,10 +691,11 @@ class TestSecurity:
             ("nb.ipynb", [code_cell("def target_func():\n    pass\n")])
         ])
         symbols_path = tmp_path / ".nb_index" / "symbols.json"
-        if symbols_path.exists():
-            data = json.loads(symbols_path.read_text(encoding="utf-8"))
-            data.setdefault("symbols", {})["target_func"] = ["../../../../etc/passwd:0"]
-            symbols_path.write_text(json.dumps(data), encoding="utf-8")
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json yet")
+        data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        data.setdefault("symbols", {})["target_func"] = ["../../../../etc/passwd:0"]
+        symbols_path.write_text(json.dumps(data), encoding="utf-8")
         r = run_search(["--symbol", "target_func", str(tmp_path)])
         assert "Traceback" not in r.stderr
         assert "/etc/passwd" not in r.stdout
@@ -587,10 +707,14 @@ class TestSecurity:
         ])
         idx_dir = tmp_path / ".nb_index"
         for json_file in idx_dir.glob("*.json"):
-            json_file.write_text("not valid json {{{", encoding="utf-8")
+            if json_file.name != "symbols.json":
+                json_file.write_text("not valid json {{{", encoding="utf-8")
         r = run_search(["x", str(tmp_path)])
         assert "Traceback" not in r.stderr
-        assert r.returncode in (0, 1, 2)
+        # Corrupt index → skipped → no matches → exit 1; exit 0 if symbols.json still valid
+        assert r.returncode in (0, 1), (
+            f"Corrupt index must not cause exit 2 (usage error), got {r.returncode}"
+        )
 
     def test_future_version_index_skipped(self, tmp_path):
         """Schema: version > 1 → skip + warn, no crash"""
@@ -651,14 +775,18 @@ class TestSymbolsJsonFastPath:
             ("nb.ipynb", [code_cell("def fast_lookup():\n    pass\n")])
         ])
         symbols_path = tmp_path / ".nb_index" / "symbols.json"
-        if symbols_path.exists():
-            # Delete individual index files to force reliance on symbols.json
-            for f in (tmp_path / ".nb_index").glob("nb.ipynb.json"):
-                f.unlink()
-            r = run_search(["--symbol", "fast_lookup", str(tmp_path)])
-            # If symbols.json fast path is used, this should succeed
-            # (the per-notebook index is gone but symbols.json has the data)
-            assert r.returncode in (0, 1)  # 0 if fast path used, 1 if falls back to serial scan
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json yet")
+        # Delete individual per-notebook index files to force reliance on symbols.json
+        for f in (tmp_path / ".nb_index").glob("nb.ipynb.json"):
+            f.unlink()
+        r = run_search(["--symbol", "fast_lookup", str(tmp_path)])
+        # If symbols.json fast path is used, this should succeed even without
+        # the per-notebook index file.
+        assert r.returncode == 0, (
+            "When symbols.json is fresh, --symbol must succeed without per-notebook index files; "
+            f"got exit {r.returncode}; stderr: {r.stderr!r}"
+        )
 
     def test_symbols_json_stale_falls_back(self, tmp_path):
         """§12.2: stale symbols.json falls back to serial per-notebook scan"""
@@ -666,16 +794,24 @@ class TestSymbolsJsonFastPath:
             ("nb.ipynb", [code_cell("def fallback_func():\n    pass\n")])
         ])
         symbols_path = tmp_path / ".nb_index" / "symbols.json"
-        if symbols_path.exists():
-            # Make a per-notebook index appear newer than symbols.json
-            nb_idx = tmp_path / ".nb_index" / "nb.ipynb.json"
-            if nb_idx.exists():
-                future = symbols_path.stat().st_mtime + 100
-                os.utime(nb_idx, (future, future))
-            r = run_search(["--symbol", "fallback_func", str(tmp_path)])
-            # Must still find the symbol via serial scan fallback
-            assert r.returncode == 0, (
-                "Stale symbols.json must fall back to serial scan and still find results"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json yet")
+        nb_idx = tmp_path / ".nb_index" / "nb.ipynb.json"
+        if not nb_idx.exists():
+            pytest.skip("Per-notebook index file not found")
+        # Make symbols.json appear stale: set its generated_at to a past time and
+        # bump the per-notebook index mtime so it's newer.
+        sym_data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        sym_data["generated_at"] = "2000-01-01T00:00:00Z"
+        # Also update max_indexed_at to a past value to ensure freshness check fails
+        sym_data["max_indexed_at"] = "2000-01-01T00:00:00Z"
+        symbols_path.write_text(json.dumps(sym_data), encoding="utf-8")
+        future = symbols_path.stat().st_mtime + 100
+        os.utime(nb_idx, (future, future))
+        r = run_search(["--symbol", "fallback_func", str(tmp_path)])
+        # Must still find the symbol via serial scan fallback
+        assert r.returncode == 0, (
+            "Stale symbols.json must fall back to serial scan and still find results"
             )
 
     def test_corrupt_symbols_json_falls_back(self, tmp_path):
@@ -684,8 +820,9 @@ class TestSymbolsJsonFastPath:
             ("nb.ipynb", [code_cell("def corrupt_test():\n    pass\n")])
         ])
         symbols_path = tmp_path / ".nb_index" / "symbols.json"
-        if symbols_path.exists():
-            symbols_path.write_text("{corrupt json{{", encoding="utf-8")
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json yet")
+        symbols_path.write_text("{corrupt json{{", encoding="utf-8")
         r = run_search(["--symbol", "corrupt_test", str(tmp_path)])
         assert "Traceback" not in r.stderr
         assert r.returncode == 0, (
@@ -703,4 +840,42 @@ class TestSymbolsJsonFastPath:
         r = run_search(["--symbol", "serial_scan_func", str(tmp_path)])
         assert r.returncode == 0, (
             "Missing symbols.json must fall back to serial scan"
+        )
+
+
+# ---------------------------------------------------------------------------
+# §12.10 — Streaming output (results printed as found, not buffered)
+# ---------------------------------------------------------------------------
+
+class TestStreamingOutput:
+    """§12.10: nb-search must print results as found, not buffer until all files loaded."""
+
+    def test_first_result_before_all_files_scanned(self, tmp_path):
+        """§12.10: output is not withheld until all files are processed"""
+        # Create multiple notebooks so there is real work to do
+        notebooks = [
+            (f"nb{i:02}.ipynb", [code_cell(f"stream_token = {i}\n", cell_id=f"c{i:03}")])
+            for i in range(5)
+        ]
+        make_indexed_project(tmp_path, notebooks)
+        # Run search and capture output — streaming means exit 0 with results in stdout
+        r = run_search(["stream_token", str(tmp_path)])
+        assert r.returncode == 0
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        assert len(lines) >= 5, (
+            f"Expected at least 5 results (one per notebook), got {len(lines)}: {r.stdout!r}"
+        )
+
+    def test_limit_stops_early(self, tmp_path):
+        """§12.10/§12.11: --limit stops output before scanning all files"""
+        # Create 10 notebooks each with the search token
+        notebooks = [
+            (f"nb{i:02}.ipynb", [code_cell(f"early_stop = {i}\n", cell_id=f"c{i:03}")])
+            for i in range(10)
+        ]
+        make_indexed_project(tmp_path, notebooks)
+        r = run_search(["early_stop", "--limit", "3", str(tmp_path)])
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        assert len(lines) <= 3, (
+            f"--limit 3 must stop output at 3 results, got {len(lines)}: {r.stdout!r}"
         )

@@ -22,6 +22,7 @@ Section mapping:
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -293,30 +294,51 @@ class TestIndexLocation:
         assert (tmp_path / ".nb_index").is_dir()
 
     def test_two_representations_same_index(self, tmp_path):
-        """§1.11: ./a/../b.ipynb and ./b.ipynb → same index path"""
+        """§1.11: ./sub/../nb.ipynb and ./nb.ipynb → same resolved index path"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path, name="nb.ipynb")
         # First run via canonical path
         r1 = run_indexer(nb)
         assert r1.returncode == 0
         idx1 = index_path_for(nb)
+        assert idx1.exists()
         inode1 = idx1.stat().st_ino
 
-        # Force rebuild via a non-canonical path that resolves to the same file
+        # Second run via a non-canonical path that resolves to the same file.
+        # Create 'sub' so the path is structurally valid before resolve().
+        (tmp_path / "sub").mkdir(exist_ok=True)
         dotdot = tmp_path / "sub" / ".." / "nb.ipynb"
-        run_indexer(nb, extra_args=["--force"])
-        inode2 = idx1.stat().st_ino
-        # After --force the inode changes (new file written), but the path is the same
-        assert idx1.exists(), "Index path must be the same regardless of input representation"
+        # The dotdot string resolves to the same real file; --force ensures a rebuild.
+        r2 = run_indexer(dotdot, extra_args=["--force"])
+        assert r2.returncode == 0, (
+            f"Indexing via non-canonical path must succeed: {r2.stderr}"
+        )
+        # The index must be written to the same location (same inode after a second write
+        # would be different, but the PATH must be the same file we already know about).
+        idx2 = index_path_for(nb)  # canonical form
+        assert idx2 == idx1, "Both path forms must produce the same index path"
+        assert idx2.exists(), "Index must exist after second run"
 
     def test_containment_violation_exits_1(self, tmp_path):
-        """§1.7: notebook path with ../ that escapes .nb_index must exit 1"""
-        # We can't trivially construct a path that escapes after normalization
-        # when using Path.resolve() — the path is resolved first. But we can
-        # test that a crafted absolute path outside any .git tree that would
-        # require .nb_index to be at a parent of an existing directory fails.
-        # The most direct test: pass a path that doesn't end in .ipynb or is missing.
-        r = run_indexer(tmp_path / "nonexistent.ipynb")
-        assert r.returncode == 1
+        """§1.7: notebook that resolves outside the git root must not escape .nb_index/"""
+        # Set up a git root and a real notebook OUTSIDE it.
+        git_root = tmp_path / "project"
+        git_root.mkdir()
+        (git_root / ".git").mkdir()
+        outside = tmp_path / "external"
+        outside.mkdir()
+        real_nb = make_notebook([code_cell("x = 1")], tmp_path=outside, name="ext.ipynb")
+        # Create a symlink inside the git root pointing to the external notebook.
+        # nb-index.py rejects symlinks (§0), so exit 1 is expected.
+        link = git_root / "linked.ipynb"
+        link.symlink_to(real_nb)
+        r = run_indexer(link)
+        assert r.returncode == 1, (
+            "Symlink notebook (possible containment escape) must be rejected with exit 1"
+        )
+        # Verify no index was created outside the project
+        assert not (outside / ".nb_index").exists(), (
+            "Must not create .nb_index outside git root via symlink"
+        )
 
     def test_git_symlink_skipped(self, tmp_path):
         """§1.2: .git that is a symlink is NOT treated as git root"""
@@ -446,18 +468,22 @@ class TestGitignore:
             f"Expected a symlink warning on stderr: {r.stderr!r}"
         )
 
-    @pytest.mark.skipif(os.getuid() == 0, reason="root can write read-only dirs")
+    @pytest.mark.skipif(
+        sys.platform == "win32" or getattr(os, "getuid", lambda: -1)() == 0,
+        reason="POSIX-only; root can write read-only dirs",
+    )
     def test_readonly_directory_handled_gracefully(self, tmp_path):
-        """§2.7: read-only directory must not cause exit 1"""
+        """§2.7: read-only directory .gitignore failure must not produce unhandled traceback"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         try:
             os.chmod(tmp_path, 0o555)
             r = run_indexer(nb)
-            # Exit code depends on whether .nb_index can be created, but the
-            # .gitignore write failure alone should not cause exit 1
-            # In practice, mkdir will also fail, so exit 1 is allowed here.
-            # What the test verifies is no unhandled exception traceback.
-            assert "Traceback" not in r.stderr
+            # mkdir for .nb_index will also fail in a read-only dir, so exit 1 is
+            # acceptable here. What the test verifies is no unhandled exception traceback
+            # from a .gitignore write failure.
+            assert "Traceback" not in r.stderr, (
+                f"Must not produce a bare Traceback on read-only dir: {r.stderr!r}"
+            )
         finally:
             os.chmod(tmp_path, 0o755)
 
@@ -543,6 +569,11 @@ class TestStaleness:
             assert inode_after != inode_before, (
                 "Index must rebuild when hash differs even with same mtime+size"
             )
+        else:
+            pytest.skip(
+                f"make_notebook produced different sizes ({nb2.stat().st_size} vs "
+                f"{original_size}); size-equality precondition not met"
+            )
 
     def test_fresh_index_not_rebuilt(self, tmp_path):
         """§3.5: no rebuild when all three signals match (inode unchanged)"""
@@ -557,12 +588,13 @@ class TestStaleness:
         )
 
     def test_fresh_index_stderr_says_fresh(self, tmp_path):
-        """§0 stderr: 'fresh — skipping' on no-rebuild"""
+        """§0 stderr: '[index] fresh — skipping rebuild' on no-rebuild"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         run_indexer(nb)
         r = run_indexer(nb)
-        assert "fresh" in r.stderr.lower() or "skip" in r.stderr.lower(), (
-            f"Expected 'fresh' or 'skip' in stderr on no-rebuild: {r.stderr!r}"
+        # Spec format: "[index] fresh — skipping rebuild"
+        assert "fresh" in r.stderr.lower() and "skip" in r.stderr.lower(), (
+            f"Expected both 'fresh' and 'skip' in stderr on no-rebuild: {r.stderr!r}"
         )
 
     def test_force_rebuilds_fresh_index(self, tmp_path):
@@ -773,9 +805,11 @@ class TestSectionExtraction:
         )
         run_indexer(nb)
         data = load_index(index_path_for(nb))
-        # The heading cell is at the boundary; spec says section field is for
-        # containing section. An h2 heading is not inside the section it opens.
-        # Test only that subsequent cells have the correct section.
+        # The heading cell (cells[0]) opens Section A but is NOT contained within it.
+        assert data["cells"][0]["section"] is None, (
+            "Heading cell must have section=null (it opens the section, is not inside it)"
+        )
+        # The code cell following the heading IS inside Section A.
         assert data["cells"][1]["section"] == "Section A"
 
     def test_h1_closes_h2_section(self, tmp_path):
@@ -803,10 +837,11 @@ class TestSectionExtraction:
         nb = make_notebook(cells, tmp_path=tmp_path)
         run_indexer(nb)
         data = load_index(index_path_for(nb))
-        # Cells under ### Sub are inside ## Main (h3 > h2 in level number,
-        # so h3 doesn't close h2)
-        assert data["cells"][3]["section"] in ("Sub", "Main"), (
-            "Cell under h3 should be in h3 section (or its h2 parent, depending on spec)"
+        # Per §5.3: section = innermost containing heading.
+        # h3 "Sub" opens its own sub-section inside h2 "Main".
+        # Cells[3] (under h3) are in section "Sub" (the innermost heading).
+        assert data["cells"][3]["section"] == "Sub", (
+            "Cell under h3 must be in the h3 sub-section, not the parent h2 section"
         )
 
 
@@ -950,14 +985,21 @@ class TestSymbolExtraction:
         assert "y" in data["cells"][0]["symbols_defined"]
 
     def test_adversarial_no_closing_delimiter(self, tmp_path):
-        """§6.17: 10k-char line with no closing paren must return in < 100 ms"""
+        """§6.17: 10k-char line with no closing paren must return quickly, not be captured"""
         source = "library(" + "a" * 10000 + "\n"
         nb = make_notebook([code_cell(source)], kernel_language="r", tmp_path=tmp_path)
         start = time.monotonic()
         r = run_indexer(nb)
         elapsed = time.monotonic() - start
         assert r.returncode == 0
-        assert elapsed < 5.0, f"Indexer took {elapsed:.2f}s on adversarial input (limit 5s)"
+        # Per spec: < 100ms for adversarial lines; use 2s as practical subprocess budget
+        assert elapsed < 2.0, f"Indexer took {elapsed:.2f}s on adversarial input (limit 2s)"
+        # The long line must be silently skipped — no spurious import must be captured
+        data = load_index(index_path_for(nb))
+        captured = data["cells"][0].get("symbols_imported", [])
+        assert not any("a" * 100 in s for s in captured), (
+            "Adversarial long line must be skipped, not partially captured"
+        )
 
     def test_symbol_name_length_cap(self, tmp_path):
         """§6.18: identifier > MAX_SYMBOL_LEN (256) is discarded"""
@@ -978,12 +1020,17 @@ class TestSymbolExtraction:
         assert name in data["cells"][0]["symbols_defined"]
 
     def test_symbol_count_cap_per_cell(self, tmp_path):
-        """§6.19: more than MAX_SYMBOLS_PER_CELL (500) assignments are capped"""
+        """§6.19: more than MAX_SYMBOLS_PER_CELL (500) assignments are capped at exactly 500"""
         lines = "".join(f"a{i} = {i}\n" for i in range(600))
         nb = make_notebook([code_cell(lines)], tmp_path=tmp_path)
         run_indexer(nb)
         data = load_index(index_path_for(nb))
-        assert len(data["cells"][0]["symbols_defined"]) <= 500
+        count = len(data["cells"][0]["symbols_defined"])
+        # All 600 unique symbols; capped at 500 — the first 500 must be present
+        assert count == 500, (
+            f"Expected exactly 500 symbols after cap (got {count}); "
+            "cap must retain first 500, not drop all"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1031,19 +1078,26 @@ class TestOutputStorage:
         assert "display_data" in cell.get("output_types", [])
 
     def test_binary_output_not_stored_in_text(self, tmp_path):
-        """§7.4"""
+        """§7.4: binary-only output must NOT produce an output_text key at all"""
         cell = self._run(
             [code_cell("plot()", outputs=[png_output()])],
             tmp_path
         )
-        assert "output_text" not in cell or cell.get("output_text") == ""
+        # Spec §7.4/§7.8: no output_text key for binary-only cells (not even empty string)
+        assert "output_text" not in cell, (
+            f"output_text must be absent for binary-only output, got: {cell.get('output_text')!r}"
+        )
         assert cell["has_output"] is True
         assert "image/png" in cell.get("output_types", [])
 
     def test_no_output_no_output_text_key(self, tmp_path):
-        """§7.8"""
+        """§7.8: cell with no outputs must have has_output=false and no output_text key"""
         cell = self._run([code_cell("x = 1")], tmp_path)
-        assert not cell.get("has_output", False)
+        # has_output must be explicitly False, not merely absent
+        assert cell.get("has_output") is False, (
+            f"has_output must be explicitly False for cells with no output, "
+            f"got: {cell.get('has_output')!r}"
+        )
         assert "output_text" not in cell
 
     def test_output_types_deduplicated(self, tmp_path):
@@ -1067,7 +1121,7 @@ class TestOutputStorage:
         assert types.index("stream") < types.index("execute_result")
 
     def test_4kb_cap_truncation(self, tmp_path):
-        """§7.5: output > 4096 bytes truncated at last complete line"""
+        """§7.5: output > 4096 bytes truncated at last complete line boundary"""
         lines = ("x" * 100 + "\n") * 60   # ~6 KB
         cell = self._run(
             [code_cell("x", outputs=[stream_output(lines)])],
@@ -1076,6 +1130,10 @@ class TestOutputStorage:
         text = cell.get("output_text", "")
         assert cell["output_truncated"] is True
         assert len(text.encode("utf-8")) <= 4096
+        # Must end at a line boundary (spec §7.5: "last complete line before boundary")
+        assert text.endswith("\n"), (
+            f"Truncated output must end at a newline (line boundary), got: {text[-20:]!r}"
+        )
 
     def test_exact_4096_bytes_not_truncated(self, tmp_path):
         """§7.6"""
@@ -1089,7 +1147,7 @@ class TestOutputStorage:
         assert cell.get("output_truncated") is False
 
     def test_single_line_over_4096_hard_truncated(self, tmp_path):
-        """§7.7"""
+        """§7.7: single line > 4096 bytes → hard truncate at 4096 + suffix"""
         long_line = "a" * 5000 + "\n"
         cell = self._run(
             [code_cell("x", outputs=[stream_output(long_line)])],
@@ -1099,7 +1157,11 @@ class TestOutputStorage:
         text = cell.get("output_text", "")
         assert text != "", "output_text must not be empty for single-line overflow"
         assert "[truncated mid-line]" in text
-        assert len(text.encode("utf-8")) <= 4096 + len("\n[truncated mid-line]")
+        # Spec: "store first 4096 bytes … with suffix '\n[truncated mid-line]'"
+        suffix = "\n[truncated mid-line]"
+        assert len(text.encode("utf-8")) <= 4096 + len(suffix.encode("utf-8")), (
+            f"Hard-truncated output is too long: {len(text.encode('utf-8'))} bytes"
+        )
 
     def test_null_bytes_stripped(self, tmp_path):
         """§7.11"""
@@ -1156,14 +1218,24 @@ class TestWriteIntegration:
     """
 
     def _mock_indexer(self, tmp_path):
-        """Write a stub nb-index.py that records its argv to a log file."""
+        """Write a stub nb-index.py that records sys.executable and argv to a log file."""
         log = tmp_path / "indexer_args.txt"
         stub = tmp_path / "nb-index.py"
         stub.write_text(
-            f"import sys\nopen({str(log)!r}, 'w').write(' '.join(sys.argv[1:]))\n",
+            f"import sys\n"
+            f"with open({str(log)!r}, 'w') as _f:\n"
+            f"    _f.write(sys.executable + '\\n')\n"
+            f"    _f.write(' '.join(sys.argv[1:]) + '\\n')\n",
             encoding="utf-8"
         )
         return stub, log
+
+    def _wait_for_log(self, log, timeout=5.0):
+        """Poll until log file appears or timeout expires."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not log.exists():
+            time.sleep(0.05)
+        return log.exists()
 
     def _run_write(self, args, cwd=None):
         return subprocess.run(
@@ -1192,8 +1264,8 @@ class TestWriteIntegration:
             capture_output=True, text=True
         )
         assert r.returncode == 0
-        # Allow a brief moment for any async spawn
-        time.sleep(0.3)
+        # Allow a brief moment for any async spawn (polling: up to 0.5s)
+        time.sleep(0.5)
         assert not log.exists(), "nb-index.py must NOT be spawned on 'create'"
 
     def test_indexer_spawned_on_patch(self, tmp_path):
@@ -1214,8 +1286,25 @@ class TestWriteIntegration:
             capture_output=True, text=True
         )
         assert r.returncode == 0
-        time.sleep(0.5)
-        assert log.exists(), "nb-index.py must be spawned after patch"
+        assert self._wait_for_log(log), "nb-index.py was not spawned within 5s after patch"
+
+    def test_indexer_spawned_on_insert(self, tmp_path):
+        """§8.2: insert triggers indexing"""
+        stub, log = self._mock_indexer(tmp_path)
+        write_copy = self._patch_write_script_path(tmp_path, stub)
+        nb_path = tmp_path / "nb.ipynb"
+        subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "create", "--python"],
+            capture_output=True
+        )
+        src = tmp_path / "src.py"
+        src.write_text("y = 99\n", encoding="utf-8")
+        r = subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "insert", "0", "code", "-f", str(src)],
+            capture_output=True, text=True
+        )
+        assert r.returncode == 0
+        assert self._wait_for_log(log), "nb-index.py was not spawned within 5s after insert"
 
     def test_indexer_spawned_on_delete(self, tmp_path):
         """§8.3: delete triggers indexing"""
@@ -1231,8 +1320,7 @@ class TestWriteIntegration:
             capture_output=True, text=True
         )
         assert r.returncode == 0
-        time.sleep(0.5)
-        assert log.exists(), "nb-index.py must be spawned after delete"
+        assert self._wait_for_log(log), "nb-index.py was not spawned within 5s after delete"
 
     def test_indexer_failure_does_not_fail_write(self, tmp_path):
         """§8.5: missing nb-index.py must not prevent write from succeeding"""
@@ -1256,7 +1344,7 @@ class TestWriteIntegration:
         )
 
     def test_uses_sys_executable(self, tmp_path):
-        """§8.6: spawned interpreter is sys.executable (recorded in stub argv)"""
+        """§8.6: spawned interpreter is sys.executable (not a hardcoded 'python3')"""
         stub, log = self._mock_indexer(tmp_path)
         write_copy = self._patch_write_script_path(tmp_path, stub)
         nb_path = tmp_path / "nb.ipynb"
@@ -1270,11 +1358,19 @@ class TestWriteIntegration:
             [PYTHON, str(write_copy), str(nb_path), "patch", "0", "-f", str(src)],
             capture_output=True
         )
-        time.sleep(0.5)
-        if log.exists():
-            # The stub records sys.argv[1:] — the notebook path must be absolute
-            recorded = log.read_text(encoding="utf-8")
-            assert os.path.isabs(recorded.split()[0]) if recorded.strip() else True
+        assert self._wait_for_log(log), "nb-index.py was not spawned within 5s after patch"
+        lines = log.read_text(encoding="utf-8").splitlines()
+        assert lines, "Stub log must not be empty"
+        # Line 0: sys.executable of the spawned process
+        # If nb-write.py used sys.executable, this will equal PYTHON
+        recorded_exe = lines[0].strip()
+        assert os.path.isabs(recorded_exe), (
+            f"Spawned interpreter must be an absolute path, got: {recorded_exe!r}"
+        )
+        assert recorded_exe == PYTHON, (
+            f"nb-write.py must use sys.executable ({PYTHON!r}) to spawn nb-index.py, "
+            f"but the spawned process saw sys.executable={recorded_exe!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1310,7 +1406,11 @@ class TestSymbolCache:
         run_indexer(nb)
         data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
         assert "generated_at" in data
-        assert data["generated_at"].endswith("Z"), "generated_at must end with Z (UTC)"
+        ts = data["generated_at"]
+        # Must be full ISO 8601 UTC format: YYYY-MM-DDTHH:MM:SSZ
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", ts), (
+            f"generated_at must match ISO 8601 UTC format (YYYY-MM-DDTHH:MM:SSZ), got: {ts!r}"
+        )
 
     def test_symbols_json_has_max_indexed_at(self, tmp_path):
         """§12.2 / schema: max_indexed_at field required"""
@@ -1368,9 +1468,20 @@ class TestSymbolCache:
         run_indexer(nb)
         data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
         locs = data.get("symbols", {}).get("foo", [])
+        assert locs, f"Expected at least one location for 'foo', got: {locs}"
+        # Spec §13.1: format is "<notebook_path>:<cell_index>" (e.g. "nb.ipynb:0")
         assert any("mynotebook.ipynb" in loc for loc in locs), (
             f"Expected 'mynotebook.ipynb' in symbol location, got: {locs}"
         )
+        # Verify the :<N> integer suffix is present
+        for loc in locs:
+            if "mynotebook.ipynb" in loc:
+                colon_pos = loc.rfind(":")
+                assert colon_pos > 0, f"Location must have ':N' suffix, got: {loc!r}"
+                index_part = loc[colon_pos + 1:]
+                assert index_part.isdigit(), (
+                    f"Cell index in location must be a non-negative integer, got: {index_part!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1434,9 +1545,13 @@ class TestEdgeCases:
         data = load_index(idx)
         assert isinstance(data, dict), "Index must be valid JSON after concurrent writes"
         assert "cells" in data
+        assert data.get("cell_count") == 10, (
+            f"Index must contain all 10 cells after concurrent writes, "
+            f"got cell_count={data.get('cell_count')}"
+        )
 
     def test_single_output_line_over_4096(self, tmp_path):
-        """§14.7"""
+        """§14.7: alias for §7.7 edge case — covered by TestOutputStorage.test_single_line_over_4096_hard_truncated"""
         long_line = "a" * 5000 + "\n"
         cells = [code_cell("x", outputs=[stream_output(long_line)])]
         nb = make_notebook(cells, tmp_path=tmp_path)
@@ -1446,8 +1561,8 @@ class TestEdgeCases:
         text = cell.get("output_text", "")
         assert cell["output_truncated"] is True
         assert "[truncated mid-line]" in text
-        # stored bytes ≤ 4096 + overhead for the suffix
-        assert len(text.encode("utf-8")) <= 4096 + len("\n[truncated mid-line]") + 10
+        suffix = "\n[truncated mid-line]"
+        assert len(text.encode("utf-8")) <= 4096 + len(suffix.encode("utf-8"))
 
     def test_first_line_for_all_cell_types(self, tmp_path):
         """§14.11"""
@@ -1490,13 +1605,14 @@ class TestEdgeCases:
         assert "こんにちは" in data["cells"][0].get("output_text", "")
 
     def test_indexed_at_field_present_and_utc(self, tmp_path):
-        """Schema: indexed_at stored as ISO 8601 UTC ending with Z"""
+        """Schema: indexed_at stored as full ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         run_indexer(nb)
         data = load_index(index_path_for(nb))
         assert "indexed_at" in data
-        assert data["indexed_at"].endswith("Z"), (
-            f"indexed_at must end with 'Z': {data['indexed_at']!r}"
+        ts = data["indexed_at"]
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", ts), (
+            f"indexed_at must match ISO 8601 UTC (YYYY-MM-DDTHH:MM:SSZ), got: {ts!r}"
         )
 
     def test_no_orphaned_tmp_files_after_rapid_writes(self, tmp_path):
@@ -1536,3 +1652,174 @@ class TestEdgeCases:
         # Re-index should overwrite it (this also verifies no crash on read)
         r = run_indexer(nb, extra_args=["--force"])
         assert r.returncode == 0
+
+    def test_derived_fields_not_stored_in_index(self, tmp_path):
+        """Schema: symbol_index, import_index, and sections are NOT stored in the JSON"""
+        cells = [
+            markdown_cell("## Section A", cell_id="m0"),
+            code_cell("def foo():\n    pass\n", cell_id="c1"),
+        ]
+        nb = make_notebook(cells, tmp_path=tmp_path)
+        run_indexer(nb)
+        data = load_index(index_path_for(nb))
+        assert "symbol_index" not in data, (
+            "symbol_index must be derived at load time, not stored in the JSON"
+        )
+        assert "import_index" not in data, (
+            "import_index must be derived at load time, not stored in the JSON"
+        )
+        assert "sections" not in data, (
+            "sections array must be derived at load time, not stored in the JSON"
+        )
+
+    def test_raw_cell_type_and_symbols_extracted_false(self, tmp_path):
+        """Schema: raw cells store type='raw' and symbols_extracted=false"""
+        nb = make_notebook([raw_cell("some raw content")], tmp_path=tmp_path)
+        run_indexer(nb)
+        data = load_index(index_path_for(nb))
+        cell = data["cells"][0]
+        assert cell["type"] == "raw", f"Expected type='raw', got: {cell.get('type')!r}"
+        assert cell["symbols_extracted"] is False
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: §6 symbol extraction gaps
+# ---------------------------------------------------------------------------
+
+class TestSymbolExtractionAdditional:
+
+    def _index(self, source, tmp_path, kernel="python"):
+        nb = make_notebook([code_cell(source)], kernel_language=kernel, tmp_path=tmp_path)
+        run_indexer(nb)
+        return load_index(index_path_for(nb))["cells"][0]
+
+    def test_symbols_extracted_true_for_python_code(self, tmp_path):
+        """§6: symbols_extracted must be True for code cells with a known language"""
+        cell = self._index("def foo():\n    pass\n", tmp_path, kernel="python")
+        assert cell["symbols_extracted"] is True, (
+            "symbols_extracted must be True for Python code cells"
+        )
+
+    def test_ir_kernel_not_treated_as_r(self, tmp_path):
+        """§6 A5: 'ir' kernel (IRkernel) must NOT trigger R pattern extraction"""
+        cell = self._index("my_func <- function(x) x + 1\n", tmp_path, kernel="ir")
+        # 'ir' must not be treated as R language
+        assert cell["symbols_extracted"] is False, (
+            "IRkernel ('ir') must not trigger R symbol extraction"
+        )
+
+    def test_julia_struct_detected(self, tmp_path):
+        """§6 A5: Julia struct definitions → symbols_defined"""
+        cell = self._index("struct MyPoint\n    x::Float64\n    y::Float64\nend\n",
+                            tmp_path, kernel="julia")
+        assert "MyPoint" in cell["symbols_defined"], (
+            "Julia struct type must be captured in symbols_defined"
+        )
+
+    def test_julia_mutable_struct_detected(self, tmp_path):
+        """§6 A5: Julia mutable struct → symbols_defined"""
+        cell = self._index("mutable struct Counter\n    n::Int\nend\n",
+                            tmp_path, kernel="julia")
+        assert "Counter" in cell["symbols_defined"]
+
+    def test_julia_import_colon_syntax(self, tmp_path):
+        """§6.12: 'import CancerResearch: PiecewiseTyson' → 'CancerResearch' in imports"""
+        cell = self._index("import CancerResearch: PiecewiseTyson\n",
+                            tmp_path, kernel="julia")
+        assert "CancerResearch" in cell["symbols_imported"], (
+            "Julia 'import X: Y' must add X to symbols_imported"
+        )
+
+    def test_r_require_detected(self, tmp_path):
+        """§6 A5: R require() treated same as library()"""
+        cell = self._index("require(dplyr)\n", tmp_path, kernel="r")
+        assert "dplyr" in cell["symbols_imported"], (
+            "R require() must be captured the same as library()"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: §7 output storage gaps
+# ---------------------------------------------------------------------------
+
+class TestOutputStorageAdditional:
+
+    def _run(self, cells, tmp_path, kernel="python"):
+        nb = make_notebook(cells, kernel_language=kernel, tmp_path=tmp_path)
+        run_indexer(nb)
+        return load_index(index_path_for(nb))["cells"][0]
+
+    def test_has_output_true_for_stream(self, tmp_path):
+        """§7: code cell with stream output must have has_output=True"""
+        cell = self._run(
+            [code_cell("print('hi')", outputs=[stream_output("hi\n")])], tmp_path
+        )
+        assert cell["has_output"] is True
+
+    def test_output_truncated_false_for_small_output(self, tmp_path):
+        """§7: small output must have output_truncated=False (field must be present)"""
+        cell = self._run(
+            [code_cell("x", outputs=[stream_output("short\n")])], tmp_path
+        )
+        assert cell.get("output_truncated") is False, (
+            "output_truncated must be explicitly False for small (non-truncated) output; "
+            f"got: {cell.get('output_truncated')!r}"
+        )
+
+    def test_lone_surrogate_replaced_in_output(self, tmp_path):
+        """§7.12: lone surrogates in output must be replaced with U+FFFD"""
+        # Construct a string with a lone surrogate using surrogatepass encoding
+        lone_surrogate = "\ud800"  # lone high surrogate
+        nb = {
+            "nbformat": 4, "nbformat_minor": 5,
+            "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
+                                         "name": "python3"},
+                          "language_info": {"name": "python", "version": "3.10.0"}},
+            "cells": [{
+                "cell_type": "code", "id": "c001", "metadata": {},
+                "source": ["x = 1"],
+                "outputs": [{"output_type": "stream", "name": "stdout",
+                              "text": [lone_surrogate + "hello\n"]}],
+                "execution_count": 1,
+            }],
+        }
+        nb_path = tmp_path / "surrogate.ipynb"
+        nb_path.write_bytes(
+            json.dumps(nb, ensure_ascii=False).encode("utf-8", errors="surrogatepass")
+        )
+        r = run_indexer(nb_path)
+        assert r.returncode == 0, f"Lone surrogate must not crash indexer: {r.stderr}"
+        data = load_index(index_path_for(nb_path))
+        output_text = data["cells"][0].get("output_text", "")
+        assert "\ud800" not in output_text, "Lone surrogate must be replaced (not left raw)"
+        assert "hello" in output_text, "Non-surrogate content must be preserved"
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: §13 symbols.json gaps
+# ---------------------------------------------------------------------------
+
+class TestSymbolCacheAdditional:
+
+    def test_symbols_json_version_gt1_falls_back(self, tmp_path):
+        """§13.7: symbols.json with version > 1 must cause fallback to serial scan"""
+        nb = make_notebook([code_cell("def version_gap_func():\n    pass\n")],
+                            tmp_path=tmp_path)
+        run_indexer(nb)
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json yet")
+        # Bump version to simulate future format
+        data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        data["version"] = 999
+        symbols_path.write_text(json.dumps(data), encoding="utf-8")
+        # nb-index.py should not crash on re-index; symbols.json will be rebuilt
+        r = run_indexer(nb, extra_args=["--force"])
+        assert r.returncode == 0, (
+            f"Indexer must tolerate unknown symbols.json version: {r.stderr}"
+        )
+        # After rebuild, version should be 1 again (or the file may have been recreated)
+        new_data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        assert new_data.get("version") == 1, (
+            "symbols.json must be rebuilt with version=1 after detecting unknown version"
+        )
