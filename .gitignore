@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Test artefacts
+/tmp/
+*.nb_tmp
+
+# Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
