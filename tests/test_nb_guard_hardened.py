@@ -1,5 +1,5 @@
 """
-Hardened TDD tests for nb-guard.sh.
+Hardened TDD tests for nb-guard.py.
 
 Covers security and correctness findings from adversarial audit:
 
@@ -8,6 +8,7 @@ Covers security and correctness findings from adversarial audit:
     - Deeply nested paths (a/b/c/nb.ipynb) must be blocked
     - ANSI escape sequences in file paths must not appear in output
     - Newline injection in file paths must not produce extra output lines
+    - Shell metacharacters in file paths must not execute arbitrary commands
     - Non-.ipynb files must be ALLOWED (exit 0), not blocked
 
   Correctness:
@@ -16,19 +17,20 @@ Covers security and correctness findings from adversarial audit:
     - MultiEdit: must allow (exit 0) when no edit targets .ipynb
 
   Robustness:
-    - jq failure (malformed JSON) must exit cleanly (fail open: exit 0)
-    - Unknown TOOL with .ipynb path must exit 1 (not silently allow)
+    - Malformed JSON must exit cleanly (fail open: exit 0)
+    - Unknown or missing tool_name with .ipynb path must fail open (exit 0)
 """
 
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
-GUARD     = REPO_ROOT / "scripts" / "nb-guard.sh"
+GUARD     = REPO_ROOT / "scripts" / "nb-guard.py"
 
 _claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 SETTINGS    = _claude_dir / "settings.json"
@@ -39,9 +41,9 @@ SETTINGS    = _claude_dir / "settings.json"
 # ---------------------------------------------------------------------------
 
 def run_guard_raw(payload_str: str) -> subprocess.CompletedProcess:
-    """Run nb-guard.sh with arbitrary stdin string."""
+    """Run nb-guard.py with arbitrary stdin string."""
     return subprocess.run(
-        ["bash", str(GUARD)],
+        [sys.executable, str(GUARD)],
         input=payload_str,
         capture_output=True,
         text=True,
@@ -49,7 +51,7 @@ def run_guard_raw(payload_str: str) -> subprocess.CompletedProcess:
 
 
 def run_guard(tool_name: str, file_path: str = "analysis.ipynb") -> subprocess.CompletedProcess:
-    """Run nb-guard.sh with a correctly-shaped payload for the given tool.
+    """Run nb-guard.py with a correctly-shaped payload for the given tool.
 
     MultiEdit uses tool_input.edits[].file_path; all other tools use
     tool_input.file_path.  Using the correct shape ensures tests match
@@ -68,7 +70,7 @@ def run_guard(tool_name: str, file_path: str = "analysis.ipynb") -> subprocess.C
 
 
 def run_guard_multiedit(edits: list) -> subprocess.CompletedProcess:
-    """Run nb-guard.sh with a MultiEdit-style payload (edits array)."""
+    """Run nb-guard.py with a MultiEdit-style payload (edits array)."""
     payload = json.dumps({
         "tool_name": "MultiEdit",
         "tool_input": {"edits": edits},
@@ -129,7 +131,7 @@ class TestNonIpynbFilesAllowed:
         "config.json",
         "notebook.ipynb.bak",        # common backup suffix
         "fake_ipynb",                 # no extension
-        "analysis.IPYNB",             # wrong case (case-sensitive glob)
+        "analysis.IPYNB",             # wrong case (case-sensitive check)
     ])
     def test_non_ipynb_exits_zero(self, path):
         """Non-.ipynb files must exit 0 (allow), not block."""
@@ -174,12 +176,7 @@ class TestInjectionHardening:
         )
 
     def test_newline_in_path_does_not_inject_extra_blocked_line(self):
-        """A newline embedded in the file path must not produce extra 'Blocked:' lines.
-
-        The path ends with .ipynb so the guard fires (bash * matches newlines in
-        double-bracket glob patterns).  Without sanitisation the echo would split
-        across lines, producing two 'Blocked:' prefixes; with sanitisation, one.
-        """
+        """A newline embedded in the file path must not produce extra 'Blocked:' lines."""
         injected_path = "malicious\nBlocked: injected-override.ipynb"
         r = run_guard("Read", injected_path)
         assert r.returncode == 1, (
@@ -277,11 +274,11 @@ class TestExitCodeRobustness:
             f"Expected exit 0 (fail open) for malformed JSON, got {r.returncode}"
         )
 
-    def test_jq_error_does_not_produce_exit_code_other_than_0_or_1(self):
-        """Previously 'set -e' caused jq error code to propagate. Must be 0 or 1."""
+    def test_broken_json_exits_0_or_1_only(self):
+        """Broken JSON must exit 0 (fail open) — no unexpected exit codes."""
         r = run_guard_raw("{broken json")
         assert r.returncode in (0, 1), (
-            f"Script must exit 0 (allow) or 1 (block), not jq's code. Got: {r.returncode}"
+            f"Script must exit 0 (allow) or 1 (block), got: {r.returncode}"
         )
 
     def test_empty_stdin_does_not_crash(self):
@@ -301,6 +298,18 @@ class TestExitCodeRobustness:
             f"{tool} on .ipynb must exit exactly 1, got {r.returncode}"
         )
 
+    def test_unknown_tool_with_ipynb_fails_open(self):
+        """Unknown tool_name with a .ipynb path must fail open (exit 0), not block."""
+        payload = json.dumps({
+            "tool_name": "UnknownTool",
+            "tool_input": {"file_path": "nb.ipynb"},
+            "session_id": "test",
+        })
+        r = run_guard_raw(payload)
+        assert r.returncode == 0, (
+            f"Unknown tool must fail open (exit 0), got {r.returncode}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Settings.json: no-if-condition approach (post-install verification)
@@ -308,7 +317,7 @@ class TestExitCodeRobustness:
 
 @pytest.mark.skipif(
     not SETTINGS.exists(),
-    reason="settings.json not found — run install.sh first",
+    reason="settings.json not found — run install.py first",
 )
 class TestSettingsHardenedApproach:
     """Verifies settings.json is correctly configured post-install."""
@@ -321,25 +330,33 @@ class TestSettingsHardenedApproach:
     def pretooluse_hooks(self, settings):
         hooks = settings.get("hooks", {}).get("PreToolUse", [])
         if not hooks:
-            pytest.skip("No PreToolUse hooks in settings.json — run install.sh first")
+            pytest.skip("No PreToolUse hooks in settings.json — run install.py first")
         return hooks
 
     def test_nb_guard_hook_present(self, pretooluse_hooks):
-        """At least one PreToolUse hook must reference nb-guard.sh."""
+        """At least one PreToolUse hook must reference nb-guard.py."""
         all_hooks = []
         for entry in pretooluse_hooks:
             all_hooks.extend(entry.get("hooks", []))
-        guard_hooks = [h for h in all_hooks if "nb-guard.sh" in h.get("command", "")]
-        assert guard_hooks, "No PreToolUse hook references nb-guard.sh"
+        guard_hooks = [h for h in all_hooks if "nb-guard.py" in h.get("command", "")]
+        assert guard_hooks, "No PreToolUse hook references nb-guard.py"
+
+    def test_nb_guard_hook_not_legacy_sh(self, pretooluse_hooks):
+        """No PreToolUse hook must reference the legacy nb-guard.sh."""
+        all_hooks = []
+        for entry in pretooluse_hooks:
+            all_hooks.extend(entry.get("hooks", []))
+        sh_hooks = [h for h in all_hooks if "nb-guard.sh" in h.get("command", "")]
+        assert not sh_hooks, f"Stale nb-guard.sh hook found — run install.py to upgrade: {sh_hooks}"
 
     def test_nb_guard_command_is_absolute_path(self, pretooluse_hooks):
-        """nb-guard.sh command must be an absolute path, not a shell variable."""
+        """nb-guard.py command must be an absolute path, not a shell variable."""
         all_hooks = []
         for entry in pretooluse_hooks:
             all_hooks.extend(entry.get("hooks", []))
-        for h in [h for h in all_hooks if "nb-guard.sh" in h.get("command", "")]:
+        for h in [h for h in all_hooks if "nb-guard.py" in h.get("command", "")]:
             assert "${CLAUDE_CONFIG_DIR}" not in h["command"], (
-                "nb-guard.sh path must not use ${CLAUDE_CONFIG_DIR} in settings.json"
+                "nb-guard.py path must not use ${CLAUDE_CONFIG_DIR} in settings.json"
             )
 
     def test_nb_guard_matcher_covers_multiedit(self, pretooluse_hooks):
@@ -347,9 +364,9 @@ class TestSettingsHardenedApproach:
         for entry in pretooluse_hooks:
             matcher = entry.get("matcher", "")
             hooks = entry.get("hooks", [])
-            if any("nb-guard.sh" in h.get("command", "") for h in hooks):
+            if any("nb-guard.py" in h.get("command", "") for h in hooks):
                 assert "MultiEdit" in matcher, (
                     f"nb-guard entry matcher must include MultiEdit: {matcher!r}"
                 )
                 return
-        pytest.fail("No PreToolUse entry contains nb-guard.sh")
+        pytest.fail("No PreToolUse entry contains nb-guard.py")

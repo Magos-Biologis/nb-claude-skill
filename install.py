@@ -166,6 +166,13 @@ def main():
     # SKILL.md
     shutil.copy2(REPO_ROOT / "SKILL.md", skill_dir / "SKILL.md")
 
+    # install.py / uninstall.py — ship alongside tests so the installed copy is
+    # self-contained and the test suite can locate them via parent.parent.
+    for stem in ("install.py", "uninstall.py"):
+        src = REPO_ROOT / stem
+        if src.exists():
+            shutil.copy2(src, skill_dir / stem)
+
     # scripts/ — copy only .py and .sh files (skip __pycache__ etc.)
     scripts_dst = skill_dir / "scripts"
     scripts_dst.mkdir(exist_ok=True)
