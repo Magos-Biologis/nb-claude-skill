@@ -18,3 +18,10 @@ venv/
 *.swo
 .idea/
 .vscode/
+
+# Claude Code artefacts created when running hooks inside the repo
+.claude/
+
+# pytest cache (already covered by pattern but make explicit)
+.pytest_cache/
+tests/__pycache__/
