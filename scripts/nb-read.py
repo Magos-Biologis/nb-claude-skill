@@ -11,6 +11,7 @@ Options:
   --cells N,M,K     Show specific cells (e.g. --cells 0,2,5)
   --type TYPE       Filter by cell type: code | markdown | raw
   --truncate N      Truncate cell source at N lines (default: 80, 0 = unlimited)
+  --no-safe         Disable source sanitisation and │ line-prefix (raw output)
 """
 
 import json
@@ -22,12 +23,32 @@ import re
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_RANGE_SIZE = 10_000             # guard against billion-element set allocation
 
+# ---------------------------------------------------------------------------
+# ANSI sanitisation
+# ---------------------------------------------------------------------------
+
+# Comprehensive ECMA-48 regex: covers standard CSI, private-mode CSI (?/>),
+# OSC sequences (capped at 512 chars), Fe escape sequences, single-char escapes.
+_ANSI_RE_FULL = re.compile(
+    r'\x1b(?:'
+    r'[@-Z\\-_]'                             # Fe: ESC @..Z, ESC \, ESC _
+    r'|\[[0-?]*[ -/]*[@-~]'                  # CSI: covers ?, >, = params
+    r'|\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)?' # OSC: cap at 512 chars
+    r'|[^@-_]'                               # other 2-char escapes
+    r')'
+)
 # Strip ANSI escape sequences from strings sourced from untrusted notebook metadata
-_ANSI_RE = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\][^\x07]*\x07|[()][AB012])')
+_ANSI_RE = _ANSI_RE_FULL  # same regex used for both metadata and source in safe mode
+
 
 def _sanitise(s):
+    """Strip ANSI/CSI/OSC sequences from untrusted strings."""
     return _ANSI_RE.sub('', str(s))
 
+
+# ---------------------------------------------------------------------------
+# Cell parsing
+# ---------------------------------------------------------------------------
 
 def parse_cell_filter(spec):
     """Return a set of indices, or None to mean 'all'."""
@@ -67,14 +88,41 @@ def parse_cell_filter(spec):
                  f"(non-negative integers only).")
 
 
-def render_source(lines, truncate):
+def _coerce_source(lines) -> str:
     """
-    lines is a list of strings (notebook cell source format) or a single string.
-    Truncation notices are printed to stderr so they are never captured as cell content.
+    Convert cell source to a plain string, defensively handling non-standard
+    values (int, float, None, list-with-non-strings) found in corrupted or
+    unusual notebooks.
     """
-    source = "".join(lines) if isinstance(lines, list) else (lines or "")
+    if lines is None:
+        return ""
+    if isinstance(lines, list):
+        return "".join(str(s) for s in lines)
+    return str(lines)
+
+
+def render_source(lines, truncate, safe=True):
+    """
+    Render cell source as a string.
+
+    In safe mode (default):
+      - ANSI/CSI/OSC sequences are stripped.
+      - Every source line is prefixed with '│ ' to prevent cell content from
+        being confused with the [N:type] ─── header lines or injected as
+        fake boundaries.
+
+    Truncation notices are printed to stderr so they are never captured as
+    cell content.
+
+    Returns the rendered string, or '│ (empty)' / '(empty)' for empty cells.
+    """
+    source = _coerce_source(lines)
+    if safe:
+        source = _ANSI_RE.sub('', source)
+
     if not source.strip():
-        return "(empty)"
+        return "│ (empty)" if safe else "(empty)"
+
     all_lines = source.splitlines()
     if truncate and len(all_lines) > truncate:
         hidden = len(all_lines) - truncate
@@ -82,9 +130,40 @@ def render_source(lines, truncate):
         print(f"  *** TRUNCATED: {hidden} more line(s) not shown. "
               f"Re-read with --truncate 0 before patching this cell. ***",
               file=sys.stderr)
-        return "\n".join(all_lines[:truncate])
+        all_lines = all_lines[:truncate]
+
+    if safe:
+        return "\n".join("│ " + l for l in all_lines)
     return "\n".join(all_lines)
 
+
+def _output_summary(cell) -> str | None:
+    """
+    Return a one-line summary of cell outputs, or None if there are no outputs.
+    Example: '[cell has 3 output(s), 5 lines — not shown]'
+    """
+    outputs = cell.get("outputs", [])
+    if not outputs:
+        return None
+    n_entries = len(outputs)
+    n_lines = 0
+    for out in outputs:
+        # stream / display_data / execute_result use 'text'
+        text = out.get("text", [])
+        if isinstance(text, list):
+            n_lines += sum(len(str(t).splitlines()) for t in text)
+        elif isinstance(text, str):
+            n_lines += len(text.splitlines())
+        # error outputs use 'traceback'
+        tb = out.get("traceback", [])
+        if isinstance(tb, list):
+            n_lines += len(tb)
+    return (f"[cell has {n_entries} output(s), {n_lines} lines — not shown]")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Token-efficient notebook reader")
@@ -94,8 +173,11 @@ def main():
                         help="Only show cells of this type")
     parser.add_argument("--truncate", type=int, default=80,
                         help="Max lines per cell (0 = unlimited, default: 80)")
+    parser.add_argument("--no-safe", dest="no_safe", action="store_true",
+                        help="Disable ANSI sanitisation and │ line-prefix (raw output)")
     args = parser.parse_args()
 
+    safe = not args.no_safe
     path = args.notebook
 
     if args.truncate < 0:
@@ -148,8 +230,15 @@ def main():
 
         bar = "─" * max(1, 44 - len(str(i)) - len(ctype))
         print(f"[{i}:{ctype}] {bar}")
-        source_text = render_source(cell.get("source", []), args.truncate)
+        source_text = render_source(cell.get("source", []), args.truncate, safe=safe)
         print(source_text)
+
+        # Output summary for code cells (shown in both safe and no-safe modes)
+        if ctype == "code":
+            summary = _output_summary(cell)
+            if summary:
+                print(summary)
+
         print()
         shown += 1
 

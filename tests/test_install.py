@@ -123,12 +123,12 @@ class TestInstall:
         hooks = find_nb_guard_hooks(s)
         for h in hooks:
             cmd = h["command"]
-            # Must contain an absolute path (starts with / on POSIX, drive letter on Windows)
-            parts = cmd.split()
-            # The last part (the script path) must be absolute
-            script_part = next((p for p in parts if "nb-guard.py" in p), None)
+            # Extract the script path — may be quoted, e.g. python3 "/abs/path/nb-guard.py"
+            script_part = next((p for p in cmd.split() if "nb-guard.py" in p), None)
             assert script_part, f"No script path in command: {cmd!r}"
-            assert Path(script_part).is_absolute(), (
+            # Strip surrounding quotes before checking absoluteness
+            script_path = Path(script_part.strip('"').strip("'"))
+            assert script_path.is_absolute(), (
                 f"Script path must be absolute: {script_part!r}"
             )
 

@@ -287,9 +287,10 @@ class TestOutputSummary:
         p = _make_nb([{"cell_type": "markdown", "source": ["## Heading"]}], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        # No output summary
+        # No '[cell has N output(s)' summary line — the header line contains "cell"
+        # but not "output(s)" so we match on the summary-specific wording.
         lines_with_output = [l for l in r.stdout.splitlines()
-                             if "output" in l.lower() and "cell" in l.lower()]
+                             if "output(s)" in l.lower() or "not shown" in l.lower()]
         assert not lines_with_output
 
     def test_output_summary_mentions_not_shown(self, tmp_path):

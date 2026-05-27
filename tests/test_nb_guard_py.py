@@ -27,10 +27,11 @@ def _payload(tool_name: str, file_path: str | None = None,
              edits: list | None = None) -> str:
     """Build a realistic hook payload JSON string."""
     if tool_name == "MultiEdit":
-        tool_input = {
-            "edits": edits or [{"file_path": file_path or "nb.ipynb",
-                                 "old_string": "x", "new_string": "y"}]
-        }
+        # Use provided edits (even empty list); only fall back to default if None
+        if edits is None:
+            edits = [{"file_path": file_path or "nb.ipynb",
+                      "old_string": "x", "new_string": "y"}]
+        tool_input = {"edits": edits}
     else:
         tool_input = {}
         if file_path is not None:
