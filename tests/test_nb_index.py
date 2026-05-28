@@ -1513,6 +1513,53 @@ class TestWriteIntegration:
             f"but the spawned process saw sys.executable={recorded_exe!r}"
         )
 
+    def test_path_with_spaces_and_parens_not_shell_interpreted(self, tmp_path):
+        """§8.1: shell=False — notebook path with spaces and parentheses must not be
+        shell-interpreted. If Popen used shell=True, spaces would split the argv and
+        parens would be interpreted as sub-shell syntax, causing the spawn to fail."""
+        stub, log = self._mock_indexer(tmp_path)
+        # Place the notebook in a directory whose name contains spaces and parens
+        nb_dir = tmp_path / "my project (2025)"
+        nb_dir.mkdir()
+        write_copy = tmp_path / "nb-write.py"
+        import shutil
+        shutil.copy2(WRITE_SCRIPT, write_copy)
+        # Also copy the stub so nb-write.py finds it in the same dir
+        import shutil as _shutil
+        _shutil.copy2(stub, tmp_path / "nb-index.py")
+        nb_path = nb_dir / "my data.ipynb"
+        # Create the notebook via nb-write.py create
+        subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "create", "--python"],
+            capture_output=True
+        )
+        assert nb_path.exists(), "create must work even with spaces/parens in path"
+        src = tmp_path / "src.py"
+        src.write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "insert", "0", "code", "-f", str(src)],
+            capture_output=True
+        )
+        r = subprocess.run(
+            [PYTHON, str(write_copy), str(nb_path), "patch", "0", "-f", str(src)],
+            capture_output=True, text=True
+        )
+        assert r.returncode == 0, (
+            f"Write must succeed for path with spaces/parens: {r.stderr}"
+        )
+        # The stub nb-index.py in tmp_path (not nb_dir) is what write_copy will call.
+        # If shell=True were used, the stub would not be invoked with the correct args.
+        assert self._wait_for_log(log), (
+            "nb-index.py stub must be spawned even when path contains spaces/parens "
+            "(confirms shell=False list-form Popen is used)"
+        )
+        lines = log.read_text(encoding="utf-8").splitlines()
+        # Second line of the log is the argv passed to the stub: must contain the full path
+        assert "my project (2025)" in lines[1], (
+            f"Full path with spaces/parens must reach nb-index.py as a single argv[1]; "
+            f"got: {lines[1]!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # §13 — Project-level symbol cache (symbols.json)
@@ -1689,6 +1736,54 @@ class TestEdgeCases:
         assert data.get("cell_count") == 10, (
             f"Index must contain all 10 cells after concurrent writes, "
             f"got cell_count={data.get('cell_count')}"
+        )
+
+    def test_concurrent_indexers_symbols_json_not_corrupted(self, tmp_path):
+        """§13.6: concurrent indexers on different notebooks must not corrupt symbols.json.
+
+        Each indexer acquires the symbols.nblock lock before reading and writing
+        symbols.json, so the file must be valid JSON and contain entries from at
+        least one of the two notebooks after both complete.
+        """
+        nb1 = make_notebook(
+            [code_cell("def alpha_unique_fn():\n    pass\n", cell_id="c0")],
+            tmp_path=tmp_path, name="nb1.ipynb"
+        )
+        nb2 = make_notebook(
+            [code_cell("def beta_unique_fn():\n    pass\n", cell_id="c0")],
+            tmp_path=tmp_path, name="nb2.ipynb"
+        )
+        p1 = subprocess.Popen(
+            [PYTHON, str(SCRIPT), str(nb1)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        p2 = subprocess.Popen(
+            [PYTHON, str(SCRIPT), str(nb2)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        rc1 = p1.wait(timeout=30)
+        rc2 = p2.wait(timeout=30)
+        assert rc1 == 0, f"First indexer exited {rc1}"
+        assert rc2 == 0, f"Second indexer exited {rc2}"
+
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        assert symbols_path.exists(), "symbols.json must exist after both indexers complete"
+
+        # Must be valid JSON (not truncated/interleaved by a concurrent write)
+        try:
+            data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            pytest.fail(f"symbols.json is not valid JSON after concurrent writes: {exc}")
+
+        assert isinstance(data, dict)
+        syms = data.get("symbols", {})
+        # At least one notebook's symbol must appear (the other may have been skipped
+        # if the lock was unavailable — §13.6 specifies silent skip in that case)
+        assert (
+            "alpha_unique_fn" in syms or "beta_unique_fn" in syms
+        ), (
+            f"symbols.json must contain at least one of the two indexed functions; "
+            f"got keys: {list(syms.keys())!r}"
         )
 
     def test_single_output_line_over_4096(self, tmp_path):
