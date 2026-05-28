@@ -637,6 +637,35 @@ class TestStaleness:
         inode_after = idx.stat().st_ino
         assert inode_after != inode_before, "--force must always rewrite the index"
 
+    def test_short_circuit_no_hash_when_mtime_and_size_match(self, tmp_path):
+        """A3 short-circuit: when mtime and size both match, the indexer must NOT
+        open the notebook file to compute the SHA-256 hash.
+
+        Proof: after a fresh index is written, make the notebook unreadable (chmod 000).
+        If the indexer respects the short-circuit, it sees matching mtime+size, declares
+        the index fresh, and exits 0 without touching the notebook.
+        If it always hashes, it tries to open the unreadable file and exits with an error.
+        """
+        nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
+        run_indexer(nb)
+        idx = index_path_for(nb)
+        inode_before = idx.stat().st_ino
+
+        # Remove read permission — a hash attempt will raise PermissionError
+        nb.chmod(0o000)
+        try:
+            r = run_indexer(nb)
+            assert r.returncode == 0, (
+                "Indexer must exit 0 when index is fresh (mtime+size match), "
+                f"even if the notebook is unreadable; got exit {r.returncode}: {r.stderr}"
+            )
+            # Fresh → no rebuild → inode unchanged
+            assert idx.stat().st_ino == inode_before, (
+                "Index inode must be unchanged (no rebuild) when mtime+size match"
+            )
+        finally:
+            nb.chmod(0o644)  # restore so tmp_path cleanup works
+
     def test_source_hash_per_cell(self, tmp_path):
         """§3.8: source_hash = MD5[:8] of UTF-8 source bytes"""
         source = "import pandas as pd\n"
@@ -1638,6 +1667,46 @@ class TestSymbolCache:
         assert "alpha" not in symbols, "Stale 'alpha' entry must be removed on re-index"
         assert "beta" in symbols, "'beta' must appear after re-index"
 
+    def test_notebook_path_in_symbols_json_comes_from_file_not_index(self, tmp_path):
+        """§13.2: the notebook_path stored in symbols.json must be derived from the
+        actual file path at index time, NOT read from the per-notebook index file.
+
+        If nb-index.py trusted the 'notebook_path' stored in an existing per-notebook
+        index, a tampered index could inject a poisoned path into symbols.json, enabling
+        cross-notebook symbol poisoning.
+
+        Proof: tamper notebook_path in the per-notebook index, re-run with --force,
+        verify symbols.json still uses the real path (not the tampered one).
+        """
+        nb = make_notebook(
+            [code_cell("def poisoned_fn():\n    pass\n")],
+            tmp_path=tmp_path, name="real.ipynb"
+        )
+        run_indexer(nb)
+        idx = index_path_for(nb)
+
+        # Tamper: inject a fake notebook_path into the per-notebook index
+        data = load_index(idx)
+        data["notebook_path"] = "../../injected/fake.ipynb"
+        idx.write_text(json.dumps(data), encoding="utf-8")
+
+        # Re-index with --force: the indexer must recompute notebook_path from
+        # the actual file path argument, not from the tampered stored value.
+        run_indexer(nb, extra_args=["--force"])
+
+        symbols_data = json.loads(
+            (tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8")
+        )
+        locs = symbols_data.get("symbols", {}).get("poisoned_fn", [])
+        assert locs, "poisoned_fn must be in symbols.json after re-index"
+        for loc in locs:
+            assert "injected" not in loc and "fake.ipynb" not in loc, (
+                f"symbols.json must NOT use tampered notebook_path; got location: {loc!r}"
+            )
+            assert "real.ipynb" in loc, (
+                f"symbols.json must use the real file path; got location: {loc!r}"
+            )
+
     def test_symbols_json_not_skipped_as_notebook_index(self, tmp_path):
         """§13.5: symbols.json itself must not be treated as a per-notebook index"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
@@ -2094,4 +2163,112 @@ class TestSymbolCacheAdditional:
         new_data = json.loads(symbols_path.read_text(encoding="utf-8"))
         assert new_data.get("version") == 1, (
             "symbols.json must be rebuilt with version=1 after detecting unknown version"
+        )
+
+
+# ---------------------------------------------------------------------------
+# §15 — Shared index discovery: all three scripts agree on index location
+# ---------------------------------------------------------------------------
+
+class TestSharedIndexDiscovery:
+    """§15: nb-index.py, nb-read.py, and nb-search.py must implement
+    _find_index_dir() and _index_file_path() identically.
+
+    We verify this behaviourally: index a notebook with nb-index.py, then
+    confirm nb-read.py and nb-search.py both find the same index file without
+    being told its location explicitly.
+    """
+
+    READ_SCRIPT   = REPO_ROOT / "scripts" / "nb-read.py"
+    SEARCH_SCRIPT = REPO_ROOT / "scripts" / "nb-search.py"
+
+    def test_nb_read_finds_index_written_by_nb_index(self, tmp_path):
+        """§15: nb-read.py must locate the same .nb_index/<path>.json that
+        nb-index.py wrote — without being given the index path directly."""
+        nb = make_notebook(
+            [code_cell("discovery_marker = True\n")], tmp_path=tmp_path
+        )
+        r_idx = run_indexer(nb)
+        assert r_idx.returncode == 0, f"nb-index.py failed: {r_idx.stderr}"
+
+        # nb-read.py should use --outline (cheapest read path) which goes through
+        # the index-discovery logic and reads first_line from the index.
+        r_read = subprocess.run(
+            [PYTHON, str(self.READ_SCRIPT), str(nb), "--outline"],
+            capture_output=True, text=True
+        )
+        assert r_read.returncode == 0, (
+            f"nb-read.py must find the index written by nb-index.py; "
+            f"exit {r_read.returncode}: {r_read.stderr}"
+        )
+        # The outline must contain the first_line content
+        assert "discovery_marker" in r_read.stdout, (
+            f"nb-read.py outline must reflect indexed content; stdout: {r_read.stdout!r}"
+        )
+
+    def test_nb_search_finds_index_written_by_nb_index(self, tmp_path):
+        """§15: nb-search.py must locate the same .nb_index/<path>.json that
+        nb-index.py wrote when doing a --symbol search (index-only path)."""
+        nb = make_notebook(
+            [code_cell("def search_discovery_fn():\n    pass\n")],
+            tmp_path=tmp_path
+        )
+        r_idx = run_indexer(nb)
+        assert r_idx.returncode == 0, f"nb-index.py failed: {r_idx.stderr}"
+
+        r_search = subprocess.run(
+            [PYTHON, str(self.SEARCH_SCRIPT), "--symbol", "search_discovery_fn",
+             str(tmp_path)],
+            capture_output=True, text=True
+        )
+        assert r_search.returncode == 0, (
+            f"nb-search.py --symbol must find 'search_discovery_fn' in the index "
+            f"written by nb-index.py; exit {r_search.returncode}: {r_search.stderr}"
+        )
+        assert "search_discovery_fn" in r_search.stdout, (
+            f"Symbol must appear in search output; got: {r_search.stdout!r}"
+        )
+
+    def test_nb_read_and_nb_search_agree_on_index_location_git_root(self, tmp_path):
+        """§15: in a git repo, all three scripts must resolve the index to
+        <git-root>/.nb_index/, not the notebook's own directory."""
+        git_root = tmp_path / "project"
+        git_root.mkdir()
+        (git_root / ".git").mkdir()  # fake git root
+
+        sub = git_root / "notebooks"
+        sub.mkdir()
+        nb = make_notebook(
+            [code_cell("git_root_marker = 1\n")],
+            tmp_path=sub, name="nb.ipynb"
+        )
+
+        r_idx = run_indexer(nb)
+        assert r_idx.returncode == 0, f"nb-index.py failed: {r_idx.stderr}"
+
+        # Index must be at git root, not inside notebooks/
+        expected_idx_dir = git_root / ".nb_index"
+        assert expected_idx_dir.is_dir(), (
+            f"nb-index.py must place .nb_index/ at git root {git_root}; "
+            f"directories found: {list(tmp_path.rglob('.nb_index'))}"
+        )
+
+        # nb-read.py must find it there
+        r_read = subprocess.run(
+            [PYTHON, str(self.READ_SCRIPT), str(nb), "--outline"],
+            capture_output=True, text=True
+        )
+        assert r_read.returncode == 0, (
+            f"nb-read.py must find the git-root index; exit {r_read.returncode}: {r_read.stderr}"
+        )
+
+        # nb-search.py must find it there
+        r_search = subprocess.run(
+            [PYTHON, str(self.SEARCH_SCRIPT), "--symbol", "git_root_marker",
+             str(git_root)],
+            capture_output=True, text=True
+        )
+        assert r_search.returncode == 0, (
+            f"nb-search.py must find symbol in git-root index; "
+            f"exit {r_search.returncode}: {r_search.stderr}"
         )
