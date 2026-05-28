@@ -565,6 +565,56 @@ class TestSectionFilter:
             f"cell 3 (Analysis section) appeared in output: {r.stdout!r}"
         )
 
+    def test_section_filter_matches_parent_via_section_path(self, tmp_path):
+        """§12.8: --section on a parent heading matches cells nested under sub-headings.
+
+        A cell under '### Normalization' inside '## Data Loading' must be found
+        by '--section Data Loading' because 'Data Loading' is in its section_path.
+        Without section_path this query would fail — the cell's section field is
+        'Normalization', not 'Data Loading'.
+        """
+        cells = [
+            markdown_cell("## Data Loading\n", cell_id="m0"),
+            markdown_cell("### Normalization\n", cell_id="m1"),
+            code_cell("nested_token = True\n", cell_id="c2"),   # in Normalization ⊂ Data Loading
+            markdown_cell("## Analysis\n", cell_id="m3"),
+            code_cell("other_token = 1\n", cell_id="c4"),
+        ]
+        make_indexed_project(tmp_path, [("nb.ipynb", cells)])
+        r = run_search(["nested_token", "--section", "Data Loading", str(tmp_path)])
+        assert r.returncode == 0, (
+            "--section 'Data Loading' must find 'nested_token' which is nested inside "
+            "'### Normalization' ⊂ '## Data Loading' (section_path matching); "
+            f"got exit {r.returncode}; stderr: {r.stderr!r}"
+        )
+        assert "nested_token" in r.stdout or ":2:" in r.stdout, (
+            f"nested_token (cell 2) must appear in output; got: {r.stdout!r}"
+        )
+        # The Analysis cell must NOT appear
+        assert ":4:" not in r.stdout, (
+            f"Cell 4 (Analysis section) must not appear; got: {r.stdout!r}"
+        )
+
+    def test_section_filter_innermost_heading_still_works(self, tmp_path):
+        """§12.8: --section on the innermost heading still narrows correctly"""
+        cells = [
+            markdown_cell("## Data Loading\n", cell_id="m0"),
+            markdown_cell("### Normalization\n", cell_id="m1"),
+            code_cell("norm_token = 1\n", cell_id="c2"),          # in Normalization
+            markdown_cell("### Splitting\n", cell_id="m3"),
+            code_cell("split_token = 1\n", cell_id="c4"),         # in Splitting ⊂ Data Loading
+        ]
+        make_indexed_project(tmp_path, [("nb.ipynb", cells)])
+        r = run_search(["norm_token", "--section", "Normalization", str(tmp_path)])
+        assert r.returncode == 0, (
+            "--section 'Normalization' must find norm_token; "
+            f"got exit {r.returncode}; stderr: {r.stderr!r}"
+        )
+        assert ":4:" not in r.stdout, (
+            "--section 'Normalization' must not return the cell in 'Splitting'; "
+            f"got: {r.stdout!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # §12.9 — Exit codes

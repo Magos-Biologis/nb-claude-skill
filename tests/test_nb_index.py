@@ -881,6 +881,84 @@ class TestSectionExtraction:
             "Cell under ## Main2 must be in 'Main2', not the preceding h3 sub-section"
         )
 
+    def test_section_path_stored_per_cell(self, tmp_path):
+        """§5.5: section_path is an ordered list from outermost to innermost heading"""
+        cells = [
+            markdown_cell("## Data Loading", cell_id="m0"),   # idx 0
+            markdown_cell("### Normalization", cell_id="m1"), # idx 1
+            code_cell("x = normalize(df)", cell_id="c2"),     # idx 2  → in h3
+        ]
+        nb = make_notebook(cells, tmp_path=tmp_path)
+        run_indexer(nb)
+        data = load_index(index_path_for(nb))
+        cell = data["cells"][2]
+        assert cell["section"] == "Normalization", (
+            "section must be the innermost heading name"
+        )
+        assert cell["section_path"] == ["Data Loading", "Normalization"], (
+            "section_path must list all ancestor headings in order outermost→innermost"
+        )
+
+    def test_section_path_invariant_section_equals_last_element(self, tmp_path):
+        """§5.5 invariant: section == section_path[-1] when section_path is non-empty"""
+        cells = [
+            markdown_cell("# Chapter", cell_id="m0"),
+            markdown_cell("## Section", cell_id="m1"),
+            markdown_cell("### Sub", cell_id="m2"),
+            code_cell("pass", cell_id="c3"),
+        ]
+        nb = make_notebook(cells, tmp_path=tmp_path)
+        run_indexer(nb)
+        data = load_index(index_path_for(nb))
+        cell = data["cells"][3]
+        assert cell["section_path"], "section_path must be non-empty for nested cell"
+        assert cell["section"] == cell["section_path"][-1], (
+            "section must equal the last element of section_path"
+        )
+
+    def test_section_path_empty_before_first_heading(self, tmp_path):
+        """§5.5: section_path is [] for cells before the first heading"""
+        cells = [
+            code_cell("x = 1", cell_id="c0"),              # before any heading
+            markdown_cell("## Section A", cell_id="m1"),
+            code_cell("y = 2", cell_id="c2"),
+        ]
+        nb = make_notebook(cells, tmp_path=tmp_path)
+        run_indexer(nb)
+        data = load_index(index_path_for(nb))
+        assert data["cells"][0]["section_path"] == [], (
+            "section_path must be [] for cells before any heading"
+        )
+        assert data["cells"][0]["section"] is None, (
+            "section must be null for cells before any heading"
+        )
+        # Cell after heading must have non-empty section_path
+        assert data["cells"][2]["section_path"] == ["Section A"]
+
+    def test_section_path_top_level_heading_only(self, tmp_path):
+        """§5.5: cell under a single top-level heading has section_path of length 1"""
+        cells = [
+            markdown_cell("## Analysis", cell_id="m0"),
+            code_cell("result = run()", cell_id="c1"),
+        ]
+        nb = make_notebook(cells, tmp_path=tmp_path)
+        run_indexer(nb)
+        data = load_index(index_path_for(nb))
+        assert data["cells"][1]["section_path"] == ["Analysis"], (
+            "Cell under single h2 must have section_path=['Analysis']"
+        )
+
+    def test_section_path_no_headings(self, tmp_path):
+        """§5.6: notebooks with no headings produce section_path=[] for all cells"""
+        nb = make_notebook([code_cell("x = 1"), code_cell("y = 2", cell_id="c1")],
+                           tmp_path=tmp_path)
+        run_indexer(nb)
+        data = load_index(index_path_for(nb))
+        for i, cell in enumerate(data["cells"]):
+            assert cell["section_path"] == [], (
+                f"Cell {i} must have section_path=[] when no headings exist"
+            )
+
 
 # ---------------------------------------------------------------------------
 # §6 — Symbol extraction

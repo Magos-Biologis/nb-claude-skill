@@ -317,7 +317,11 @@ is best-effort.
       "source_hash": "b2e1a9f3",   // MD5[:8] of cell source text
       "first_line": "import pandas as pd",  // first non-empty source line, stripped,
                                             // ANSI-sanitised, max 120 chars
-      "section": "Packages",       // null if before first heading
+      "section": "Packages",       // innermost containing section name; null if before first heading
+      "section_path": ["Analysis", "Packages"],  // ordered list from outermost to innermost heading;
+                                                  // [] if before first heading.
+                                                  // Enables parent-section filtering without full-text scan.
+                                                  // section === section_path[-1] (when non-empty).
       "symbols_defined": ["load_data", "df"],
       "symbols_imported": ["pandas", "numpy"],
       "symbols_extracted": true,
@@ -336,6 +340,7 @@ is best-effort.
       "source_hash": "c4d3e2f1",
       "first_line": "## Data Loading",     // heading line stored verbatim (after sanitise)
       "section": null,
+      "section_path": [],          // empty array when before first heading
       "heading": 2,                // present only when type=markdown and first line is a heading
       "heading_text": "Data Loading",
       "symbols_defined": [],
@@ -597,12 +602,23 @@ processed. This is O(C) and must not be implemented as a nested scan (O(C²)).
 ### 5.4 Empty sections list when no headings
 `"sections": []`.
 
-### 5.5 Cell `section` field
-`cells[i]["section"]` = heading text of innermost containing section, or
-`null` if before any heading.
+### 5.5 Cell `section` field and `section_path` field
+`cells[i]["section"]` = heading text of the **innermost** containing section,
+or `null` if before any heading.
+
+`cells[i]["section_path"]` = ordered list of heading texts from outermost to
+innermost, e.g. `["Data Loading", "Normalization"]`. Empty list `[]` if before
+any heading. This enables parent-section filtering: a query `--section
+"Data Loading"` matches any cell where `"Data Loading"` appears anywhere in
+`section_path`, not only cells in the innermost section of that name.
+
+Invariant: when `section_path` is non-empty, `section == section_path[-1]`.
+
+The required stack algorithm (§5.3) already carries the full stack; writing
+`section_path` is a list snapshot of the stack's heading texts at each cell.
 
 ### 5.6 Notebook with no markdown cells
-`"sections": []`; all cells have `"section": null`.
+`"sections": []`; all cells have `"section": null` and `"section_path": []`.
 
 ---
 
@@ -971,6 +987,19 @@ Finds cells where `import_index` key matches the queried module name using
 `[UNINDEXED] path/to/nb.ipynb — run nb-index.py first` on stderr.
 
 ### 12.8 `--section` filter
+`nb-search.py QUERY --section "Data Loading"` restricts results to cells where
+the query string appears as any element of `section_path` — not only the
+innermost `section`. This means cells nested under a sub-heading of the named
+section are included.
+
+Matching rule: a cell passes the filter iff `query_section in cell["section_path"]`
+(exact string match, case-sensitive). If a cell's index predates the `section_path`
+field (older index format), fall back to matching against `cell["section"]`.
+
+Example: given headings `## Data Loading > ### Normalization`:
+- `--section "Data Loading"` matches cells under `### Normalization` (because
+  `"Data Loading"` is in `section_path: ["Data Loading", "Normalization"]`).
+- `--section "Normalization"` matches only cells directly under `### Normalization`.
 
 ### 12.9 Exit codes
 - 0: one or more matches
