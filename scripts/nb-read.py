@@ -11,6 +11,8 @@ Options:
   --cells N,M,K     Show specific cells (e.g. --cells 0,2,5)
   --type TYPE       Filter by cell type: code | markdown | raw
   --truncate N      Truncate cell source at N lines (default: 80, 0 = unlimited)
+  --outline         Print compact one-line-per-cell table (no source body)
+  --outputs         Show cell outputs after each source block
   --no-safe         Disable source sanitisation and │ line-prefix (raw output).
                     WARNING: disabling safe mode passes ANSI escape sequences and
                     raw control characters from untrusted notebook content through
@@ -21,11 +23,13 @@ Options:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import argparse
 import os
 import re
+from pathlib import Path
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_RANGE_SIZE = 10_000             # guard against billion-element set allocation
@@ -61,6 +65,73 @@ _CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')  # C0 controls + DEL
 def _sanitise(s: str) -> str:
     """Strip ANSI sequences then any remaining control characters."""
     return _CTRL_RE.sub('', _ANSI_RE.sub('', str(s)))
+
+
+# ---------------------------------------------------------------------------
+# Index discovery (§15)
+# ---------------------------------------------------------------------------
+
+def _find_index_dir(nb_path: Path) -> Path:
+    """Walk upward from nb_path to find git root; fall back to nb_path.parent."""
+    nb_path = nb_path.resolve()
+    current = nb_path.parent
+    current_dev = os.stat(current).st_dev
+    for _ in range(20):
+        git_dir = current / ".git"
+        if git_dir.is_dir() and not git_dir.is_symlink():
+            return current / ".nb_index"
+        parent = current.parent
+        if parent == current:
+            break
+        try:
+            if os.stat(parent).st_dev != current_dev:
+                break
+        except OSError:
+            break
+        current = parent
+        current_dev = os.stat(current).st_dev
+    return nb_path.parent / ".nb_index"
+
+
+def _index_file_path(nb_path: Path) -> Path:
+    """Return the expected index JSON path for the given notebook."""
+    nb_path = nb_path.resolve()
+    index_dir = _find_index_dir(nb_path)
+    # git case: index_dir is <git-root>/.nb_index
+    # Need to check if index_dir is at git root (not nb parent)
+    if index_dir.parent != nb_path.parent:
+        # git root case: use relative path from git root
+        rel = nb_path.relative_to(index_dir.parent)
+        return index_dir / (str(rel).replace(os.sep, "/") + ".json")
+    else:
+        # no-git case: flat
+        return index_dir / (nb_path.name + ".json")
+
+
+def _load_fresh_index(nb_path: Path):
+    """Load and return (data, reason) where reason is 'fresh', 'absent', 'stale',
+    'corrupt', or 'error'.  Returns (data, 'fresh') only when all staleness
+    signals match.
+    """
+    idx_path = _index_file_path(nb_path)
+    if not idx_path.exists():
+        return None, "absent"
+    try:
+        data = json.loads(idx_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None, "corrupt"
+    try:
+        stat = os.stat(nb_path)
+        stored_mtime = data.get("notebook_mtime")
+        stored_size = data.get("notebook_size")
+        if stat.st_mtime != stored_mtime:
+            return None, "stale"
+        if stat.st_size != stored_size:
+            return None, "stale"
+        # mtime + size both match — treat as fresh (skip hash for nb-read)
+        return data, "fresh"
+    except OSError:
+        return None, "error"
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +228,7 @@ def render_source(lines, truncate, safe=True):
 def _output_summary(cell) -> str | None:
     """
     Return a one-line summary of cell outputs, or None if there are no outputs.
-    Example: '[cell has 3 output(s), 5 lines — not shown]'
+    Format: '│ ── (N outputs, M lines) ──'  (§2.6 canonical)
     """
     outputs = cell.get("outputs", [])
     if not outputs:
@@ -175,7 +246,128 @@ def _output_summary(cell) -> str | None:
         tb = out.get("traceback", [])
         if isinstance(tb, list):
             n_lines += len(tb)
-    return (f"[cell has {n_entries} output(s), {n_lines} lines — not shown]")
+    plural = "output" if n_entries == 1 else "outputs"
+    return f"│ ── ({n_entries} {plural}, {n_lines} lines) ──"
+
+
+# ---------------------------------------------------------------------------
+# Output rendering helpers (for --outputs mode)
+# ---------------------------------------------------------------------------
+
+def _extract_output_text(cell, safe=True) -> str | None:
+    """
+    Extract and render the text portions of a cell's outputs.
+    Returns None if there is no renderable text output.
+    """
+    outputs = cell.get("outputs", [])
+    if not outputs:
+        return None
+
+    parts = []
+    for out in outputs:
+        otype = out.get("output_type", "")
+        if otype in ("stream", "execute_result", "display_data"):
+            if otype in ("execute_result", "display_data"):
+                text_val = out.get("data", {}).get("text/plain", out.get("text", []))
+            else:
+                text_val = out.get("text", [])
+            if isinstance(text_val, list):
+                text = "".join(str(t) for t in text_val)
+            elif isinstance(text_val, str):
+                text = text_val
+            else:
+                text = str(text_val)
+            if text:
+                parts.append(text)
+        elif otype == "error":
+            tb = out.get("traceback", [])
+            if isinstance(tb, list):
+                text = "\n".join(str(t) for t in tb)
+            else:
+                text = str(tb)
+            if text:
+                parts.append(text)
+
+    if not parts:
+        return None
+
+    combined = "".join(parts)
+    if safe:
+        combined = _ANSI_RE.sub('', combined)
+        combined = _CTRL_RE.sub('', combined)
+    return combined
+
+
+def _render_output_block(cell, safe=True) -> str | None:
+    """
+    Render the [output] block for a cell.  Returns None if no text output.
+    """
+    text = _extract_output_text(cell, safe=safe)
+    if text is None:
+        return None
+
+    lines = text.splitlines()
+    header = "[output] " + "─" * 40
+    if safe:
+        body = "\n".join("│ " + l for l in lines)
+    else:
+        body = "\n".join(lines)
+    return header + "\n" + body
+
+
+# ---------------------------------------------------------------------------
+# Outline helpers (for --outline mode)
+# ---------------------------------------------------------------------------
+
+def _first_line_from_source(source_raw, safe=True) -> str:
+    """Extract the first non-empty line from raw cell source."""
+    text = _coerce_source(source_raw)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            result = stripped[:120]
+            if safe:
+                result = _sanitise(result)
+            return result
+    return "(empty)"
+
+
+def _format_outline_line(i: int, ctype: str, exec_count, first_line: str,
+                         section: str | None = None) -> str:
+    """Format a single outline line per §9/§11 spec.
+
+    §11.3: section name shown as '§Name' (soft max 20 chars with '…').
+    §11.4: total bracket must not exceed 72 chars (no bar in --outline mode,
+           but bracket width is still limited to 72).
+    """
+    if ctype == "code":
+        run_str = str(exec_count) if exec_count is not None else "——"
+        bracket_core = f"{i}:{ctype}:run={run_str}"
+    else:
+        bracket_core = f"{i}:{ctype}"
+
+    if section is not None:
+        # Soft 20-char max with '…'
+        if len(section) > 20:
+            section_display = section[:20] + "…"
+        else:
+            section_display = section
+        # Check if adding § section would exceed 72 chars for the bracket
+        # Bracket format: [<core> §<section>]
+        candidate = f"[{bracket_core} §{section_display}]"
+        if len(candidate) > 72 and len(section_display) > 1:
+            # Shrink section name further
+            budget = 72 - len(f"[{bracket_core} §]")
+            if budget > 0:
+                section_display = section_display[:budget]
+                candidate = f"[{bracket_core} §{section_display}]"
+            else:
+                candidate = f"[{bracket_core}]"
+        bracket = candidate
+    else:
+        bracket = f"[{bracket_core}]"
+
+    return f"{bracket} {first_line}"
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +382,10 @@ def main():
                         help="Only show cells of this type")
     parser.add_argument("--truncate", type=int, default=80,
                         help="Max lines per cell (0 = unlimited, default: 80)")
+    parser.add_argument("--outline", action="store_true",
+                        help="Print compact one-line-per-cell table")
+    parser.add_argument("--outputs", action="store_true",
+                        help="Show cell outputs after each source block")
     parser.add_argument("--no-safe", dest="no_safe", action="store_true",
                         help="Disable ANSI sanitisation and │ line-prefix (raw output)")
     args = parser.parse_args()
@@ -234,9 +430,56 @@ def main():
 
     cell_filter = parse_cell_filter(args.cells)
 
+    # Try to load a fresh index (used by --outline, --outputs, and §11 headers)
+    nb_path = Path(path)
+    index_data, index_reason = _load_fresh_index(nb_path)
+    if index_reason == "stale":
+        print(f"[STALE INDEX] {path}", file=sys.stderr)
+
     # Header
     print(f"{path} | {total} cell{'s' if total != 1 else ''} | {kernel}{lang_str}\n")
 
+    # ------------------------------------------------------------------
+    # --outline mode
+    # ------------------------------------------------------------------
+    if args.outline:
+        # Build a lookup from cell index to index data when fresh
+        index_cell_map = {}
+        if index_data is not None:
+            for c in index_data.get("cells", []):
+                index_cell_map[c["i"]] = c
+
+        for i, cell in enumerate(cells):
+            if cell_filter is not None and i not in cell_filter:
+                continue
+            ctype = _sanitise(cell.get("cell_type", "unknown"))
+            if args.cell_type and ctype != args.cell_type:
+                continue
+
+            exec_count = cell.get("execution_count", None)
+
+            section = None
+            if index_cell_map and i in index_cell_map:
+                first_line = index_cell_map[i].get("first_line", "(empty)")
+                if safe:
+                    first_line = _sanitise(first_line)
+                idx_exec = index_cell_map[i].get("exec")
+                if exec_count is None and idx_exec is not None:
+                    exec_count = idx_exec
+                # §11.3: show section name from index
+                section = index_cell_map[i].get("section")
+                if section is not None and safe:
+                    section = _sanitise(section)
+            else:
+                first_line = _first_line_from_source(cell.get("source", []), safe=safe)
+
+            print(_format_outline_line(i, ctype, exec_count, first_line, section=section))
+
+        return
+
+    # ------------------------------------------------------------------
+    # Normal and --outputs rendering
+    # ------------------------------------------------------------------
     shown = 0
     for i, cell in enumerate(cells):
         if cell_filter is not None and i not in cell_filter:
@@ -245,16 +488,32 @@ def main():
         if args.cell_type and ctype != args.cell_type:
             continue
 
-        bar = "─" * max(1, 44 - len(str(i)) - len(ctype))
-        print(f"[{i}:{ctype}] {bar}")
+        # Build header with :run= for code cells (§11)
+        if ctype == "code":
+            exec_count = cell.get("execution_count", None)
+            run_str = str(exec_count) if exec_count is not None else "——"
+            meta = f"[{i}:{ctype}:run={run_str}]"
+        else:
+            meta = f"[{i}:{ctype}]"
+
+        bar_len = max(1, 44 - len(meta))
+        bar = "─" * bar_len
+        print(f"{meta} {bar}")
+
         source_text = render_source(cell.get("source", []), args.truncate, safe=safe)
         print(source_text)
 
-        # Output summary for code cells (shown in both safe and no-safe modes)
         if ctype == "code":
-            summary = _output_summary(cell)
-            if summary:
-                print(summary)
+            if args.outputs:
+                # --outputs mode: render full output block
+                output_block = _render_output_block(cell, safe=safe)
+                if output_block:
+                    print(output_block)
+            else:
+                # Normal mode: show summary line (§2.6)
+                summary = _output_summary(cell)
+                if summary:
+                    print(summary)
 
         print()
         shown += 1

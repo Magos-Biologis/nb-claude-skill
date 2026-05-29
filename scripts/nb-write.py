@@ -33,11 +33,15 @@ Notes:
 import json
 import sys
 import os
+import subprocess
 import tempfile
 import secrets
 import string
+from pathlib import Path
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+
+_NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-level
 
 # Optional file locking (POSIX only; not available on Windows)
 try:
@@ -426,6 +430,22 @@ def main():
         die(f"unknown operation '{op}', must be create | patch | insert | delete.")
 
     save(path, nb, lock_fd=lock_fd)
+
+    if _NB_INDEX_SIBLING.exists():
+        _script = _NB_INDEX_SIBLING.resolve()   # resolved at call time, not import time
+        try:
+            subprocess.Popen(
+                [sys.executable, str(_script), str(Path(path).resolve())],
+                shell=False,          # NEVER shell=True
+                close_fds=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print(f"[warn] failed to spawn nb-index.py: {e}", file=sys.stderr)
+    else:
+        print(f"[warn] nb-index.py not found at {_NB_INDEX_SIBLING}; "
+              f"skipping auto-index", file=sys.stderr)
 
 
 if __name__ == "__main__":

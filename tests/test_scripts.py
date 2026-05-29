@@ -95,7 +95,7 @@ class TestNbRead:
         assert r.returncode == 0
         assert "[0:markdown]" in r.stdout
         assert "# Title" in r.stdout
-        assert "[1:code]" in r.stdout
+        assert "[1:code:run=" in r.stdout
         assert "x = 1" in r.stdout
 
     def test_header_shows_cell_count_and_kernel(self, tmp_path):
@@ -114,7 +114,7 @@ class TestNbRead:
         ], tmp_path)
         r = run_read([p, "--type", "code"])
         assert "[0:markdown]" not in r.stdout
-        assert "[1:code]" in r.stdout
+        assert "[1:code:run=" in r.stdout
         assert "[2:markdown]" not in r.stdout
 
     def test_filter_single_cell(self, tmp_path):

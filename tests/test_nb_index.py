@@ -1553,9 +1553,8 @@ class TestWriteIntegration:
         write_copy = tmp_path / "nb-write.py"
         import shutil
         shutil.copy2(WRITE_SCRIPT, write_copy)
-        # Also copy the stub so nb-write.py finds it in the same dir
-        import shutil as _shutil
-        _shutil.copy2(stub, tmp_path / "nb-index.py")
+        # stub is already at tmp_path / "nb-index.py" (placed by _mock_indexer);
+        # write_copy is in tmp_path, so _NB_INDEX_SIBLING will resolve correctly.
         nb_path = nb_dir / "my data.ipynb"
         # Create the notebook via nb-write.py create
         subprocess.run(

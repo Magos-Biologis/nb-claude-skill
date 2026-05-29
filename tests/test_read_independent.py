@@ -118,7 +118,7 @@ class TestBasicOutputFormat:
         )
         result = run([str(nb)])
         assert result.returncode == 0
-        assert "[0:code]" in result.stdout
+        assert "[0:code:run=" in result.stdout
 
     def test_cell_source_appears_in_output(self, tmp_path):
         """The cell's source text must appear in stdout."""
@@ -142,9 +142,9 @@ class TestBasicOutputFormat:
         )
         result = run([str(nb)])
         assert result.returncode == 0
-        assert "[0:code]" in result.stdout
+        assert "[0:code:run=" in result.stdout
         assert "[1:markdown]" in result.stdout
-        assert "[2:code]" in result.stdout
+        assert "[2:code:run=" in result.stdout
 
     def test_cell_header_contains_dashes(self, tmp_path):
         """Cell header lines include a visual separator (dashes)."""
@@ -156,7 +156,7 @@ class TestBasicOutputFormat:
         assert result.returncode == 0
         # At least several dashes on the same line as the cell header
         lines = result.stdout.splitlines()
-        header_lines = [l for l in lines if "[0:code]" in l]
+        header_lines = [l for l in lines if "[0:code:run=" in l]
         assert header_lines, "No cell header line found"
         assert "─" in header_lines[0] or "-" in header_lines[0] or "─" in header_lines[0]
 
@@ -233,7 +233,7 @@ class TestSourceFormatVariants:
         )
         result = run([str(nb)])
         assert result.returncode == 0
-        assert "[0:code]" in result.stdout
+        assert "[0:code:run=" in result.stdout
 
     def test_empty_source_list(self, tmp_path):
         """A cell with empty list source does not crash."""
