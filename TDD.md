@@ -260,6 +260,119 @@ SCRIPT = REPO_ROOT / "scripts" / "nb-write.py"  # test_write_independent.py
 
 ---
 
+### 2.13 Installer shared module (`_nb_install_common.py`)
+
+**Problem:**
+
+`install.py` and `uninstall.py` share four functions that must behave identically but are duplicated with trivial divergences that will drift over time:
+
+| Function | Divergence |
+|---|---|
+| `_default_claude_dir` | Error message shorter in `uninstall.py` (drops "Cannot determine Claude config dir.") |
+| `_claude_dir` | Identical bodies; differ only in a missing comment separator |
+| `_is_nb_guard_hook` | Truly identical — 2 lines |
+| `_save_settings` | Identical logic; `uninstall.py` drops docstring and one inline comment |
+
+`uninstall.py`'s `main()` also inlines the full hook-removal loop that `install.py` encapsulates as `_remove_nb_guard_entries()`, adding only a `removed` counter.
+
+Two bugs inside `_save_settings` (present in both copies):
+
+1. `import tempfile` is inside the function body — should be module-level.
+2. File descriptor leak: if `os.fdopen(fd, ...)` raises after `mkstemp`, `fd` is never closed (extremely rare OS condition, but real).
+3. `except OSError` in the outer handler is too narrow — a `json.dump` failure (e.g. encoding error) escapes cleanup and leaves the temp file on disk. Should be `except Exception`.
+
+**Solution:** Extract shared code into `_nb_install_common.py` at repo root. Both scripts import from it. `install.py` copies it alongside itself when installing to `skill_dir`.
+
+**`_nb_install_common.py` public API:**
+
+```python
+import json           # all at module level
+import os
+import sys
+import tempfile       # was inside _save_settings — moved here
+from pathlib import Path
+
+def _default_claude_dir() -> Path:
+    """Config dir for the current platform. Uses install.py's longer APPDATA error message."""
+
+def _claude_dir() -> Path:
+    """Respects CLAUDE_CONFIG_DIR env var; falls back to _default_claude_dir()."""
+
+def _is_nb_guard_hook(cmd: str) -> bool:
+    """True if cmd references nb-guard.py or nb-guard.sh."""
+
+def _save_settings(settings_path: Path, data: dict) -> None:
+    """Atomic write with fsync + os.replace. 0o600 on POSIX. Fd-leak safe."""
+
+def _remove_nb_guard_entries(settings: dict) -> int:
+    """Remove all nb-guard hook entries from settings in-place. Returns count removed."""
+```
+
+**`_save_settings` fixes — canonical pattern:**
+
+```python
+fd, tmp_path_str = tempfile.mkstemp(dir=dir_, suffix=".nb_tmp")
+try:
+    try:
+        f = os.fdopen(fd, "w", encoding="utf-8")
+    except Exception:
+        os.close(fd)   # guard: close fd before re-raising
+        raise
+    with f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path_str, settings_path)
+except Exception as e:
+    Path(tmp_path_str).unlink(missing_ok=True)  # always try; missing_ok if replace already ran
+    sys.exit(f"Error: cannot write {settings_path}: {e}")
+```
+
+Note: `ensure_ascii=False` added (consistent with all other `json.dump` calls in the project; guards against 6× size inflation on non-ASCII paths).
+
+**`_remove_nb_guard_entries` signature change:** Returns `int` (count of removed individual hook entries). `install.py` ignores the return value; `uninstall.py` uses it for its status message, replacing the current 8-line inline loop.
+
+**`_load_settings` is NOT shared.** `install.py` treats missing/corrupt settings as a fresh start (`return {}`). `uninstall.py` treats missing as "nothing to do" (early return) and corrupt as "skip removal". These are legitimately different behaviors; sharing would require a callback or enum that adds more complexity than the duplication it removes.
+
+**Changes to `install.py`:**
+
+Remove functions: `_default_claude_dir`, `_claude_dir`, `_is_nb_guard_hook`, `_save_settings`, `_remove_nb_guard_entries`.
+
+Add after stdlib imports:
+```python
+from _nb_install_common import (
+    _claude_dir, _is_nb_guard_hook, _save_settings, _remove_nb_guard_entries,
+)
+```
+
+Extend the stems loop that copies install/uninstall to `skill_dir`:
+```python
+for stem in ("install.py", "uninstall.py", "_nb_install_common.py"):
+```
+
+**Changes to `uninstall.py`:**
+
+Remove functions: `_default_claude_dir`, `_claude_dir`, `_is_nb_guard_hook`, `_save_settings`.
+
+Add after stdlib imports:
+```python
+from _nb_install_common import (
+    _claude_dir, _is_nb_guard_hook, _save_settings, _remove_nb_guard_entries,
+)
+```
+
+Replace inline hook-removal loop in `main()` with:
+```python
+removed = _remove_nb_guard_entries(settings)
+```
+
+**Test addition (`tests/test_install.py`):**
+
+- `test_install_copies_common_module` — after install, `skills/nb/_nb_install_common.py` exists in the skill dir (the installed `install.py`/`uninstall.py` import it at runtime).
+
+---
+
 ## 3. Non-changes (explicit decisions)
 
 | Item | Decision |
@@ -279,8 +392,9 @@ SCRIPT = REPO_ROOT / "scripts" / "nb-write.py"  # test_write_independent.py
 |------|--------|
 | `scripts/nb-guard.py` | **New** — replaces `nb-guard.sh` |
 | `scripts/nb-guard.sh` | **Kept** as legacy (POSIX-only systems); `install.py` prefers `.py` |
-| `install.py` | **New** — cross-platform installer |
-| `uninstall.py` | **New** — cross-platform uninstaller |
+| `_nb_install_common.py` | **New** — shared installer utilities (§2.13) |
+| `install.py` | **New** (§2.2) / **Updated** (§2.13) — imports from `_nb_install_common.py`, copies it to skill dir |
+| `uninstall.py` | **New** (§2.2) / **Updated** (§2.13) — imports from `_nb_install_common.py`, replaces inline hook loop |
 | `install.sh` | **Updated** — thin wrapper calling `python3 install.py` |
 | `uninstall.sh` | **Updated** — thin wrapper calling `python3 uninstall.py` |
 | `scripts/nb-read.py` | **Updated** — §2.3 §2.4 §2.5 §2.6 |

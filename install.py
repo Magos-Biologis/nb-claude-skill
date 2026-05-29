@@ -20,14 +20,9 @@ Requirements:
 
 import json
 import os
-import platform
 import shutil
 import sys
 from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Python version check
-# ---------------------------------------------------------------------------
 
 if sys.version_info < (3, 8):
     sys.exit("Error: nb requires Python 3.8 or later. "
@@ -35,39 +30,15 @@ if sys.version_info < (3, 8):
 
 REPO_ROOT = Path(__file__).parent.resolve()
 
+from _nb_install_common import (
+    _claude_dir, _is_nb_guard_hook, _save_settings, _remove_nb_guard_entries,
+)
 
-# ---------------------------------------------------------------------------
-# Config dir detection
-# ---------------------------------------------------------------------------
-
-def _default_claude_dir() -> Path:
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        if not appdata:
-            sys.exit("Error: %APPDATA% not set. Cannot determine Claude config dir.")
-        return Path(appdata) / "Claude"
-    return Path.home() / ".claude"
-
-
-def _claude_dir() -> Path:
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env:
-        return Path(env).resolve()
-    return _default_claude_dir()
-
-
-# ---------------------------------------------------------------------------
-# Python command detection
-# ---------------------------------------------------------------------------
 
 def _python_cmd() -> str:
     """Return 'python3' or 'python' depending on what's on PATH."""
     return "python3" if shutil.which("python3") else "python"
 
-
-# ---------------------------------------------------------------------------
-# Settings.json helpers
-# ---------------------------------------------------------------------------
 
 def _load_settings(settings_path: Path) -> dict:
     if not settings_path.exists():
@@ -79,67 +50,7 @@ def _load_settings(settings_path: Path) -> dict:
         return {}
 
 
-def _save_settings(settings_path: Path, data: dict) -> None:
-    """Atomic write to settings.json with restricted permissions."""
-    import tempfile
-    dir_ = settings_path.parent
-    dir_.mkdir(parents=True, exist_ok=True)
-    tmp_path = None
-    try:
-        fd, tmp_path_str = tempfile.mkstemp(dir=dir_, suffix=".nb_tmp")
-        tmp_path = Path(tmp_path_str)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            tmp_path = None
-            raise
-        os.replace(tmp_path_str, settings_path)
-        tmp_path = None
-    except OSError as e:
-        if tmp_path:
-            tmp_path.unlink(missing_ok=True)
-        sys.exit(f"Error: cannot write {settings_path}: {e}")
-
-    # Set permissions to 0o600 on POSIX
-    if sys.platform != "win32":
-        try:
-            os.chmod(settings_path, 0o600)
-        except OSError:
-            pass  # best-effort
-
-
-def _is_nb_guard_hook(cmd: str) -> bool:
-    return "nb-guard.py" in cmd or "nb-guard.sh" in cmd
-
-
-def _remove_nb_guard_entries(settings: dict) -> None:
-    """Remove all nb-guard hook entries (both .py and .sh) from settings."""
-    pre = settings.get("hooks", {}).get("PreToolUse", [])
-    new_pre = []
-    for entry in pre:
-        filtered_hooks = [h for h in entry.get("hooks", [])
-                          if not _is_nb_guard_hook(h.get("command", ""))]
-        if filtered_hooks:
-            entry = dict(entry)
-            entry["hooks"] = filtered_hooks
-            new_pre.append(entry)
-        # If all hooks in this entry were nb-guard, drop the whole entry
-
-    hooks = settings.setdefault("hooks", {})
-    if new_pre:
-        hooks["PreToolUse"] = new_pre
-    else:
-        # Drop the key entirely so we don't leave an empty PreToolUse list
-        hooks.pop("PreToolUse", None)
-
-
 def _add_nb_guard_entry(settings: dict, guard_cmd: str) -> None:
-    """Add the nb-guard.py PreToolUse entry."""
     settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append({
         "matcher": "Read|Edit|Write|MultiEdit",
         "hooks": [{
@@ -148,10 +59,6 @@ def _add_nb_guard_entry(settings: dict, guard_cmd: str) -> None:
         }],
     })
 
-
-# ---------------------------------------------------------------------------
-# Main install logic
-# ---------------------------------------------------------------------------
 
 def main():
     claude_dir = _claude_dir()
@@ -163,12 +70,10 @@ def main():
     # 1. Copy files
     skill_dir.mkdir(parents=True, exist_ok=True)
 
-    # SKILL.md
     shutil.copy2(REPO_ROOT / "SKILL.md", skill_dir / "SKILL.md")
 
-    # install.py / uninstall.py — ship alongside tests so the installed copy is
-    # self-contained and the test suite can locate them via parent.parent.
-    for stem in ("install.py", "uninstall.py"):
+    # install.py / uninstall.py / shared module — self-contained installed copy
+    for stem in ("install.py", "uninstall.py", "_nb_install_common.py"):
         src = REPO_ROOT / stem
         if src.exists():
             shutil.copy2(src, skill_dir / stem)
@@ -196,10 +101,8 @@ def main():
     settings_path = claude_dir / "settings.json"
     settings = _load_settings(settings_path)
 
-    # Remove all existing nb-guard entries (idempotent + legacy .sh cleanup)
     _remove_nb_guard_entries(settings)
 
-    # Build the hook command with an absolute path to the installed guard
     guard_script = (scripts_dst / "nb-guard.py").resolve()
     guard_cmd = f'{py_cmd} "{guard_script}"'
     _add_nb_guard_entry(settings, guard_cmd)

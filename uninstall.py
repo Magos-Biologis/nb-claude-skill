@@ -25,57 +25,9 @@ if sys.version_info < (3, 8):
 
 REPO_ROOT = Path(__file__).parent.resolve()
 
-
-def _default_claude_dir() -> Path:
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        if not appdata:
-            sys.exit("Error: %APPDATA% not set.")
-        return Path(appdata) / "Claude"
-    return Path.home() / ".claude"
-
-
-def _claude_dir() -> Path:
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env:
-        return Path(env).resolve()
-    return _default_claude_dir()
-
-
-def _is_nb_guard_hook(cmd: str) -> bool:
-    return "nb-guard.py" in cmd or "nb-guard.sh" in cmd
-
-
-def _save_settings(settings_path: Path, data: dict) -> None:
-    import tempfile
-    dir_ = settings_path.parent
-    dir_.mkdir(parents=True, exist_ok=True)
-    tmp_path = None
-    try:
-        fd, tmp_path_str = tempfile.mkstemp(dir=dir_, suffix=".nb_tmp")
-        tmp_path = Path(tmp_path_str)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            tmp_path = None
-            raise
-        os.replace(tmp_path_str, settings_path)
-        tmp_path = None
-    except OSError as e:
-        if tmp_path:
-            tmp_path.unlink(missing_ok=True)
-        sys.exit(f"Error: cannot write {settings_path}: {e}")
-
-    if sys.platform != "win32":
-        try:
-            os.chmod(settings_path, 0o600)
-        except OSError:
-            pass
+from _nb_install_common import (
+    _claude_dir, _is_nb_guard_hook, _save_settings, _remove_nb_guard_entries,
+)
 
 
 def main():
@@ -103,24 +55,7 @@ def main():
               file=sys.stderr)
         return
 
-    # Remove all nb-guard entries (both .py and legacy .sh)
-    pre = settings.get("hooks", {}).get("PreToolUse", [])
-    new_pre = []
-    removed = 0
-    for entry in pre:
-        filtered = [h for h in entry.get("hooks", [])
-                    if not _is_nb_guard_hook(h.get("command", ""))]
-        removed += len(entry.get("hooks", [])) - len(filtered)
-        if filtered:
-            entry = dict(entry)
-            entry["hooks"] = filtered
-            new_pre.append(entry)
-    hooks = settings.setdefault("hooks", {})
-    if new_pre:
-        hooks["PreToolUse"] = new_pre
-    else:
-        hooks.pop("PreToolUse", None)
-
+    removed = _remove_nb_guard_entries(settings)
     _save_settings(settings_path, settings)
 
     if removed:

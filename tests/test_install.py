@@ -101,6 +101,11 @@ class TestInstall:
         assert tests.exists()
         assert any(tests.glob("test_*.py"))
 
+    def test_install_copies_common_module(self, tmp_path):
+        """_nb_install_common.py must be present so installed install/uninstall can import it."""
+        run_install(tmp_path)
+        assert (tmp_path / "skills" / "nb" / "_nb_install_common.py").exists()
+
     def test_install_writes_hook_to_settings(self, tmp_path):
         run_install(tmp_path)
         s = read_settings(tmp_path)
