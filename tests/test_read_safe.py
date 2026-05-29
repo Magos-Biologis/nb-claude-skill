@@ -241,7 +241,7 @@ class TestNonStringSource:
 class TestOutputSummary:
 
     def test_output_summary_shown_for_code_cell_with_outputs(self, tmp_path):
-        """A code cell with outputs must show a summary line after the source."""
+        """A code cell with outputs must show a §2.6 canonical summary line after the source."""
         p = _make_nb([{
             "cell_type": "code",
             "source": ["print('hello')"],
@@ -250,13 +250,13 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        # Must mention outputs and count
-        assert "output" in r.stdout.lower(), (
-            f"Expected output summary in stdout, got:\n{r.stdout}"
+        # Must use the canonical TDD §2.6 format: '│ ── (N output'
+        assert "│ ── (1 output" in r.stdout, (
+            f"Expected canonical §2.6 summary '│ ── (1 output' in stdout, got:\n{r.stdout}"
         )
 
     def test_output_summary_shows_count_and_lines(self, tmp_path):
-        """Summary must include number of output entries."""
+        """Summary must include the §2.6 canonical prefix and the count of output entries."""
         p = _make_nb([{
             "cell_type": "code",
             "source": ["for i in range(3): print(i)"],
@@ -268,7 +268,10 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        assert "3" in r.stdout  # 3 output entries
+        # Must use the canonical prefix AND show the count
+        assert "│ ── (3 output" in r.stdout, (
+            f"Expected '│ ── (3 output' in stdout, got:\n{r.stdout}"
+        )
 
     def test_output_summary_not_shown_for_empty_outputs(self, tmp_path):
         """A code cell with outputs=[] must not show a summary line."""
@@ -279,24 +282,23 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        # No output summary keyword expected (outputs=[] → no summary line).
-        # Check for the specific summary pattern, not just "output" (the tmp path
-        # may contain "output" in the directory name).
-        assert "output(s)" not in r.stdout.lower() and "not shown" not in r.stdout.lower()
+        # No output summary must appear. Check for the §2.6 canonical prefix
+        # '│ ── (' — its absence confirms no summary was emitted regardless of
+        # format.  (Checking the old non-conforming marker 'output(s)' would
+        # silently pass even after a format regression.)
+        assert "│ ── (" not in r.stdout
 
     def test_output_summary_not_shown_for_markdown_cell(self, tmp_path):
         """Markdown cells have no outputs field; no summary line must appear."""
         p = _make_nb([{"cell_type": "markdown", "source": ["## Heading"]}], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        # No '[cell has N output(s)' summary line — the header line contains "cell"
-        # but not "output(s)" so we match on the summary-specific wording.
-        lines_with_output = [l for l in r.stdout.splitlines()
-                             if "output(s)" in l.lower() or "not shown" in l.lower()]
-        assert not lines_with_output
+        # Check absence using the §2.6 canonical prefix so the assertion catches
+        # any future format, not just the old non-conforming 'output(s)' wording.
+        assert "│ ── (" not in r.stdout
 
     def test_output_summary_mentions_not_shown(self, tmp_path):
-        """Summary line must tell Claude the outputs are not rendered."""
+        """Summary line must use the §2.6 canonical '│ ── (' prefix format."""
         p = _make_nb([{
             "cell_type": "code",
             "source": ["print('x')"],
@@ -304,10 +306,11 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        stdout_lower = r.stdout.lower()
-        assert "not shown" in stdout_lower or "not rendered" in stdout_lower or \
-               "not display" in stdout_lower, (
-            f"Output summary must say outputs are not shown:\n{r.stdout}"
+        # The TDD §2.6 format is '│ ── (N outputs, M lines) ──'
+        # Check that the summary line starts with the canonical prefix
+        summary_lines = [l for l in r.stdout.splitlines() if l.startswith("│ ── (")]
+        assert summary_lines, (
+            f"Expected a summary line starting with '│ ── (' in stdout, got:\n{r.stdout}"
         )
 
     def test_error_output_counted_in_summary(self, tmp_path):
@@ -324,10 +327,14 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        assert "output" in r.stdout.lower()
+        # Use the canonical §2.6 prefix — "output" alone is too loose and
+        # matches directory paths that may contain the word "output".
+        assert "│ ── (1 output" in r.stdout, (
+            f"Expected canonical §2.6 summary '│ ── (1 output' in stdout, got:\n{r.stdout}"
+        )
 
     def test_no_safe_still_shows_output_summary(self, tmp_path):
-        """--no-safe must not suppress the output summary."""
+        """--no-safe must not suppress the output summary (count must still appear)."""
         p = _make_nb([{
             "cell_type": "code",
             "source": ["print(1)"],
@@ -335,4 +342,9 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p, "--no-safe"])
         assert r.returncode == 0
-        assert "output" in r.stdout.lower()
+        # The spec says output summary is shown in both safe and no-safe modes.
+        # Pin the canonical §2.6 prefix rather than the loose word "output" which
+        # can match a directory name in the tmp path.
+        assert "│ ── (1 output" in r.stdout, (
+            f"--no-safe must still show §2.6 canonical summary, got:\n{r.stdout}"
+        )

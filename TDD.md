@@ -160,6 +160,8 @@ else:
 Count: number of output entries; lines: total `len(text.splitlines())` across all `text`/`traceback` fields.  
 The `│ ` prefix keeps it consistent with the source framing (2.3) and distinguishable from cell headers.
 
+**Canonical format:** The exact string is `│ ── (N outputs, M lines) ──` (with the `│ ` prefix, a space, two dashes, a space, and the parenthesised counts). Implementations that render a different format (e.g. `[cell has N output(s), M lines — not shown]`) are non-conforming. Tests must check for the literal substring `│ ── (` rather than a loose `"output" in stdout` to detect format drift.
+
 This is metadata only — no output content is rendered (preserving token efficiency).
 
 ---
@@ -305,7 +307,7 @@ SCRIPT = REPO_ROOT / "scripts" / "nb-write.py"  # test_write_independent.py
 - `test_source_int_does_not_crash` — `source: 42` → renders as `"42"`, exits 0
 - `test_source_list_with_int_does_not_crash` — `source: ["line\n", 42]` → renders without crash
 - `test_source_none_does_not_crash` — `source: null` → renders as empty cell, exits 0
-- `test_output_summary_shown_for_code_cell` — cell with `outputs: [{output_type: stream, text: "hello"}]` → stdout contains `│ ── (1 output`
+- `test_output_summary_shown_for_code_cell` — cell with `outputs: [{output_type: stream, text: "hello"}]` → stdout contains the literal substring `│ ── (1 output` (not merely the word "output" — this pins the canonical §2.6 format)
 - `test_output_summary_not_shown_for_markdown` — markdown cell → no output summary line
 - `test_no_safe_flag_passes_ansi_through` — `--no-safe` → raw ANSI in stdout
 - `test_cell_source_lines_prefixed_with_pipe` — all source lines begin with `│ `
@@ -316,6 +318,16 @@ SCRIPT = REPO_ROOT / "scripts" / "nb-write.py"  # test_write_independent.py
 - `test_patch_negative_one_clear_error` — `patch -1` → error mentions "negative index", not "patch requires: <index>"
 - `test_write_locked_file_clear_error` — (POSIX only) lock file with `flock`, attempt patch → exits 1 (or succeeds if lock is cooperative)
 - `test_permission_error_message` — mock `os.replace` raising `PermissionError` → error mentions "locked by another process"
+
+### `tests/test_read_outline.py` [NEW]
+- `test_outline_flag_accepted` — `nb-read.py --outline` exits 0
+- `test_outline_one_line_per_cell` — output has exactly one line per cell (after the header line)
+- `test_outline_format_code_cell` — format is `[N:code:run=N] first_line`
+- `test_outline_format_markdown_cell` — format is `[N:markdown   ] ## Heading` (no `run=` field)
+- `test_outline_run_dashes_for_not_run` — `run=——` when `execution_count` is null
+- `test_outline_no_bar` — no `─────────` bar line appears in outline mode output
+- `test_outline_fallback_when_no_index` — works correctly (exits 0, one line per cell) without `nb-index.py` having been run
+- `test_outline_stale_index_warns_stderr` — when index exists but is stale, emits `[STALE INDEX]` on stderr and falls back to reading notebook directly
 
 ### `tests/test_nb_guard_py.py`
 - `test_read_ipynb_blocked` — payload with `tool_name: Read`, `file_path: test.ipynb` → exit 1
@@ -330,6 +342,9 @@ SCRIPT = REPO_ROOT / "scripts" / "nb-write.py"  # test_write_independent.py
 - `test_missing_jq_no_longer_needed` — script runs with no jq present (by design)
 - `test_python_cmd_in_redirect_message` — output contains `python3` or `python` (platform-appropriate)
 
+### `tests/test_nb_guard_hook.py` — settings registration note
+- `TestSettingsRegistration` must assert that the hook command registered in `settings.json` references `nb-guard.py`, **not** `nb-guard.sh`. A test that only checks for `"nb-guard"` (without the extension) would silently pass after a regression back to the shell version. The assertion must be: `assert "nb-guard.py" in hook_command`.
+
 ### `tests/test_install.py`
 - `test_install_creates_skill_dir` — install.py to temp dir → `skills/nb/` populated
 - `test_install_writes_hook_to_settings` — settings.json contains nb-guard.py hook entry
@@ -341,6 +356,36 @@ SCRIPT = REPO_ROOT / "scripts" / "nb-write.py"  # test_write_independent.py
 - `test_windows_config_dir` — mock `sys.platform == "win32"` → uses `%APPDATA%\Claude`
 - `test_settings_json_permissions` — created settings.json has mode 0o600 (POSIX only)
 - `test_temp_file_cleaned_on_jq_failure` — simulate json write failure → no `.nb_tmp` left
+
+---
+
+## 16. Test plan — `--outline` and `--outputs` modes
+
+These features are fully specified in TDD_INDEX.md §9 and §10 but have no tests written yet. Tests belong in `tests/test_read_outline.py` (new file) and `tests/test_read_outputs.py` (new file).
+
+### `tests/test_read_outline.py`
+
+See §5 above for the eight outline tests. Additional coverage:
+
+- `test_outline_reads_index_when_fresh` — after running `nb-index.py`, `--outline` does NOT open the `.ipynb` file (verified by mocking `open` or checking `strace`); uses `cells[i].first_line` from the index
+- `test_outline_section_field_absent_without_index` — without a fresh index, no `§SectionName` appears in any outline line
+- `test_outline_compatible_with_cells_filter` — `--outline --cells 0,2` shows only cells 0 and 2
+- `test_outline_empty_notebook` — 0-cell notebook → only the header line, no cell lines, exits 0
+- `test_outline_ansi_in_first_line_stripped` — index `first_line` containing `\x1b[31m` → stripped before output
+- `test_outline_no_safe_passes_ansi_through` — `--outline --no-safe` with ANSI in `first_line` → raw ANSI in stdout
+
+### `tests/test_read_outputs.py`
+
+- `test_outputs_flag_accepted` — `nb-read.py --outputs` exits 0
+- `test_outputs_section_rendered_after_source` — cell with output → `[output] ───` section appears after source block
+- `test_outputs_reads_from_index_when_fresh` — after indexing, `--outputs` does NOT open `.ipynb` for output data
+- `test_outputs_falls_back_to_notebook_when_no_index` — without index, output read directly from notebook; exits 0
+- `test_outputs_stale_index_warns_stderr` — stale index → `[STALE INDEX]` on stderr, falls back to notebook
+- `test_outputs_truncated_notice` — cell with `output_truncated: true` in index → truncation notice shown
+- `test_outputs_no_section_for_cells_without_output` — cells with empty `outputs` → no `[output]` section
+- `test_outputs_ansi_stripped_in_safe_mode` — ANSI in `output_text` → stripped (default `--safe`)
+- `test_outputs_no_safe_passes_ansi_through` — `--outputs --no-safe` → raw ANSI in stdout
+- `test_outputs_binary_output_not_rendered` — cell with only `image/png` output → no `[output]` section rendered (binary not stored)
 
 ---
 

@@ -211,13 +211,37 @@ class TestSettingsRegistration:
         for entry in pretooluse_hooks:
             all_hooks.extend(entry.get("hooks", []))
         guard_hooks = [h for h in all_hooks
-                       if "nb-guard.py" in h.get("command", "")
-                       or "nb-guard.sh" in h.get("command", "")]
-        assert guard_hooks, "No hook references nb-guard.py (or nb-guard.sh)"
+                       if "nb-guard.py" in h.get("command", "")]
+        assert guard_hooks, "No hook references nb-guard.py in settings.json"
         for h in guard_hooks:
             assert "if" not in h, (
                 f"nb-guard hook must not use an `if` condition (subdirectory bypass risk). "
                 f"Found: {h}"
+            )
+
+    def test_nb_guard_command_references_py_not_sh(self, pretooluse_hooks):
+        """Post install.py, the hook command must reference nb-guard.py, not nb-guard.sh.
+
+        nb-guard.sh is the legacy shell implementation. install.py replaces it with
+        nb-guard.py (the cross-platform Python implementation). This test ensures
+        install.py ran successfully and updated the hook command.
+        """
+        all_hooks = []
+        for entry in pretooluse_hooks:
+            all_hooks.extend(entry.get("hooks", []))
+        guard_hooks = [h for h in all_hooks
+                       if "nb-guard" in h.get("command", "")]
+        assert guard_hooks, "No hook references nb-guard in settings.json"
+        for h in guard_hooks:
+            cmd = h.get("command", "")
+            assert "nb-guard.py" in cmd, (
+                f"Hook command must reference nb-guard.py (Python implementation), "
+                f"not nb-guard.sh (legacy shell). Found: {cmd!r}. "
+                f"Run: python3 install.py to update settings.json."
+            )
+            assert "nb-guard.sh" not in cmd, (
+                f"Legacy nb-guard.sh entry found — install.py should have replaced it. "
+                f"Run: python3 install.py to update settings.json."
             )
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write", "MultiEdit"])
@@ -225,10 +249,10 @@ class TestSettingsRegistration:
         """Each guarded tool's hook entry must use a hardcoded absolute path to nb-guard."""
         entries = self._find_entries_for_tool(pretooluse_hooks, tool)
         guard_entries = [e for e in entries
-                         if "nb-guard.py" in e.get("command", "")
-                         or "nb-guard.sh" in e.get("command", "")]
+                         if "nb-guard.py" in e.get("command", "")]
         assert guard_entries, (
-            f"No hook entry for '{tool}' references nb-guard.py. Entries: {entries}"
+            f"No hook entry for '{tool}' references nb-guard.py (Python implementation). "
+            f"Entries: {entries}"
         )
         for e in guard_entries:
             cmd = e.get("command", "")

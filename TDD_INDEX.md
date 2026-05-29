@@ -177,6 +177,15 @@ ASSIGN_RE = re.compile(r'^(\w+)\s*(?::[\w\[\], ]{0,200})?\s*=(?!=)', re.MULTILIN
 # Post-filter: remove the string "type" from symbols_defined results.
 # (Python 3.12+ soft-keyword: `type Vector = list[float]` would otherwise
 #  capture "type" as a defined symbol, which is wrong.)
+#
+# Known edge: a line of exactly 499 chars containing a long annotation (e.g.
+# `x: SomeType[...] ` with no `=`) can cause O(n²) backtracking in the
+# optional annotation subpattern despite the `{0,200}` cap (because the
+# {0,200} quantifier has quadratic-worst-case in the backtracker for
+# near-limit inputs). The 500-char line skip is the primary mitigation.
+# If this is a concern, replace the optional annotation subpattern with a
+# possessive/atomic group in a future version (requires Python 3.11+
+# `re.POSSESSIVE` or the `regex` module).
 
 # Imported symbols
 IMPORT_RE = re.compile(r'^import\s+([\w.]+)', re.MULTILINE)
@@ -912,6 +921,24 @@ keep the bar ≥ 4 chars.
 A section heading of 80 chars produces at most `…` (20-char truncation
 rule) in the header. No crash from negative bar length.
 
+### 11.7 `test_outline_long_section_name_truncated`
+A section name longer than 20 chars must be truncated with `…` in the
+cell header. Test: index a notebook whose first markdown heading is a
+25-char string; run `nb-read.py --outline`; assert the heading text in
+the output is at most 21 chars (20 visible + `…`).
+
+### 11.8 `test_outline_header_never_exceeds_72_chars`
+With a large cell index number and a long section name, the total header
+line (including `─` bar) must never exceed 72 chars. Test: construct a
+notebook with 1000+ cells and a section name of 80 chars; assert every
+line produced by `--outline` is ≤ 72 chars.
+
+### 11.9 `test_outline_minimum_bar_length_4`
+Even when cell index and section name together consume most of the 72-char
+budget, the `─` bar appended to the header must be at least 4 chars long.
+Test: force the worst-case metadata width and assert `'─' * 4` appears in
+the header line.
+
 ### 11.6 Section name absent when index unavailable or stale
 When no fresh index exists, section names are omitted from headers (the
 `§Section` field requires the index). Prints `[STALE INDEX] <path>` to stderr
@@ -1008,6 +1035,11 @@ Example: given headings `## Data Loading > ### Normalization`:
 
 ### 12.10 Streaming output
 Results are printed as found, not buffered until all files are loaded.
+
+Note: The current streaming test (`TestStreamingOutput.test_first_result_before_all_files_scanned`)
+verifies that all results are eventually printed but cannot directly verify byte-level streaming
+without `Popen` + line-by-line reading. A follow-up test using `Popen` with
+`iter(proc.stdout.readline, "")` is recommended if streaming timeliness becomes a concern.
 
 ### 12.11 `--limit N` flag
 Stop after N results (default: no limit).
@@ -1166,6 +1198,17 @@ After indexing: a code cell with source `["x = 1\n", "y = 2"]` has
 `first_line: "## Heading"`. An empty cell has `first_line: "(empty)"`.
 
 
+### 14.12 Filesystem boundary stop during git-root walk
+When the notebook's directory tree crosses a filesystem mount boundary
+(different `st_dev`), the walk stops at that boundary and does not cross into
+the parent filesystem. Indexing proceeds using the notebook's own directory
+as fallback.
+
+Test plan note: `test_filesystem_boundary_stops_walk` — this test is
+platform-dependent and must be marked with `@pytest.mark.skipif` on platforms
+where bind-mounts cannot be created (most CI). The test should be documented
+but may be manually verified only on Linux with sufficient privileges.
+
 ### 14.13 `--outline` from fresh index never opens notebook file
 Patch a test notebook; index it; use `strace` or mock `open()` to verify
 nb-read.py does NOT open the `.ipynb` during `--outline` when index is fresh.
@@ -1209,7 +1252,7 @@ nb-read.py never triggers a synchronous rebuild.
 |------|-------------|
 | `scripts/nb-index.py` | Builds/updates `.nb_index/<path>.json` and `symbols.json` |
 | `scripts/nb-search.py` | Keyword / symbol / import / section search |
-| `tests/test_nb_index.py` | Full test suite for §1–§8, §13–§14 |
+| `tests/test_nb_index.py` | Full test suite for §1–§8, §13–§14 (including `test_filesystem_boundary_stops_walk` — see §14.12) |
 | `tests/test_nb_search.py` | Full test suite for §12 |
 
 ## Modified files
