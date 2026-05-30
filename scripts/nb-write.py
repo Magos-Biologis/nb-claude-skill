@@ -35,11 +35,14 @@ import sys
 import os
 import subprocess
 import tempfile
+import time
 import secrets
 import string
 from pathlib import Path
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+_REPLACE_RETRIES    = 3
+_REPLACE_RETRY_DELAY = 0.05   # 50 ms — AV scans typically release within one window
 
 _NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-level
 
@@ -49,6 +52,11 @@ try:
     _have_flock = True
 except ImportError:
     _have_flock = False  # Windows: no flock; concurrent writes are not serialised
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
 
 
 # ---------------------------------------------------------------------------
@@ -185,13 +193,17 @@ def save(path, nb, lock_fd=None):
             os.unlink(tmp_path)
             tmp_path = None
             raise
-        try:
-            os.replace(tmp_path, path)
-        except PermissionError:
-            os.unlink(tmp_path)
-            tmp_path = None
-            die(f"cannot write '{path}': file is locked by another process "
-                f"(is it open in Jupyter?). Close or checkpoint it first.")
+        for _attempt in range(_REPLACE_RETRIES):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if _attempt == _REPLACE_RETRIES - 1:
+                    os.unlink(tmp_path)
+                    tmp_path = None
+                    die(f"cannot write '{path}': file is locked by another process "
+                        f"(is it open in Jupyter?). Close or checkpoint it first.")
+                time.sleep(_REPLACE_RETRY_DELAY)
         tmp_path = None
     except OSError as e:
         if tmp_path:

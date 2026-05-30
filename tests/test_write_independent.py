@@ -716,6 +716,7 @@ class TestStdoutSilence:
 # Symlink rejection
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
 class TestSymlinkRejection:
 
     def test_patch_refuses_symlink(self, tmp_path):

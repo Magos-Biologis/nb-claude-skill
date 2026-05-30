@@ -1121,6 +1121,20 @@ from the existing per-notebook index. Reading the existing index's
 `notebook_path` field for the removal key allows an attacker who can
 write to `.nb_index/` to cause cross-notebook symbol poisoning by
 setting one notebook's `notebook_path` to another notebook's path.
+
+### 13.2a Notebook key format — always forward slashes
+The notebook key stored in `symbols.json` (the dict key, e.g.
+`"data/explore.ipynb"` or `"C:/Users/foo/nb.ipynb"`) must use
+**forward slashes on all platforms**, matching the `notebook_path`
+field in per-notebook index files (see Index File Schema comment:
+*"Always forward slashes, even on Windows."*).
+
+`_compute_notebook_key()` must use `nb_path.as_posix()` for the
+absolute-path fallback (when the notebook is outside any git root),
+and `rel.as_posix()` for the relative-path case. Using `str(nb_path)`
+or `str(rel)` is non-conforming on Windows because `str(WindowsPath)`
+uses backslashes, creating a mismatch with the `notebook_path` field
+of the per-notebook index and causing lookup failures in nb-search.py.
 ### 13.3 Missing symbols.json falls back to serial scan
 nb-search.py works correctly without it.
 ### 13.4 Corrupt symbols.json triggers rebuild from per-notebook indices
@@ -1246,6 +1260,72 @@ nb-read.py never triggers a synchronous rebuild.
 
 ---
 
+---
+
+## §15 — Windows Encoding and Path Compatibility
+
+### 15.1 `nb-index.py` must have the `reconfigure` encoding block
+
+nb-index.py must include the stdout/stderr reconfigure block at startup
+(added in commit 5523dad for the other four scripts). When nb-index.py
+is run directly from the CLI or by the test suite, and its stderr output
+contains non-ASCII characters (e.g. a notebook file path with a
+non-English directory segment), Python will raise `UnicodeEncodeError`
+on Windows cp1252 consoles unless the stream is reconfigured.
+
+**Required pattern** (independently guarded per stream):
+```python
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+```
+
+The `hasattr` guard handles Python ≤ 3.6 (no `reconfigure`) and
+non-TextIOWrapper streams (pytest capture, Jupyter). Each stream must
+be guarded independently — sharing a single `hasattr(sys.stdout, ...)`
+check for both calls is incorrect when the streams are heterogeneous.
+
+### 15.2 All path normalization in nb-index.py must use `as_posix()`
+
+Every site that converts a `Path` object to a POSIX-style string for
+storage must use `path.as_posix()`, not `str(path).replace(os.sep, "/")`.
+The two are functionally equivalent on Windows but the latter is
+confusing, fragile, and inconsistent with the established pattern.
+
+Affected sites (as of the 5523dad patch):
+- `_index_file_path()`: `rel_posix = str(rel).replace(os.sep, "/")` → `rel.as_posix()`
+- `_compute_notebook_key()` relative branch: same replacement
+- `main()` `notebook_path` field: same replacement
+
+### 15.3 `os.replace` in nb-index.py — PermissionError is non-fatal
+
+On Windows, antivirus scanners transiently hold file handles on newly
+written files (CPython issue #46003). The nb-index.py atomic write
+(temp file + `os.replace`) may fail with `PermissionError` on Windows
+in this window. Since nb-index.py is fire-and-forget, a transient
+`PermissionError` must:
+- NOT call `_die()` (which exits 1) — the write still succeeded in
+  the caller (nb-write.py); reporting a fatal error is misleading.
+- Print a warning to stderr and exit 0.
+
+```python
+except PermissionError:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    print(f"[warn] index not written (transient file lock): {index_file}",
+          file=sys.stderr)
+    sys.exit(0)
+```
+
+The enclosing `except OSError` should NOT catch `PermissionError` before
+this specific handler — Python exception handling uses MRO, so the
+`PermissionError` handler must appear before `except OSError`.
+
+---
+
 ## New files
 
 | Path | Description |
@@ -1254,6 +1334,7 @@ nb-read.py never triggers a synchronous rebuild.
 | `scripts/nb-search.py` | Keyword / symbol / import / section search |
 | `tests/test_nb_index.py` | Full test suite for §1–§8, §13–§14 (including `test_filesystem_boundary_stops_walk` — see §14.12) |
 | `tests/test_nb_search.py` | Full test suite for §12 |
+| `tests/test_windows_compat.py` | §15 Windows encoding and path compatibility |
 
 ## Modified files
 

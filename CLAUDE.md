@@ -166,7 +166,7 @@ Tests are written TDD-first against the spec before implementation. All black-bo
 ## Install details
 
 `install.py` (cross-platform, no `jq` dependency):
-- Detects config dir: `$CLAUDE_CONFIG_DIR` → `~/.claude` (POSIX) or `%APPDATA%\Claude` (Windows).
+- Detects config dir: `$CLAUDE_CONFIG_DIR` → `~/.claude` on all platforms (`%USERPROFILE%\.claude` on Windows).
 - Copies files with `shutil.copytree(dirs_exist_ok=True)`.
 - Patches `settings.json` atomically (temp file + `os.replace`).
 - Removes stale `nb-guard.sh` entries if upgrading from the shell version.

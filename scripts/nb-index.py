@@ -15,7 +15,12 @@ stderr: status messages.
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+    _have_fcntl = True
+except ImportError:
+    _have_fcntl = False  # Windows: no fcntl; symbol-index locking is skipped
+
 import hashlib
 import json
 import os
@@ -24,6 +29,11 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -171,8 +181,7 @@ def _index_file_path(nb_path: Path) -> tuple[Path, Path, Path | None]:
             index_file = index_dir / (nb_path.name + ".json")
         else:
             # Forward slashes, even on Windows
-            rel_posix = str(rel).replace(os.sep, "/")
-            index_file = index_dir / (rel_posix + ".json")
+            index_file = index_dir / (rel.as_posix() + ".json")
     else:
         index_file = index_dir / (nb_path.name + ".json")
 
@@ -565,10 +574,10 @@ def _compute_notebook_key(nb_path: Path, git_root: Path | None) -> str:
     if git_root is not None:
         try:
             rel = nb_path.relative_to(git_root)
-            return str(rel).replace(os.sep, "/")
+            return rel.as_posix()
         except ValueError:
             pass
-    return str(nb_path)
+    return nb_path.as_posix()
 
 
 def _update_symbols_json(
@@ -589,12 +598,13 @@ def _update_symbols_json(
     except OSError:
         return  # Can't open lock file — skip silently
 
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        # Lock unavailable — another indexer is writing, skip silently
-        lock_fd.close()
-        return
+    if _have_fcntl:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Lock unavailable — another indexer is writing, skip silently
+            lock_fd.close()
+            return
 
     try:
         # Load existing symbols.json if it exists and has correct version
@@ -669,10 +679,11 @@ def _update_symbols_json(
             pass  # Non-fatal
 
     finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
+        if _have_fcntl:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         lock_fd.close()
         # Clean up lock file (it will be recreated next time if needed).
         # This prevents it from appearing as an orphaned non-JSON file.
@@ -896,11 +907,11 @@ def main() -> None:
     if git_root is not None:
         try:
             rel = nb_path.relative_to(git_root)
-            nb_path_str = str(rel).replace(os.sep, "/")
+            nb_path_str = rel.as_posix()
         except ValueError:
-            nb_path_str = str(nb_path)
+            nb_path_str = nb_path.as_posix()
     else:
-        nb_path_str = str(nb_path)
+        nb_path_str = nb_path.as_posix()
 
     # Optimistic concurrency: re-stat before building index
     try:
@@ -953,7 +964,16 @@ def main() -> None:
             except OSError:
                 pass
             _die(f"Failed to write index file: {e}")
-        os.replace(tmp_path, index_file)
+        try:
+            os.replace(tmp_path, index_file)
+        except PermissionError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            print(f"[warn] index not written (transient file lock): {index_file}",
+                  file=sys.stderr)
+            sys.exit(0)
     except OSError as e:
         _die(f"Failed to write index file: {e}")
 

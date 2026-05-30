@@ -52,20 +52,19 @@ python  C:\abs\path\to\nb-guard.py    # Windows
 
 **Design for `install.py`:**
 
-1. **Config dir detection:**
+1. **Config dir detection** (updated: commit 5523dad changed Windows path):
    ```python
-   if sys.platform == "win32":
-       default = Path(os.environ["APPDATA"]) / "Claude"
-   else:
-       default = Path.home() / ".claude"
-   claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", default))
+   # Claude Code on Windows uses %USERPROFILE%\.claude, NOT %APPDATA%\Claude
+   claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
    ```
 
-2. **Python command detection:**
+2. **Python command detection** (updated: py launcher on Windows):
    ```python
-   # Prefer python3, fall back to python (Windows)
    import shutil
-   py_cmd = "python3" if shutil.which("python3") else "python"
+   if sys.platform == "win32" and shutil.which("py"):
+       py_cmd = "py -3"
+   else:
+       py_cmd = "python3" if shutil.which("python3") else "python"
    ```
 
 3. **File copy:** `shutil.copytree` / `shutil.copy2` with `dirs_exist_ok=True`.
@@ -373,6 +372,187 @@ removed = _remove_nb_guard_entries(settings)
 
 ---
 
+### 2.14 Windows encoding and path compatibility — post-audit fixes
+
+**Context:** Commit 5523dad was a Windows compatibility patch. A post-hoc audit
+(including online cross-referencing against CPython issues and PEP 540/686) found
+seven gaps and bugs not covered by that commit.
+
+---
+
+**Gap 1 — `nb-index.py` missing `reconfigure` block**
+
+The commit message explicitly states *"all five scripts"* received the encoding
+fix, but `nb-index.py` was omitted. When nb-index.py is run directly (by tests
+or from the CLI on Windows) and its stderr output contains non-ASCII characters
+(e.g. a notebook path in a non-English user directory), Python raises
+`UnicodeEncodeError` on cp1252 consoles.
+
+**Fix:** Add the reconfigure block to `nb-index.py` after `import sys`, before
+the constants section.
+
+---
+
+**Gap 2 — `reconfigure` guard checks `sys.stdout` but calls `sys.stderr.reconfigure()` unconditionally**
+
+All four scripts that received the fix use:
+```python
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')   # unchecked — bug if stderr is a different object
+```
+
+If `sys.stderr` does not have `reconfigure` (e.g. a custom logging wrapper was
+installed for stderr but not stdout), the second call raises `AttributeError`.
+
+**Fix:** Guard each stream independently:
+```python
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+```
+
+Apply this pattern in all five scripts.
+
+---
+
+**Gap 3 — `_compute_notebook_key()` absolute-path fallback uses `str(nb_path)`**
+
+`_compute_notebook_key()` in `nb-index.py` (line ~576) returns `str(nb_path)`
+when the notebook is not inside a git root. On Windows, `str(Path)` uses
+backslashes. This key is stored in `symbols.json`, so the same notebook's key
+would be `C:\\Users\\foo\\nb.ipynb` in symbols.json but `C:/Users/foo/nb.ipynb`
+in the per-notebook index's `notebook_path` field (which already uses
+`as_posix()`). Lookups that join these two fields would silently fail.
+
+**Fix:**
+```python
+# Before
+return str(nb_path)
+
+# After
+return nb_path.as_posix()
+```
+
+---
+
+**Gap 4 — Inconsistent path normalization (`str(rel).replace` vs `as_posix()`)**
+
+Three sites in `nb-index.py` use `str(rel).replace(os.sep, "/")` while the
+newer code at the absolute-path fallbacks already uses `rel.as_posix()`. These
+are functionally equivalent on Windows (since `os.sep == "\\"`), but
+inconsistent with the established pattern and harder to audit.
+
+**Fix:** Replace all three occurrences with `rel.as_posix()`.
+
+| Line | Context | Old | New |
+|------|---------|-----|-----|
+| `_index_file_path` | index file path computation | `str(rel).replace(os.sep, "/")` | `rel.as_posix()` |
+| `_compute_notebook_key` | relative-path branch | `str(rel).replace(os.sep, "/")` | `rel.as_posix()` |
+| `main()` | `notebook_path` field | `str(rel).replace(os.sep, "/")` | `rel.as_posix()` |
+
+---
+
+**Bug B1 — `guard_cmd` uses Windows backslashes in `settings.json`**
+
+`install.py` builds the hook command as:
+```python
+guard_script = (scripts_dst / "nb-guard.py").resolve()
+guard_cmd = f'{py_cmd} "{guard_script}"'
+```
+
+On Windows, `.resolve()` returns a `WindowsPath` whose `str()` gives backslashes:
+`py -3 "C:\Users\...\nb-guard.py"`. Claude Code's hook runner's treatment of
+backslashes in command strings is not guaranteed — using forward slashes avoids
+the ambiguity entirely, and Python (and cmd.exe) both accept forward slashes in
+file paths on Windows.
+
+**Fix:**
+```python
+guard_cmd = f'{py_cmd} "{guard_script.as_posix()}"'
+```
+
+---
+
+**Bug B2 — `nb-guard.py _python_cmd()` not updated for Windows**
+
+`nb-guard.py` has its own `_python_cmd()` that was not updated alongside
+`install.py`'s version. It returns `"python3"` or `"python"`, but on Windows
+neither may be on PATH (the Python Launcher `py` is the standard). The redirect
+messages shown to Claude would say `python3 nb-read.py ...` on Windows, which
+is wrong.
+
+**Fix:** Match the `install.py` pattern:
+```python
+def _python_cmd() -> str:
+    import shutil as _shutil
+    if sys.platform == "win32" and _shutil.which("py"):
+        return "py -3"
+    return "python3" if _shutil.which("python3") else "python"
+```
+
+---
+
+**Bug B3 — `os.replace` in `nb-write.py` dies immediately on `PermissionError`**
+
+On Windows, real-time antivirus scanners and the Windows Search indexer
+transiently hold an exclusive handle on newly-written files during scanning
+(CPython issue #46003; confirmed by multiple downstream projects). This causes
+`os.replace()` to raise `PermissionError: [WinError 32]` even when the
+notebook is not open in Jupyter. The current code catches `PermissionError` and
+dies immediately — this makes the tool unusable on Windows systems with active AV.
+
+AV scans typically complete in < 100 ms. Adding a short retry loop before dying
+makes the tool work on Windows without sacrificing the clear error message for the
+genuine Jupyter-is-holding-the-file case.
+
+**Fix** — replace the single `os.replace` try/except with a retry loop:
+```python
+import time
+
+_REPLACE_RETRIES = 3
+_REPLACE_RETRY_DELAY = 0.05   # 50 ms — AV scans complete well within this
+
+for attempt in range(_REPLACE_RETRIES):
+    try:
+        os.replace(tmp_path, path)
+        break
+    except PermissionError:
+        if attempt == _REPLACE_RETRIES - 1:
+            os.unlink(tmp_path)
+            tmp_path = None
+            die(f"cannot write '{path}': file is locked by another process "
+                f"(is it open in Jupyter?). Close or checkpoint it first.")
+        time.sleep(_REPLACE_RETRY_DELAY)
+```
+
+Total worst-case delay: 3 × 50 ms = 150 ms. Jupyter holds its lock for the
+duration of a save (seconds), so three retries are sufficient to distinguish AV
+(transient, < 100 ms) from Jupyter (persistent, seconds).
+
+**nb-index.py `os.replace`:** The index write is fire-and-forget. A transient
+`PermissionError` must not exit 1 (which would be misleading since the write
+succeeded). Instead, catch separately and exit 0 with a warning:
+```python
+try:
+    os.replace(tmp_path, index_file)
+except PermissionError:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    print(f"[warn] index not written (transient file lock): {index_file}",
+          file=sys.stderr)
+    sys.exit(0)
+```
+
+---
+
+**Tests:** See `tests/test_windows_compat.py` (new file) in the test plan below.
+
+---
+
 ## 3. Non-changes (explicit decisions)
 
 | Item | Decision |
@@ -408,10 +588,38 @@ removed = _remove_nb_guard_entries(settings)
 | `tests/test_read_safe.py` | **New** — §2.3 §2.4 §2.5 §2.6 |
 | `tests/test_write_new.py` | **New** — §2.7 §2.8 §2.9 §2.10 |
 | `tests/test_install.py` | **New** — install.py / uninstall.py behaviour |
+| `tests/test_windows_compat.py` | **New** — §2.14 Windows encoding and path compatibility |
 
 ---
 
 ## 5. Test plan (new tests to write before implementation)
+
+### `tests/test_windows_compat.py` (§2.14)
+
+**TestReconfigureCompliance:**
+- `test_all_five_scripts_have_reconfigure_block` — source check: all five scripts (`nb-guard.py`, `nb-index.py`, `nb-read.py`, `nb-search.py`, `nb-write.py`) contain `reconfigure` in their source
+- `test_reconfigure_checks_each_stream_independently` — source check: no script guards `sys.stdout` but calls `sys.stderr.reconfigure()` without its own guard (i.e. the pattern `sys.stdout.reconfigure` must be directly preceded or followed by an independent `hasattr(sys.stderr, ...)` guard, not sharing the stdout check)
+- `test_nb_index_stderr_unicode_path` — run nb-index.py on a notebook whose path contains a Unicode directory segment; assert exit code 0 and no `UnicodeEncodeError` on stderr
+
+**TestPathNormalization:**
+- `test_notebook_path_field_no_backslashes` — run nb-index.py; read the resulting JSON index; assert `notebook_path` value contains no backslash characters
+- `test_symbols_json_key_no_backslashes` — run nb-index.py on a notebook in a tmpdir outside any git root; read `symbols.json`; assert the notebook's key (in the `notebooks` dict) contains no backslash characters
+- `test_all_rel_replace_usages_removed` — source check: `nb-index.py` contains zero occurrences of `str(rel).replace(os.sep` (all replaced with `rel.as_posix()`)
+
+**TestInstaller:**
+- `test_guard_cmd_no_backslashes` — run `install.py` with `CLAUDE_CONFIG_DIR` pointing to a tmp dir; read the written `settings.json`; assert the hook command string contains no backslash characters
+- `test_guard_cmd_is_forward_slash_path` — same setup; assert the hook command string contains a forward-slash path to `nb-guard.py`
+
+**TestNbGuardPythonCmd:**
+- `test_redirect_message_uses_platform_python` — feed nb-guard.py a `Read` payload for a `.ipynb` file; assert the printed redirect command contains `python3`, `python`, or `py` (not a bare `py` without the `-3` flag on non-Windows, not `python3` on Windows when only `py` is present — verified by source check of the function body rather than live execution)
+- `test_nb_guard_python_cmd_has_py_branch` — source check: `nb-guard.py` `_python_cmd()` function body contains `"py -3"` or `"py"` for Windows (not just `python3`/`python`)
+
+**TestAtomicWriteRetry:**
+- `test_nb_write_replace_retry_present` — source check: `nb-write.py` `save()` function body contains `time.sleep` or retry logic around `os.replace`
+- `test_nb_write_permission_error_cleared_message` — nb-write.py exits 1 with a clear error mentioning "locked by another process" when `os.replace` consistently fails; verified via a filesystem trick (make target path a directory so replace always fails with EISDIR/PermissionError)
+- `test_nb_index_permission_error_exits_zero` — source check: nb-index.py's `os.replace` catch includes `PermissionError` → `sys.exit(0)` path (not `_die`)
+
+---
 
 ### `tests/test_read_safe.py`
 - `test_ansi_in_cell_source_stripped` — source with `\x1b[31m` → stripped from stdout
@@ -467,7 +675,7 @@ removed = _remove_nb_guard_entries(settings)
 - `test_install_creates_settings_if_missing` — missing settings.json → created with `{}`
 - `test_uninstall_removes_skill_dir` — after install, uninstall → `skills/nb/` gone
 - `test_uninstall_removes_hook_entry` — hook entry removed from settings.json
-- `test_windows_config_dir` — mock `sys.platform == "win32"` → uses `%APPDATA%\Claude`
+- `test_windows_config_dir` — mock `sys.platform == "win32"` and `CLAUDE_CONFIG_DIR` unset → uses `Path.home() / ".claude"` (NOT `%APPDATA%\Claude`)
 - `test_settings_json_permissions` — created settings.json has mode 0o600 (POSIX only)
 - `test_temp_file_cleaned_on_jq_failure` — simulate json write failure → no `.nb_tmp` left
 

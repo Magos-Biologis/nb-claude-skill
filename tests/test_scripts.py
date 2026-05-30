@@ -385,6 +385,7 @@ class TestNbWrite:
 
     # --- Security ---
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
     def test_rejects_symlink(self, tmp_path):
         real = make_notebook([{"cell_type": "code", "source": ["x"]}], tmp_path)
         link = str(tmp_path / "link.ipynb")

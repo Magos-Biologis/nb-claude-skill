@@ -206,6 +206,7 @@ class TestCLI:
         r = run_indexer(tmp_path / "does_not_exist.ipynb")
         assert r.returncode == 1
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
     def test_exit_1_for_symlink_notebook(self, tmp_path):
         real = make_notebook([code_cell("x = 1")], tmp_path=tmp_path, name="real.ipynb")
         link = tmp_path / "link.ipynb"
@@ -370,6 +371,7 @@ class TestIndexLocation:
             "Index must not appear inside an unrelated git root"
         )
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
     def test_git_symlink_skipped(self, tmp_path):
         """§1.2: .git that is a symlink is NOT treated as git root"""
         git_root = tmp_path / "project"
@@ -480,6 +482,7 @@ class TestGitignore:
                     f"Expected literal '.nb_index/' entry, got: {line!r}"
                 )
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
     def test_symlink_gitignore_skipped(self, tmp_path):
         """§2.6: symlink .gitignore must not be written through"""
         real_gitignore = tmp_path / "real_gitignore"
@@ -1768,6 +1771,7 @@ class TestEdgeCases:
         assert all_defined == []
         assert all_imported == []
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
     def test_gitignore_symlink_does_not_block_indexing(self, tmp_path):
         """§14.4: .gitignore symlink → warning on stderr, index still written"""
         real_gitignore = tmp_path / "real_gi"

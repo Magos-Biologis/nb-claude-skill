@@ -13,9 +13,15 @@ Two concerns under test:
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+_bash_only = pytest.mark.skipif(
+    sys.platform == 'win32',
+    reason='nb-guard.sh requires bash; not reliably available on Windows',
+)
 
 # ---------------------------------------------------------------------------
 # Paths — all relative to this file so the test suite is portable
@@ -66,11 +72,13 @@ class TestGuardScriptExists:
         """nb-guard.sh must exist at the expected path."""
         assert GUARD.exists(), f"nb-guard.sh not found at {GUARD}"
 
+    @_bash_only
     def test_script_is_executable(self):
         """nb-guard.sh must be executable."""
         assert os.access(GUARD, os.X_OK), f"{GUARD} is not executable"
 
 
+@_bash_only
 class TestGuardBlocking:
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write", "MultiEdit"])
@@ -121,6 +129,7 @@ class TestGuardBlocking:
         assert "line " not in r.stdout or "nb-read" in r.stdout  # allow "line N" in the command hint
 
 
+@_bash_only
 class TestGuardGracefulEdgeCases:
 
     def test_unknown_tool_exits_nonzero(self):

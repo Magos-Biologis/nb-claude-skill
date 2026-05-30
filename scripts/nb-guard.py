@@ -25,6 +25,11 @@ import re
 import shlex
 import sys
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 # ---------------------------------------------------------------------------
 # ANSI / control-character sanitisation
 #
@@ -65,8 +70,10 @@ def _nb_scripts_dir() -> str:
 
 
 def _python_cmd() -> str:
-    """Return 'python3' or 'python' depending on what's available."""
+    """Return the best Python 3 command for the current platform."""
     import shutil as _shutil
+    if sys.platform == "win32" and _shutil.which("py"):
+        return "py -3"
     return "python3" if _shutil.which("python3") else "python"
 
 

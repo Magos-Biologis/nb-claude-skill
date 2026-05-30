@@ -13,11 +13,6 @@ from pathlib import Path
 
 
 def _default_claude_dir() -> Path:
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        if not appdata:
-            sys.exit("Error: %APPDATA% not set. Cannot determine Claude config dir.")
-        return Path(appdata) / "Claude"
     return Path.home() / ".claude"
 
 

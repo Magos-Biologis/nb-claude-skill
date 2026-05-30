@@ -168,6 +168,7 @@ class TestWalkStrategy:
         r = run_search(["cached", str(tmp_path)])
         assert "cached" not in r.stdout
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
     def test_does_not_follow_symlinks(self, tmp_path):
         """§12 walk: followlinks=False — symlink not traversed, no duplicate results"""
         real = tmp_path / "real_dir"

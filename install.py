@@ -36,7 +36,9 @@ from _nb_install_common import (
 
 
 def _python_cmd() -> str:
-    """Return 'python3' or 'python' depending on what's on PATH."""
+    """Return the best Python 3 command for the current platform."""
+    if sys.platform == "win32" and shutil.which("py"):
+        return "py -3"
     return "python3" if shutil.which("python3") else "python"
 
 
@@ -104,7 +106,7 @@ def main():
     _remove_nb_guard_entries(settings)
 
     guard_script = (scripts_dst / "nb-guard.py").resolve()
-    guard_cmd = f'{py_cmd} "{guard_script}"'
+    guard_cmd = f'{py_cmd} "{guard_script.as_posix()}"'
     _add_nb_guard_entry(settings, guard_cmd)
 
     _save_settings(settings_path, settings)
@@ -112,9 +114,10 @@ def main():
 
     print("[OK] nb skill installed successfully.")
     print()
+    tests_path = skill_dir / "tests"
     print("Next steps:")
     print("  1. Restart Claude Code")
-    print(f"  2. Verify: {py_cmd} {skill_dir}/tests/test_scripts.py (or run pytest)")
+    print(f"  2. Verify: {py_cmd} -m pytest \"{tests_path}\"")
 
 
 if __name__ == "__main__":

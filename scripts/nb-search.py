@@ -25,6 +25,11 @@ import re
 import sys
 from pathlib import Path
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 SKIP_DIRS = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".tox", ".git", ".hg"})
 MAX_WALK_DEPTH = 20

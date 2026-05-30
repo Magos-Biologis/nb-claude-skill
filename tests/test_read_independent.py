@@ -71,7 +71,7 @@ def make_notebook(cells, tmp_path, *, kernel_name="python3", include_cells_key=T
 def run(args, **kwargs):
     """Run nb-read.py with the given argument list and return CompletedProcess."""
     return subprocess.run(
-        ["python3", SCRIPT] + args,
+        [sys.executable, SCRIPT] + args,
         capture_output=True,
         text=True,
         **kwargs,

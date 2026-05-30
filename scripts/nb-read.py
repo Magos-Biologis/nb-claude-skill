@@ -31,6 +31,11 @@ import os
 import re
 from pathlib import Path
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_RANGE_SIZE = 10_000             # guard against billion-element set allocation
 
