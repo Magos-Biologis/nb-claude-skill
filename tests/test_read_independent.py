@@ -509,9 +509,10 @@ class TestTruncate:
         diagnostic_lines = [
             l for l in stdout_lines
             if "truncat" in l.lower()
-            and not re.search(r"\bline_\d+\b", l)       # not source content
-            and not l.strip().startswith("/")             # not a path/header line
-            and not l.strip().startswith("[")             # not a cell header
+            and not re.search(r"\bline_\d+\b", l)                # not source content
+            and not l.strip().startswith("/")                     # not a POSIX path/header
+            and not re.match(r"^[A-Za-z]:[/\\]", l.strip())     # not a Windows path/header
+            and not l.strip().startswith("[")                     # not a cell header
         ]
         assert diagnostic_lines == [], (
             f"Truncation message leaked to stdout: {diagnostic_lines}"

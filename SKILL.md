@@ -37,12 +37,12 @@ allowed-tools: Bash(python3 *) Bash(python *) Bash(ls *) Bash(find *) Read Write
 NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/nb/scripts"
 
 # Windows (PowerShell)
-$NB_SCRIPTS = "$env:APPDATA\Claude\skills\nb\scripts"
+$NB_SCRIPTS = "$env:USERPROFILE\.claude\skills\nb\scripts"
 ```
 
 Use this variable prefix in all commands below.
 
-**Python command:** Use `python3` on Linux/macOS. Use `python` on Windows (no `python3` alias by default).
+**Python command:** Use `python3` on Linux/macOS. Use `py -3` (Python Launcher) or `python` on Windows.
 
 ---
 
@@ -174,4 +174,4 @@ python3 "$NB_SCRIPTS/nb-read.py" analysis.ipynb --cells 4
 - **Atomic writes:** No `.bak` file is created. Writes are all-or-nothing via temp file + rename.
 - **nbformat compatibility:** Scripts require nbformat 4. nbformat 3 notebooks (with `worksheets`) are not supported — convert first with `jupyter nbconvert`.
 - **Known limitation:** The nb-guard hook covers `Read`/`Edit`/`Write`/`MultiEdit`. Reading a notebook via the `Bash` tool (e.g. `cat notebook.ipynb`) bypasses the guard. Avoid this — raw JSON is verbose and unindexed.
-- **Windows:** Use `python` instead of `python3`. Config dir is `%APPDATA%\Claude\skills\nb\scripts` instead of `~/.claude/skills/nb/scripts`.
+- **Windows:** Use `py -3` or `python` instead of `python3`. Scripts dir is `%USERPROFILE%\.claude\skills\nb\scripts` (i.e. `$env:USERPROFILE\.claude\skills\nb\scripts` in PowerShell).

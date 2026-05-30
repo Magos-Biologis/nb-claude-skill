@@ -1382,10 +1382,21 @@ class TestWriteIntegration:
         )
         return stub, log
 
-    def _wait_for_log(self, log, timeout=5.0):
-        """Poll until log file appears or timeout expires."""
+    def _wait_for_log(self, log, timeout=5.0, min_lines=1):
+        """Poll until log file exists with at least min_lines of content, or timeout expires.
+
+        Checking for min_lines guards against a race where the file is created
+        (exists) but the subprocess hasn't finished writing its content yet.
+        """
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and not log.exists():
+        while time.monotonic() < deadline:
+            if log.exists():
+                try:
+                    lines = log.read_text(encoding="utf-8").splitlines()
+                    if len(lines) >= min_lines:
+                        return True
+                except OSError:
+                    pass
             time.sleep(0.05)
         return log.exists()
 
@@ -1580,7 +1591,7 @@ class TestWriteIntegration:
         )
         # The stub nb-index.py in tmp_path (not nb_dir) is what write_copy will call.
         # If shell=True were used, the stub would not be invoked with the correct args.
-        assert self._wait_for_log(log), (
+        assert self._wait_for_log(log, min_lines=2), (
             "nb-index.py stub must be spawned even when path contains spaces/parens "
             "(confirms shell=False list-form Popen is used)"
         )

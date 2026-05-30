@@ -272,8 +272,9 @@ class TestRedirectMessage:
         """The redirect message must show a runnable Python command."""
         r = run_guard(_payload("Read", "nb.ipynb"))
         assert r.returncode == 1
-        # Must contain python3 or python in the command suggestion
-        assert "python3" in r.stdout or "python" in r.stdout, (
+        # Must contain python3, python, or py (Windows Python Launcher) in the command
+        assert ("python3" in r.stdout or "python " in r.stdout
+                or "py " in r.stdout or "py -3" in r.stdout), (
             f"Expected python cmd in message: {r.stdout!r}"
         )
 

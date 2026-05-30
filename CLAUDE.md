@@ -10,7 +10,8 @@ This repo is the **nb** Claude Code skill — a token-efficient Jupyter notebook
 
 ```bash
 # Run all tests (no install required)
-pytest tests/ -q
+pytest tests/ -q                          # Linux / macOS
+python -m pytest tests/ -q               # Windows
 
 # Run a single test file
 pytest tests/test_nb_index.py -q
@@ -19,14 +20,12 @@ pytest tests/test_nb_index.py -q
 pytest tests/test_nb_index.py::TestStaleness::test_stale_on_mtime_change -v
 
 # Install into ~/.claude/skills/nb/ and register the PreToolUse hook
-python3 install.py
+python3 install.py                        # Linux / macOS
+python  install.py                        # Windows
 
 # Uninstall
-python3 uninstall.py
-
-# Legacy wrappers (call the Python installers above)
-bash install.sh
-bash uninstall.sh
+python3 uninstall.py                      # Linux / macOS
+python  uninstall.py                      # Windows
 
 # Custom config dir
 CLAUDE_CONFIG_DIR=/path/to/config python3 install.py
@@ -128,7 +127,7 @@ notebook.ipynb | 12 cells | python3
 - **UTF-8-sig** used for reading (handles BOM transparently); latin-1 fallback with warning in nb-write.py source input.
 - **`nb-write.py patch` clears outputs and execution_count** — intentional, matches Jupyter convention.
 - **Atomic writes everywhere:** `tempfile.mkstemp` in the target directory → `fsync` → `os.replace`. No partial writes, no `.bak`.
-- **POSIX file locking:** nb-write.py uses `fcntl.LOCK_EX` on a companion `.nblock` file for the full read-modify-write cycle. nb-index.py uses `fcntl.LOCK_EX | LOCK_NB` (non-blocking) on `symbols.nblock` — skips silently if unavailable.
+- **File locking:** nb-write.py uses `fcntl.LOCK_EX` on a companion `.nblock` file for the full read-modify-write cycle (POSIX only). nb-index.py uses `fcntl.LOCK_EX | LOCK_NB` (non-blocking) on `symbols.nblock`. Both fall back to no-op on Windows where `fcntl` is unavailable.
 - **`ensure_ascii=False`** in all `json.dump` calls (prevents 6× size inflation on CJK/Unicode output).
 - **stdout is always silent on success** for all scripts; all status messages go to stderr.
 
@@ -151,9 +150,10 @@ Tests are written TDD-first against the spec before implementation. All black-bo
 | `test_nb_guard_hardened.py` | Injection, subdirectory bypass, MultiEdit payloads |
 | `test_nb_index.py` | §1–§8, §13–§14: index location, staleness, sections, symbols, outputs, symbols.json |
 | `test_nb_search.py` | §12: walk, keyword/symbol/import search, filters, security, streaming |
+| `test_windows_compat.py` | Cross-platform encoding, path normalisation, installer guard_cmd, py launcher, atomic-write retry |
 | `test_install.py` | install.py / uninstall.py cross-platform behaviour |
 
-`TestSettingsRegistration` (in `test_nb_guard_hook.py`) and `TestSettingsHardenedApproach` are post-install-only — they check `~/.claude/settings.json` and are skipped when settings.json is absent.
+`TestSettingsRegistration` (in `test_nb_guard_hook.py`) and `TestSettingsHardenedApproach` are post-install-only — they check `~/.claude/settings.json` and are skipped when settings.json is absent. Two tests within `TestSettingsRegistration` that verify preservation of pre-existing PostToolUse hooks also skip when those specific hooks are not present in the user's settings.
 
 ## TDD Documents
 
