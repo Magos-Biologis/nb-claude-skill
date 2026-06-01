@@ -1,6 +1,6 @@
-# nb — Jupyter Notebook skill for Claude Code
+# nb — Jupyter Notebook plugin for Claude Code
 
-A Claude Code skill that lets Claude read and edit Jupyter notebooks **token-efficiently**, without decimating your context window on raw `.ipynb` JSON.
+A Claude Code plugin that lets Claude read and edit Jupyter notebooks **token-efficiently**, without decimating your context window on raw `.ipynb` JSON.
 
 ## Why
 
@@ -10,62 +10,56 @@ A `PreToolUse` hook enforces this: if Claude tries to `Read` or `Edit` a `.ipynb
 
 ## Requirements
 
-- Claude Code (any recent version)
-- Python 3.8+ (standard library only — no extra packages, no `jq`, no `bash`)
+- Claude Code (any recent version with plugin support)
+- Python 3.8+ (standard library only — no extra packages)
 - `pytest` for running the test suite
 
 ## Quick start
 
 ```bash
-# Linux / macOS
-git clone <repo-url>
-cd nb-claude-skill
-python3 install.py
-# Restart Claude Code, then open any .ipynb file
-
-# Windows (PowerShell)
-git clone <repo-url>
-cd nb-claude-skill
-python install.py
+claude plugin install <repo-url>
 # Restart Claude Code, then open any .ipynb file
 ```
 
 ## What gets installed
 
 ```
-~/.claude/skills/nb/         (Windows: %USERPROFILE%\.claude\skills\nb\)
-├── SKILL.md                 ← auto-loaded by Claude Code as a skill
-├── install.py               ← re-runnable installer (idempotent)
-├── uninstall.py             ← removes files + hook entry
-├── scripts/
-│   ├── nb-guard.py          ← PreToolUse hook (blocks direct .ipynb access)
-│   ├── nb-read.py           ← token-efficient notebook reader
-│   ├── nb-write.py          ← surgical cell editor (patch / insert / delete / create)
-│   ├── nb-index.py          ← persistent JSON index builder (fire-and-forget)
-│   └── nb-search.py         ← cross-notebook keyword / symbol / import search
-└── tests/                   ← full test suite, runs against the installed scripts
+~/.claude/plugins/nb/         (Windows: %USERPROFILE%\.claude\plugins\nb\)
+├── skills/nb/SKILL.md        ← auto-loaded by Claude Code as a skill
+├── hooks/hooks.json          ← declarative PreToolUse hook registration
+├── .claude-plugin/plugin.json ← plugin manifest
+└── scripts/
+    ├── nb-guard.py           ← PreToolUse hook (blocks direct .ipynb access)
+    ├── nb-read.py            ← token-efficient notebook reader
+    ├── nb-write.py           ← surgical cell editor (patch / insert / delete / create)
+    ├── nb-index.py           ← persistent JSON index builder (fire-and-forget)
+    └── nb-search.py          ← cross-notebook keyword / symbol / import search
 ```
 
-`install.py` also patches `~/.claude/settings.json` to register `nb-guard.py` as a `PreToolUse` hook on `Read|Edit|Write|MultiEdit`.
+The `hooks/hooks.json` registers `nb-guard.py` as a `PreToolUse` hook on `Read|Edit|Write|MultiEdit` using `${CLAUDE_PLUGIN_ROOT}` — no `settings.json` patching required.
 
 ## Repository layout
 
 ```
-nb-claude-skill/
+nb-claude-plugin/
 ├── README.md
-├── SKILL.md
-├── CLAUDE.md                ← guidance for Claude Code when working in this repo
-├── install.py               ← copies files + patches settings.json (idempotent)
-├── uninstall.py             ← removes files + hook entry
-├── _nb_install_common.py    ← shared utilities for install.py / uninstall.py
+├── CLAUDE.md                    ← guidance for Claude Code when working in this repo
+├── LICENSE
+├── .claude-plugin/
+│   └── plugin.json              ← plugin manifest
+├── hooks/
+│   └── hooks.json               ← declarative hook registration
+├── skills/
+│   └── nb/
+│       └── SKILL.md             ← skill loaded by Claude Code
 ├── scripts/
 │   ├── nb-guard.py
 │   ├── nb-read.py
 │   ├── nb-write.py
 │   ├── nb-index.py
-│   ├── nb-search.py
-│   └── nb-guard.sh          ← legacy POSIX fallback (not the default)
+│   └── nb-search.py
 ├── tests/
+│   ├── test_plugin.py
 │   ├── test_scripts.py
 │   ├── test_encoding.py
 │   ├── test_read_independent.py
@@ -75,13 +69,11 @@ nb-claude-skill/
 │   ├── test_write_independent.py
 │   ├── test_write_new.py
 │   ├── test_nb_guard_py.py
-│   ├── test_nb_guard_hook.py
 │   ├── test_nb_guard_hardened.py
 │   ├── test_nb_index.py
 │   ├── test_nb_search.py
-│   ├── test_windows_compat.py
-│   └── test_install.py
-└── TDD.md / TDD_INDEX.md    ← technical design documents
+│   └── test_windows_compat.py
+└── TDD.md / TDD_INDEX.md        ← technical design documents
 ```
 
 ## Running the tests
@@ -96,46 +88,13 @@ pytest tests/ -q
 python -m pytest tests/ -q
 ```
 
-Post-install verification (also checks `settings.json` registration):
-
-```bash
-pytest ~/.claude/skills/nb/tests/ -q
-```
-
-## Custom config directory
-
-```bash
-# Linux / macOS
-CLAUDE_CONFIG_DIR=/path/to/config python3 install.py
-
-# Windows (PowerShell)
-$env:CLAUDE_CONFIG_DIR = "C:\path\to\config"; python install.py
-```
-
-The `settings.json` hook command is written with the **expanded absolute path** at install time, so it works even if `CLAUDE_CONFIG_DIR` is not set at runtime.
-
-## Updating
-
-```bash
-git pull
-python3 install.py   # idempotent — safe to re-run
-```
-
-## Uninstalling
-
-```bash
-# Linux / macOS
-python3 uninstall.py
-
-# Windows
-python uninstall.py
-```
-
-Removes `~/.claude/skills/nb/` and the hook entry from `settings.json`. Restart Claude Code afterwards.
-
 ## How it works
 
-### The skill (`SKILL.md`)
+### The plugin format
+
+This plugin uses Claude Code's native plugin format. `hooks/hooks.json` declares the `PreToolUse` hook using `${CLAUDE_PLUGIN_ROOT}` so the path is resolved at runtime by Claude Code — no install-time path expansion needed.
+
+### The skill (`skills/nb/SKILL.md`)
 
 Claude Code auto-loads `SKILL.md` and activates it when it detects you're working with `.ipynb` files. The skill's rules instruct Claude to:
 
@@ -151,7 +110,7 @@ Runs on every `Read|Edit|Write|MultiEdit` tool call. Exits immediately (0 = allo
 
 Key design decisions:
 
-- **No `if` conditions in `settings.json`** — per-tool glob conditions like `Read(*.ipynb)` only match same-directory files; subdirectory paths like `notebooks/analysis.ipynb` are bypassed. The script checks the path itself.
+- **No `if` conditions in `hooks.json`** — per-tool glob conditions like `Read(*.ipynb)` only match same-directory files; subdirectory paths like `notebooks/analysis.ipynb` are bypassed. The script checks the path itself.
 - **MultiEdit uses `edits[]`** — the harness places MultiEdit file paths in `tool_input.edits[].file_path`, not `tool_input.file_path`. The script handles this separately.
 - **Injection hardening** — file paths are sanitised before echoing (strips C0 control characters and ANSI sequences) to prevent prompt injection.
 - **Fail open** — if the JSON payload can't be parsed, the script exits 0 (allow) rather than blocking all file I/O.

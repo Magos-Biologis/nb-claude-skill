@@ -32,8 +32,6 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent
 GUARD     = REPO_ROOT / "scripts" / "nb-guard.py"
 
-_claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-SETTINGS    = _claude_dir / "settings.json"
 
 
 # ---------------------------------------------------------------------------
@@ -309,64 +307,3 @@ class TestExitCodeRobustness:
         assert r.returncode == 0, (
             f"Unknown tool must fail open (exit 0), got {r.returncode}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Settings.json: no-if-condition approach (post-install verification)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.skipif(
-    not SETTINGS.exists(),
-    reason="settings.json not found — run install.py first",
-)
-class TestSettingsHardenedApproach:
-    """Verifies settings.json is correctly configured post-install."""
-
-    @pytest.fixture(scope="class")
-    def settings(self):
-        return json.loads(SETTINGS.read_text())
-
-    @pytest.fixture(scope="class")
-    def pretooluse_hooks(self, settings):
-        hooks = settings.get("hooks", {}).get("PreToolUse", [])
-        if not hooks:
-            pytest.skip("No PreToolUse hooks in settings.json — run install.py first")
-        return hooks
-
-    def test_nb_guard_hook_present(self, pretooluse_hooks):
-        """At least one PreToolUse hook must reference nb-guard.py."""
-        all_hooks = []
-        for entry in pretooluse_hooks:
-            all_hooks.extend(entry.get("hooks", []))
-        guard_hooks = [h for h in all_hooks if "nb-guard.py" in h.get("command", "")]
-        assert guard_hooks, "No PreToolUse hook references nb-guard.py"
-
-    def test_nb_guard_hook_not_legacy_sh(self, pretooluse_hooks):
-        """No PreToolUse hook must reference the legacy nb-guard.sh."""
-        all_hooks = []
-        for entry in pretooluse_hooks:
-            all_hooks.extend(entry.get("hooks", []))
-        sh_hooks = [h for h in all_hooks if "nb-guard.sh" in h.get("command", "")]
-        assert not sh_hooks, f"Stale nb-guard.sh hook found — run install.py to upgrade: {sh_hooks}"
-
-    def test_nb_guard_command_is_absolute_path(self, pretooluse_hooks):
-        """nb-guard.py command must be an absolute path, not a shell variable."""
-        all_hooks = []
-        for entry in pretooluse_hooks:
-            all_hooks.extend(entry.get("hooks", []))
-        for h in [h for h in all_hooks if "nb-guard.py" in h.get("command", "")]:
-            assert "${CLAUDE_CONFIG_DIR}" not in h["command"], (
-                "nb-guard.py path must not use ${CLAUDE_CONFIG_DIR} in settings.json"
-            )
-
-    def test_nb_guard_matcher_covers_multiedit(self, pretooluse_hooks):
-        """The nb-guard PreToolUse hook matcher must include MultiEdit."""
-        for entry in pretooluse_hooks:
-            matcher = entry.get("matcher", "")
-            hooks = entry.get("hooks", [])
-            if any("nb-guard.py" in h.get("command", "") for h in hooks):
-                assert "MultiEdit" in matcher, (
-                    f"nb-guard entry matcher must include MultiEdit: {matcher!r}"
-                )
-                return
-        pytest.fail("No PreToolUse entry contains nb-guard.py")

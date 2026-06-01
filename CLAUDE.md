@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
-This repo is the **nb** Claude Code skill — a token-efficient Jupyter notebook interface. Raw `.ipynb` files are 10–50× larger in tokens than needed; this skill renders them compactly and enables surgical cell-level edits. The skill is developed here and installed into `~/.claude/skills/nb/` for use.
+This repo is the **nb** Claude Code plugin — a token-efficient Jupyter notebook interface. Raw `.ipynb` files are 10–50× larger in tokens than needed; this plugin renders them compactly and enables surgical cell-level edits. It uses the Claude Code native plugin format (`claude plugin install`) and does not require a manual installer.
 
 ## Commands
 
@@ -18,20 +18,6 @@ pytest tests/test_nb_index.py -q
 
 # Run a single test by name
 pytest tests/test_nb_index.py::TestStaleness::test_stale_on_mtime_change -v
-
-# Install into ~/.claude/skills/nb/ and register the PreToolUse hook
-python3 install.py                        # Linux / macOS
-python  install.py                        # Windows
-
-# Uninstall
-python3 uninstall.py                      # Linux / macOS
-python  uninstall.py                      # Windows
-
-# Custom config dir
-CLAUDE_CONFIG_DIR=/path/to/config python3 install.py
-
-# Post-install verification (tests run against the installed copies)
-pytest ~/.claude/skills/nb/tests/ -q
 ```
 
 Only `pytest` is an external dependency. Everything else is Python stdlib.
@@ -48,7 +34,7 @@ Five cooperating scripts:
 | `scripts/nb-index.py` | Builds a persistent `.nb_index/<notebook>.json` per notebook — enables outline, outputs, and search without re-reading raw JSON |
 | `scripts/nb-search.py` | Cross-notebook keyword / symbol / import / section search over indexed notebooks |
 
-`SKILL.md` defines the 9 behavioural rules Claude follows when working with `.ipynb` files (never read raw JSON, re-read after insert/delete, use `-f <file>`, etc.).
+`skills/nb/SKILL.md` defines the 9 behavioural rules Claude follows when working with `.ipynb` files (never read raw JSON, re-read after insert/delete, use `-f <file>`, etc.).
 
 ### Data flow
 
@@ -146,30 +132,28 @@ Tests are written TDD-first against the spec before implementation. All black-bo
 | `test_write_independent.py` | Full nb-write.py spec (atomicity, cell IDs, locking) |
 | `test_write_new.py` | `create`, `patch -1` error, PermissionError message, concurrent writes |
 | `test_nb_guard_py.py` | nb-guard.py exit codes, path sanitisation, fail-open |
-| `test_nb_guard_hook.py` | Hook exit codes, settings.json registration (nb-guard.py) |
 | `test_nb_guard_hardened.py` | Injection, subdirectory bypass, MultiEdit payloads |
 | `test_nb_index.py` | §1–§8, §13–§14: index location, staleness, sections, symbols, outputs, symbols.json |
 | `test_nb_search.py` | §12: walk, keyword/symbol/import search, filters, security, streaming |
-| `test_windows_compat.py` | Cross-platform encoding, path normalisation, installer guard_cmd, py launcher, atomic-write retry |
-| `test_install.py` | install.py / uninstall.py cross-platform behaviour |
+| `test_windows_compat.py` | Cross-platform encoding, path normalisation, py launcher, atomic-write retry |
+| `test_plugin.py` | Plugin manifest, hooks.json, skill file placement, no installer files |
 
-`TestSettingsRegistration` (in `test_nb_guard_hook.py`) and `TestSettingsHardenedApproach` are post-install-only — they check `~/.claude/settings.json` and are skipped when settings.json is absent. Two tests within `TestSettingsRegistration` that verify preservation of pre-existing PostToolUse hooks also skip when those specific hooks are not present in the user's settings.
+## Plugin details
+
+The plugin uses the Claude Code native plugin format:
+
+- `.claude-plugin/plugin.json` — manifest (name, description, version, author, license)
+- `hooks/hooks.json` — declarative `PreToolUse` hook using `${CLAUDE_PLUGIN_ROOT}` for the script path
+- `skills/nb/SKILL.md` — the skill file, auto-loaded by Claude Code
+
+The hook command uses `${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py`, which Claude Code expands to the plugin's installation directory at runtime. No settings.json patching is required.
+
+Scripts are installed to `~/.claude/plugins/nb/scripts/` (Windows: `%USERPROFILE%\.claude\plugins\nb\scripts\`).
 
 ## TDD Documents
 
-`TDD.md` — spec for nb-guard.py, install.py, nb-read.py safe/outline/outputs, nb-write.py create/locking.
+`TDD.md` — spec for nb-guard.py, nb-read.py safe/outline/outputs, nb-write.py create/locking.
 
 `TDD_INDEX.md` — spec for nb-index.py (§0–§14) and nb-search.py (§12–§15), with full schema, staleness algorithm, symbol extraction regexes, output pipeline, and section hierarchy.
 
 `TDD_AUDIT.md` / `TDD_INDEX_AUDIT.md` / `TDD_INDEX_GAPS.md` — adversarial review findings already resolved in the TDD documents.
-
-## Install details
-
-`install.py` (cross-platform, no `jq` dependency):
-- Detects config dir: `$CLAUDE_CONFIG_DIR` → `~/.claude` on all platforms (`%USERPROFILE%\.claude` on Windows).
-- Copies files with `shutil.copytree(dirs_exist_ok=True)`.
-- Patches `settings.json` atomically (temp file + `os.replace`).
-- Removes stale `nb-guard.sh` entries if upgrading from the shell version.
-- Creates `settings.json` with mode `0o600` if absent.
-
-The hook command written into `settings.json` references `nb-guard.py` (not `nb-guard.sh`). `nb-guard.sh` is kept in the repo as a legacy POSIX fallback but is no longer the default.

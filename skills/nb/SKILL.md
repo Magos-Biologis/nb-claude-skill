@@ -34,10 +34,10 @@ allowed-tools: Bash(python3 *) Bash(python *) Bash(ls *) Bash(find *) Read Write
 
 ```bash
 # Linux / macOS
-NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/nb/scripts"
+NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/nb/scripts"
 
 # Windows (PowerShell)
-$NB_SCRIPTS = "$env:USERPROFILE\.claude\skills\nb\scripts"
+$NB_SCRIPTS = "$env:USERPROFILE\.claude\plugins\nb\scripts"
 ```
 
 Use this variable prefix in all commands below.
@@ -61,7 +61,7 @@ python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> create
 ## Reading a notebook
 
 ```bash
-NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/nb/scripts"
+NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/nb/scripts"
 
 # Full compact view (source only, truncated at 80 lines/cell)
 python3 "$NB_SCRIPTS/nb-read.py" <notebook.ipynb>
@@ -105,7 +105,7 @@ notebook.ipynb | 12 cells | python3
 
 **Step 2** — Call nb-write.py with `-f`:
 ```bash
-NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/nb/scripts"
+NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/nb/scripts"
 python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> patch <index> -f /path/to/source.txt
 ```
 
@@ -120,7 +120,7 @@ python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> patch <index> -f /path/to/sou
 
 **Step 2:**
 ```bash
-NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/nb/scripts"
+NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/nb/scripts"
 
 # Insert a code cell before index 3
 python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> insert 3 code -f /path/to/source.txt
@@ -138,7 +138,7 @@ Cell types: `code` | `markdown` | `raw`
 ## Deleting a cell
 
 ```bash
-NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/nb/scripts"
+NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/nb/scripts"
 python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> delete <index>
 ```
 
@@ -149,7 +149,7 @@ python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> delete <index>
 ## Full workflow example
 
 ```bash
-NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/nb/scripts"
+NB_SCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/nb/scripts"
 
 # 1. Read the notebook to find the right cell index
 python3 "$NB_SCRIPTS/nb-read.py" analysis.ipynb
@@ -174,4 +174,4 @@ python3 "$NB_SCRIPTS/nb-read.py" analysis.ipynb --cells 4
 - **Atomic writes:** No `.bak` file is created. Writes are all-or-nothing via temp file + rename.
 - **nbformat compatibility:** Scripts require nbformat 4. nbformat 3 notebooks (with `worksheets`) are not supported — convert first with `jupyter nbconvert`.
 - **Known limitation:** The nb-guard hook covers `Read`/`Edit`/`Write`/`MultiEdit`. Reading a notebook via the `Bash` tool (e.g. `cat notebook.ipynb`) bypasses the guard. Avoid this — raw JSON is verbose and unindexed.
-- **Windows:** Use `py -3` or `python` instead of `python3`. Scripts dir is `%USERPROFILE%\.claude\skills\nb\scripts` (i.e. `$env:USERPROFILE\.claude\skills\nb\scripts` in PowerShell).
+- **Windows:** Use `py -3` or `python` instead of `python3`. Scripts dir is `%USERPROFILE%\.claude\plugins\nb\scripts` (i.e. `$env:USERPROFILE\.claude\plugins\nb\scripts` in PowerShell).

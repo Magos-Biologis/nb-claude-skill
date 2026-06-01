@@ -33,7 +33,6 @@ import pytest
 
 REPO_ROOT    = Path(__file__).parent.parent
 SCRIPTS_DIR  = REPO_ROOT / "scripts"
-INSTALL_PY   = REPO_ROOT / "install.py"
 
 NB_GUARD_PY  = SCRIPTS_DIR / "nb-guard.py"
 NB_INDEX_PY  = SCRIPTS_DIR / "nb-index.py"
@@ -79,17 +78,6 @@ def _run_indexer(nb_path: Path) -> subprocess.CompletedProcess:
         [PYTHON, str(NB_INDEX_PY), str(nb_path)],
         capture_output=True,
         text=True,
-    )
-
-
-def _run_install(claude_dir: Path) -> subprocess.CompletedProcess:
-    env = os.environ.copy()
-    env["CLAUDE_CONFIG_DIR"] = str(claude_dir)
-    return subprocess.run(
-        [PYTHON, str(INSTALL_PY)],
-        capture_output=True,
-        text=True,
-        env=env,
     )
 
 
@@ -230,58 +218,6 @@ class TestPathNormalization:
                         f"symbols.json location key contains backslashes: {loc!r}\n"
                         f"Must use forward slashes (§13.2a / §15.2)."
                     )
-
-
-# ===========================================================================
-# B1 — installer guard_cmd: no backslashes in settings.json hook command
-# ===========================================================================
-
-class TestInstaller:
-    """B1: guard_cmd written to settings.json must use forward slashes (§2.14 Bug B1)."""
-
-    def test_guard_cmd_no_backslashes(self, tmp_path):
-        """The hook command in settings.json must not contain backslash characters.
-
-        On Linux the path separator is already '/' so this test documents the
-        invariant and catches regressions. On Windows (where str(WindowsPath)
-        uses '\\'), this test would catch the bug introduced by using
-        str(guard_script) instead of guard_script.as_posix().
-        """
-        r = _run_install(tmp_path)
-        assert r.returncode == 0, f"install.py failed: {r.stderr}"
-
-        settings_path = tmp_path / "settings.json"
-        assert settings_path.exists(), "settings.json not created"
-        s = json.loads(settings_path.read_text(encoding="utf-8"))
-
-        hook_commands = [
-            h.get("command", "")
-            for entry in s.get("hooks", {}).get("PreToolUse", [])
-            for h in entry.get("hooks", [])
-            if "nb-guard" in h.get("command", "")
-        ]
-        assert hook_commands, "No nb-guard hook command found in settings.json"
-
-        for cmd in hook_commands:
-            assert "\\" not in cmd, (
-                f"Hook command contains backslashes: {cmd!r}\n"
-                f"install.py must use guard_script.as_posix() (§2.14 Bug B1)."
-            )
-
-    def test_guard_cmd_contains_nb_guard_py(self, tmp_path):
-        """Sanity: the hook command must reference nb-guard.py (not .sh)."""
-        r = _run_install(tmp_path)
-        assert r.returncode == 0, f"install.py failed: {r.stderr}"
-        s = json.loads((tmp_path / "settings.json").read_text())
-        cmds = [
-            h.get("command", "")
-            for entry in s.get("hooks", {}).get("PreToolUse", [])
-            for h in entry.get("hooks", [])
-            if "nb-guard" in h.get("command", "")
-        ]
-        assert any("nb-guard.py" in c for c in cmds), (
-            f"Hook must reference nb-guard.py; got: {cmds!r}"
-        )
 
 
 # ===========================================================================

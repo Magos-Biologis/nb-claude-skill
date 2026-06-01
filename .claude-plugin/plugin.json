@@ -1,0 +1,9 @@
+{
+  "name": "nb",
+  "description": "Token-efficient Jupyter notebook reading and editing for Claude Code. Renders .ipynb files as compact indexed cell source (10-50x fewer tokens than raw JSON) and enables surgical cell-level edits via PreToolUse hook enforcement.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Magos-Biologis"
+  },
+  "license": "MIT"
+}
