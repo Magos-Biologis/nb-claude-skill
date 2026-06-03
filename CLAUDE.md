@@ -148,7 +148,7 @@ The plugin uses the Claude Code native plugin format:
 
 The hook command uses `${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py`, which Claude Code expands to the plugin's installation directory at runtime. No settings.json patching is required.
 
-Scripts are installed to `~/.claude/plugins/nb/scripts/` (Windows: `%USERPROFILE%\.claude\plugins\nb\scripts\`).
+Scripts are installed into a versioned cache directory under `~/.claude/plugins/cache/`. The exact path is recorded in `~/.claude/plugins/installed_plugins.json` under the `installPath` key for the `nb@*` entry. The SKILL.md resolves this dynamically at runtime via a `python3 -c` lookup — do not hardcode the path.
 
 ## TDD Documents
 
