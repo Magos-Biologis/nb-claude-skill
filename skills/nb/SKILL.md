@@ -36,20 +36,20 @@ The plugin manager installs scripts into a versioned cache directory. Resolve th
 dynamically from the plugin registry — do **not** hardcode it:
 
 ```bash
-# Linux / macOS — resolves correctly regardless of version or marketplace
+# Linux / macOS (bash/zsh)
 NB_SCRIPTS=$(python3 -c "
 import json, pathlib, os
 cfg = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR', str(pathlib.Path.home() / '.claude')))
 reg = json.loads((cfg / 'plugins' / 'installed_plugins.json').read_text())
-print(next(v[0]['installPath'] for k, v in reg['plugins'].items() if k.startswith('nb@')) + '/scripts')
+print(pathlib.Path(next(v[0]['installPath'] for k, v in reg['plugins'].items() if k.startswith('nb@'))) / 'scripts')
 ")
 
-# Windows (PowerShell)
-$NB_SCRIPTS = (python3 -c "
+# Windows (PowerShell) — use py -3 (Python Launcher) or python if python3 is unavailable
+$NB_SCRIPTS = (py -3 -c "
 import json, pathlib, os
 cfg = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR', str(pathlib.Path.home() / '.claude')))
 reg = json.loads((cfg / 'plugins' / 'installed_plugins.json').read_text())
-print(next(v[0]['installPath'] for k, v in reg['plugins'].items() if k.startswith('nb@')) + '/scripts')
+print(pathlib.Path(next(v[0]['installPath'] for k, v in reg['plugins'].items() if k.startswith('nb@'))) / 'scripts')
 ")
 ```
 
@@ -74,7 +74,7 @@ python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> create
 ## Reading a notebook
 
 ```bash
-NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@'))+'/scripts')")
+NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(pathlib.Path(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@')))/'scripts')")
 
 # Full compact view (source only, truncated at 80 lines/cell)
 python3 "$NB_SCRIPTS/nb-read.py" <notebook.ipynb>
@@ -118,7 +118,7 @@ notebook.ipynb | 12 cells | python3
 
 **Step 2** — Call nb-write.py with `-f`:
 ```bash
-NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@'))+'/scripts')")
+NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(pathlib.Path(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@')))/'scripts')")
 python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> patch <index> -f /path/to/source.txt
 ```
 
@@ -133,7 +133,7 @@ python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> patch <index> -f /path/to/sou
 
 **Step 2:**
 ```bash
-NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@'))+'/scripts')")
+NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(pathlib.Path(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@')))/'scripts')")
 
 # Insert a code cell before index 3
 python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> insert 3 code -f /path/to/source.txt
@@ -151,7 +151,7 @@ Cell types: `code` | `markdown` | `raw`
 ## Deleting a cell
 
 ```bash
-NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@'))+'/scripts')")
+NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(pathlib.Path(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@')))/'scripts')")
 python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> delete <index>
 ```
 
@@ -162,7 +162,7 @@ python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> delete <index>
 ## Full workflow example
 
 ```bash
-NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@'))+'/scripts')")
+NB_SCRIPTS=$(python3 -c "import json,pathlib,os; cfg=pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR',str(pathlib.Path.home()/'.claude'))); reg=json.loads((cfg/'plugins'/'installed_plugins.json').read_text()); print(pathlib.Path(next(v[0]['installPath'] for k,v in reg['plugins'].items() if k.startswith('nb@')))/'scripts')")
 
 # 1. Read the notebook to find the right cell index
 python3 "$NB_SCRIPTS/nb-read.py" analysis.ipynb
@@ -187,4 +187,4 @@ python3 "$NB_SCRIPTS/nb-read.py" analysis.ipynb --cells 4
 - **Atomic writes:** No `.bak` file is created. Writes are all-or-nothing via temp file + rename.
 - **nbformat compatibility:** Scripts require nbformat 4. nbformat 3 notebooks (with `worksheets`) are not supported — convert first with `jupyter nbconvert`.
 - **Known limitation:** The nb-guard hook covers `Read`/`Edit`/`Write`/`MultiEdit`. Reading a notebook via the `Bash` tool (e.g. `cat notebook.ipynb`) bypasses the guard. Avoid this — raw JSON is verbose and unindexed.
-- **Windows:** Use `py -3` or `python` instead of `python3`. Resolve `NB_SCRIPTS` with the same `installed_plugins.json` lookup above.
+- **Windows:** Use `py -3` or `python` instead of `python3`. Use the PowerShell `$NB_SCRIPTS = (py -3 -c "...")` form from the Script location section above. `pathlib.Path(...) / 'scripts'` ensures backslash-correct paths on Windows.
