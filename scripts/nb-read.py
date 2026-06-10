@@ -65,6 +65,9 @@ _ANSI_RE = re.compile(
     r')'
 )
 _CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')  # C0 controls + DEL
+# Variant that keeps \n: used on multi-line output text BEFORE splitting, so
+# \r/\v/\f are removed rather than becoming line boundaries via splitlines().
+_CTRL_NO_NL_RE = re.compile(r'[\x00-\x09\x0b-\x1f\x7f]')
 
 
 def _sanitise(s: str) -> str:
@@ -255,6 +258,11 @@ def _output_summary(cell) -> str | None:
         tb = out.get("traceback", [])
         if isinstance(tb, list):
             n_lines += len(tb)
+        # non-text rich outputs (image/html/json only): count the one-line
+        # placeholder that --outputs renders, so summary and --outputs agree
+        # that an output exists.
+        if _placeholder_mimes(out):
+            n_lines += 1
     plural = "output" if n_entries == 1 else "outputs"
     return f"│ ── ({n_entries} {plural}, {n_lines} lines) ──"
 
@@ -263,59 +271,136 @@ def _output_summary(cell) -> str | None:
 # Output rendering helpers (for --outputs mode)
 # ---------------------------------------------------------------------------
 
-def _extract_output_text(cell, safe=True) -> str | None:
+# Max characters per rendered output line (source lines are not capped).
+MAX_OUTPUT_LINE_WIDTH = 2000
+
+# Richer / more specific mime types listed first in placeholder lines.
+_MIME_PRIORITY = (
+    "image/svg+xml", "image/png", "image/jpeg", "image/gif", "image/bmp",
+    "text/html", "application/json", "text/latex", "text/markdown",
+    "application/javascript", "application/pdf",
+)
+
+
+def _rank_mimes(mimes) -> list:
+    """Sort mime types: known rich types by priority, then the rest alphabetically."""
+    def key(m):
+        try:
+            return (0, _MIME_PRIORITY.index(m), m)
+        except ValueError:
+            return (1, 0, m)
+    return sorted(mimes, key=key)
+
+
+def _placeholder_mimes(out) -> list:
     """
-    Extract and render the text portions of a cell's outputs.
-    Returns None if there is no renderable text output.
+    For a rich output (execute_result / display_data) that carries no
+    text/plain representation, return the list of mime types present
+    (richest first).  Returns [] when the output has renderable text or
+    is not a rich output.
+    """
+    if out.get("output_type", "") not in ("execute_result", "display_data"):
+        return []
+    data = out.get("data", {})
+    if not isinstance(data, dict):
+        return []
+    # Key presence is not enough: data = {"text/plain": "", "image/png": ...}
+    # has no renderable text — the placeholder must still appear.
+    if _join_text(data.get("text/plain", "")):
+        return []
+    # legacy notebooks sometimes carry top-level 'text' on rich outputs
+    if _join_text(out.get("text", "")):
+        return []
+    return _rank_mimes(str(m) for m in data.keys() if m != "text/plain")
+
+
+def _join_text(text_val) -> str:
+    """Coerce a notebook text field (list-of-str or str) to one string."""
+    if isinstance(text_val, list):
+        return "".join(str(t) for t in text_val)
+    if isinstance(text_val, str):
+        return text_val
+    return str(text_val) if text_val is not None else ""
+
+
+def _render_output_block(cell, safe=True, truncate=0, cell_index=None) -> str | None:
+    """
+    Render the [output] block for a cell.  Returns None if the cell has no
+    renderable outputs (neither text nor rich/binary data).
+
+    - Text outputs (stream / text/plain / error tracebacks) are rendered as-is
+      (ANSI/C0-sanitised in safe mode).
+    - Non-text rich outputs (image/html/json only) render a one-line
+      placeholder listing the mime types present, so 'no output' is
+      distinguishable from 'plot exists'.
+    - `truncate` caps the block at N lines (0 = unlimited); a marker line is
+      appended explaining how to retrieve the full output.
+    - Every line is hard-capped at MAX_OUTPUT_LINE_WIDTH characters.
     """
     outputs = cell.get("outputs", [])
     if not outputs:
         return None
 
-    parts = []
+    lines = []
+    buf = []  # contiguous text chunks, joined with "" — preserves Jupyter
+              # stream semantics where partial writes form one logical line
+
+    def _flush():
+        if not buf:
+            return
+        text = "".join(buf)
+        buf.clear()
+        if safe:
+            # Sanitise BEFORE splitting so \r/\v/\f are removed instead of
+            # becoming line boundaries (e.g. \r-overwritten progress bars).
+            text = _ANSI_RE.sub('', text)
+            text = _CTRL_NO_NL_RE.sub('', text)
+        lines.extend(text.splitlines())
+
     for out in outputs:
         otype = out.get("output_type", "")
-        if otype in ("stream", "execute_result", "display_data"):
-            if otype in ("execute_result", "display_data"):
-                text_val = out.get("data", {}).get("text/plain", out.get("text", []))
+        text = None
+        if otype == "stream":
+            text = _join_text(out.get("text", []))
+        elif otype in ("execute_result", "display_data"):
+            mimes = _placeholder_mimes(out)
+            if mimes:
+                _flush()
+                if safe:
+                    mimes = [_sanitise(m) for m in mimes]
+                lines.append(f"[{', '.join(mimes)} output — not shown]")
+                continue
+            data = out.get("data", {})
+            if isinstance(data, dict) and "text/plain" in data:
+                text = _join_text(data["text/plain"])
             else:
-                text_val = out.get("text", [])
-            if isinstance(text_val, list):
-                text = "".join(str(t) for t in text_val)
-            elif isinstance(text_val, str):
-                text = text_val
-            else:
-                text = str(text_val)
-            if text:
-                parts.append(text)
+                text = _join_text(out.get("text", []))
         elif otype == "error":
             tb = out.get("traceback", [])
             if isinstance(tb, list):
                 text = "\n".join(str(t) for t in tb)
             else:
                 text = str(tb)
-            if text:
-                parts.append(text)
+        if text:
+            buf.append(text)
+    _flush()
 
-    if not parts:
+    if not lines:
         return None
 
-    combined = "".join(parts)
-    if safe:
-        combined = _ANSI_RE.sub('', combined)
-        combined = _CTRL_RE.sub('', combined)
-    return combined
+    # Hard cap on single-line width (output blocks only; source untouched).
+    lines = [
+        l if len(l) <= MAX_OUTPUT_LINE_WIDTH
+        else l[:MAX_OUTPUT_LINE_WIDTH] + "…[truncated]"
+        for l in lines
+    ]
 
+    if truncate and len(lines) > truncate:
+        lines = lines[:truncate]
+        idx = cell_index if cell_index is not None else "N"
+        lines.append(f"… output truncated to {truncate} lines "
+                     f"(use --outputs --cells {idx} --truncate 0 for full output)")
 
-def _render_output_block(cell, safe=True) -> str | None:
-    """
-    Render the [output] block for a cell.  Returns None if no text output.
-    """
-    text = _extract_output_text(cell, safe=safe)
-    if text is None:
-        return None
-
-    lines = text.splitlines()
     header = "[output] " + "─" * 40
     if safe:
         body = "\n".join("│ " + l for l in lines)
@@ -515,7 +600,9 @@ def main():
         if ctype == "code":
             if args.outputs:
                 # --outputs mode: render full output block
-                output_block = _render_output_block(cell, safe=safe)
+                output_block = _render_output_block(cell, safe=safe,
+                                                    truncate=args.truncate,
+                                                    cell_index=i)
                 if output_block:
                     print(output_block)
             else:

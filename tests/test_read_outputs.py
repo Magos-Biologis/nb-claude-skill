@@ -271,9 +271,10 @@ class TestOutputsMode:
             f"Expected 'ValueError' in output text, got:\n{r.stdout}"
         )
 
-    def test_outputs_binary_only_no_output_section(self, tmp_path):
-        """A cell whose only output is binary (image/png) must not render an
-        [output] section — binary outputs are not stored as text (§7.4)."""
+    def test_outputs_binary_only_renders_placeholder(self, tmp_path):
+        """A cell whose only output is binary (image/png) must render an
+        [output] section with a one-line placeholder naming the mime type —
+        'no output' must be distinguishable from 'plot exists'."""
         p = _make_nb([{
             "cell_type": "code",
             "source": ["plt.show()"],
@@ -286,6 +287,295 @@ class TestOutputsMode:
         }], tmp_path)
         r = run_read([p, "--outputs"])
         assert r.returncode == 0
-        assert "[output]" not in r.stdout, (
-            f"Binary-only output must not produce an [output] section, got:\n{r.stdout}"
+        assert "[output]" in r.stdout, (
+            f"Binary-only output must produce an [output] section, got:\n{r.stdout}"
         )
+        assert "image/png" in r.stdout, (
+            f"Placeholder must name the mime type, got:\n{r.stdout}"
+        )
+        assert "not shown" in r.stdout, (
+            f"Placeholder must say the output is not shown, got:\n{r.stdout}"
+        )
+        # base64 payload must never be printed
+        assert "iVBORw0KGgo" not in r.stdout, (
+            f"Binary payload must not be printed, got:\n{r.stdout}"
+        )
+
+    def test_outputs_placeholder_lists_multiple_mimes(self, tmp_path):
+        """A non-text output with several mime types lists them comma-separated,
+        richest first (image/png before text/html)."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["display(obj)"],
+            "outputs": [{
+                "output_type": "display_data",
+                "data": {
+                    "text/html": "<div>hi</div>",
+                    "image/png": "iVBORw0KGgoAAAANSUhEUgAAAAUA",
+                },
+                "metadata": {},
+            }],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p, "--outputs"])
+        assert r.returncode == 0
+        placeholder_lines = [l for l in r.stdout.splitlines()
+                             if "not shown" in l]
+        assert placeholder_lines, f"Expected a placeholder line, got:\n{r.stdout}"
+        line = placeholder_lines[0]
+        assert "image/png" in line and "text/html" in line, (
+            f"Placeholder must list all mime types, got: {line!r}"
+        )
+        assert line.index("image/png") < line.index("text/html"), (
+            f"Richest mime type must be listed first, got: {line!r}"
+        )
+
+    def test_outputs_mixed_text_and_image(self, tmp_path):
+        """A cell with both a text output and an image-only output shows the
+        text plus a placeholder for the image."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["print('stats'); plt.show()"],
+            "outputs": [
+                {"output_type": "stream", "name": "stdout",
+                 "text": ["mean=3.5\n"]},
+                {"output_type": "display_data",
+                 "data": {"image/png": "iVBORw0KGgoAAAANSUhEUgAAAAUA"},
+                 "metadata": {}},
+            ],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p, "--outputs"])
+        assert r.returncode == 0
+        assert "mean=3.5" in r.stdout, (
+            f"Text output must be rendered, got:\n{r.stdout}"
+        )
+        assert "image/png" in r.stdout and "not shown" in r.stdout, (
+            f"Placeholder for the image output must be rendered, got:\n{r.stdout}"
+        )
+
+    def test_outputs_text_plain_preferred_over_placeholder(self, tmp_path):
+        """An execute_result with both text/plain and image/png renders the
+        text/plain repr (no placeholder needed for that output)."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["fig"],
+            "outputs": [{
+                "output_type": "execute_result",
+                "data": {
+                    "text/plain": "<Figure size 640x480>",
+                    "image/png": "iVBORw0KGgoAAAANSUhEUgAAAAUA",
+                },
+                "metadata": {},
+                "execution_count": 1,
+            }],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p, "--outputs"])
+        assert r.returncode == 0
+        assert "<Figure size 640x480>" in r.stdout
+        assert "not shown" not in r.stdout, (
+            f"text/plain present: no placeholder expected, got:\n{r.stdout}"
+        )
+
+    def test_summary_counts_binary_only_output(self, tmp_path):
+        """Normal-mode summary must agree with --outputs that a binary-only
+        output exists (counts the placeholder line)."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["plt.show()"],
+            "outputs": [{
+                "output_type": "display_data",
+                "data": {"image/png": "iVBORw0KGgoAAAANSUhEUgAAAAUA"},
+                "metadata": {},
+            }],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "│ ── (1 output, 1 line" in r.stdout, (
+            f"Summary must count the placeholder line for a binary-only "
+            f"output, got:\n{r.stdout}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# § Output truncation
+# ---------------------------------------------------------------------------
+
+class TestOutputTruncation:
+
+    def _long_output_nb(self, tmp_path, n_lines=100):
+        text = "".join(f"line {i}\n" for i in range(n_lines))
+        return _make_nb([{
+            "cell_type": "code",
+            "source": ["for i in range(100): print(f'line {i}')"],
+            "outputs": [{"output_type": "stream", "name": "stdout",
+                         "text": [text]}],
+            "execution_count": 1,
+        }], tmp_path)
+
+    def test_outputs_truncated_at_n_lines_with_marker(self, tmp_path):
+        """--truncate N caps each output block at N lines and appends a marker
+        naming the cell index and how to see the full output."""
+        p = self._long_output_nb(tmp_path, 100)
+        r = run_read([p, "--outputs", "--truncate", "10"])
+        assert r.returncode == 0
+        assert "line 9" in r.stdout
+        assert "line 10\n" not in r.stdout and "│ line 10" not in r.stdout, (
+            f"Output must be cut at 10 lines, got:\n{r.stdout}"
+        )
+        assert "output truncated to 10 lines" in r.stdout, (
+            f"Expected truncation marker, got:\n{r.stdout}"
+        )
+        assert "--outputs --cells 0 --truncate 0" in r.stdout, (
+            f"Marker must explain how to see the full output, got:\n{r.stdout}"
+        )
+
+    def test_outputs_default_truncation_applies(self, tmp_path):
+        """The default --truncate (80) must apply to output blocks too."""
+        p = self._long_output_nb(tmp_path, 200)
+        r = run_read([p, "--outputs"])
+        assert r.returncode == 0
+        assert "line 79" in r.stdout
+        assert "│ line 150" not in r.stdout, (
+            f"Default truncation (80 lines) must apply to outputs, got:\n{r.stdout}"
+        )
+        assert "output truncated to 80 lines" in r.stdout
+
+    def test_outputs_truncate_zero_unlimited(self, tmp_path):
+        """--truncate 0 must print the full output with no marker."""
+        p = self._long_output_nb(tmp_path, 200)
+        r = run_read([p, "--outputs", "--truncate", "0"])
+        assert r.returncode == 0
+        assert "line 199" in r.stdout, (
+            f"--truncate 0 must print all output lines, got:\n{r.stdout}"
+        )
+        assert "output truncated" not in r.stdout
+
+    def test_outputs_short_output_no_marker(self, tmp_path):
+        """An output shorter than the truncation limit gets no marker."""
+        p = self._long_output_nb(tmp_path, 5)
+        r = run_read([p, "--outputs", "--truncate", "10"])
+        assert r.returncode == 0
+        assert "line 4" in r.stdout
+        assert "output truncated" not in r.stdout
+
+    def test_outputs_wide_line_capped(self, tmp_path):
+        """A single output line wider than 2000 chars is capped with a
+        '…[truncated]' suffix."""
+        wide = "x" * 5000
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["print('x' * 5000)"],
+            "outputs": [{"output_type": "stream", "name": "stdout",
+                         "text": [wide + "\n"]}],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p, "--outputs"])
+        assert r.returncode == 0
+        assert "…[truncated]" in r.stdout, (
+            f"Expected width-cap suffix on a 5000-char line, got first 200 "
+            f"chars:\n{r.stdout[:200]}"
+        )
+        assert "x" * 5000 not in r.stdout, "5000-char line must not print in full"
+        assert "x" * 2000 in r.stdout, "Capped line must keep the first 2000 chars"
+
+    def test_source_lines_not_width_capped(self, tmp_path):
+        """The 2000-char width cap applies to output lines only — wide source
+        lines print untouched."""
+        wide_src = "s = '" + "y" * 3000 + "'"
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": [wide_src],
+            "outputs": [],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p, "--outputs"])
+        assert r.returncode == 0
+        assert "y" * 3000 in r.stdout, (
+            "Source lines must not be width-capped"
+        )
+
+
+# ---------------------------------------------------------------------------
+# § 2026-06-11 review fixes: empty text/plain, stream join, \r handling
+# ---------------------------------------------------------------------------
+
+class TestReviewFixes:
+
+    def test_empty_text_plain_with_image_renders_placeholder(self, tmp_path):
+        """data={'text/plain': '', 'image/png': ...} has no renderable text —
+        the placeholder must appear (key presence is not enough)."""
+        nb = _make_nb([{
+            "source": ["plot()"],
+            "outputs": [{
+                "output_type": "display_data",
+                "data": {"text/plain": "", "image/png": "aGVsbG8="},
+                "metadata": {},
+            }],
+        }], tmp_path)
+        r = run_read([nb, "--outputs"])
+        assert r.returncode == 0
+        assert "[image/png output — not shown]" in r.stdout
+        assert "aGVsbG8=" not in r.stdout
+
+    def test_empty_list_text_plain_with_image_renders_placeholder(self, tmp_path):
+        nb = _make_nb([{
+            "source": ["plot()"],
+            "outputs": [{
+                "output_type": "display_data",
+                "data": {"text/plain": [], "image/png": "aGVsbG8="},
+                "metadata": {},
+            }],
+        }], tmp_path)
+        r = run_read([nb, "--outputs"])
+        assert r.returncode == 0
+        assert "[image/png output — not shown]" in r.stdout
+
+    def test_consecutive_stream_chunks_join_on_one_line(self, tmp_path):
+        """Jupyter stream semantics: chunks 'foo' + 'bar\\n' are one logical
+        line 'foobar', not two lines."""
+        nb = _make_nb([{
+            "source": ["print('x', end='')"],
+            "outputs": [
+                {"output_type": "stream", "name": "stdout", "text": ["foo"]},
+                {"output_type": "stream", "name": "stdout", "text": ["bar\n"]},
+            ],
+        }], tmp_path)
+        r = run_read([nb, "--outputs"])
+        assert r.returncode == 0
+        assert "│ foobar" in r.stdout
+        assert "│ foo\n" not in r.stdout
+
+    def test_carriage_returns_do_not_create_lines(self, tmp_path):
+        """\\r-overwritten progress frames must be stripped before splitting,
+        not become line boundaries that explode the line count."""
+        frames = "\r".join(f"progress {i}%" for i in range(50)) + "\ndone\n"
+        nb = _make_nb([{
+            "source": ["train()"],
+            "outputs": [{"output_type": "stream", "name": "stdout", "text": [frames]}],
+        }], tmp_path)
+        r = run_read([nb, "--outputs", "--truncate", "10"])
+        assert r.returncode == 0
+        # All frames collapse onto one line; 'done' must still be visible,
+        # not hidden behind a truncation marker.
+        assert "done" in r.stdout
+        assert "output truncated" not in r.stdout
+
+    def test_placeholder_between_stream_chunks_flushes_buffer(self, tmp_path):
+        """A placeholder output between two stream chunks must not glue the
+        chunks across it."""
+        nb = _make_nb([{
+            "source": ["x"],
+            "outputs": [
+                {"output_type": "stream", "name": "stdout", "text": ["before\n"]},
+                {"output_type": "display_data",
+                 "data": {"image/png": "aGVsbG8="}, "metadata": {}},
+                {"output_type": "stream", "name": "stdout", "text": ["after\n"]},
+            ],
+        }], tmp_path)
+        r = run_read([nb, "--outputs"])
+        assert r.returncode == 0
+        out = r.stdout
+        assert out.index("│ before") < out.index("[image/png output — not shown]") < out.index("│ after")

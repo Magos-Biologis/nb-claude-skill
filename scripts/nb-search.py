@@ -161,12 +161,87 @@ def _check_staleness(index_data: dict, nb_path: Path) -> bool:
 # Walk strategy (§12)
 # ---------------------------------------------------------------------------
 
+def _find_upward_index_dir(search_root: Path) -> Path | None:
+    """
+    Walk UP from search_root (same algorithm as nb-index.py's _find_index_dir:
+    <= MAX_WALK_DEPTH levels, real .git dir that is_dir() and not is_symlink(),
+    stop on st_dev change) looking for a git root strictly ABOVE search_root.
+
+    Returns that git root's .nb_index directory if it exists (and is a real
+    directory, not a symlink), else None. A git root equal to search_root is
+    already covered by the downward walk, so None is returned in that case.
+    """
+    cur = search_root
+    try:
+        cur_dev = os.stat(cur).st_dev
+    except OSError:
+        return None
+
+    for _ in range(MAX_WALK_DEPTH):
+        git_candidate = cur / ".git"
+        if git_candidate.is_dir() and not git_candidate.is_symlink():
+            if cur == search_root:
+                return None  # downward walk already covers this dir
+            index_dir = cur / ".nb_index"
+            if index_dir.is_dir() and not index_dir.is_symlink():
+                return index_dir
+            return None
+
+        parent = cur.parent
+        if parent == cur:
+            break  # reached filesystem root
+        try:
+            parent_dev = os.stat(parent).st_dev
+        except OSError:
+            break
+        if parent_dev != cur_dev:
+            break  # filesystem boundary
+        cur_dev = parent_dev
+        cur = parent
+
+    return None
+
+
+def _collect_index_files(index_dir: Path):
+    """
+    Return relative (posix-style) paths of all files under index_dir,
+    recursing into subdirectories (git-root indexes mirror the repo layout:
+    .nb_index/<repo-relative-path>.json). Because the layout mirrors the
+    repo, SKIP_DIRS pruning applies here too (e.g. notebooks under .git/ or
+    node_modules/ stay hidden). followlinks=False; depth-capped.
+    """
+    names = []
+    base = str(index_dir)
+    base_depth = base.count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        depth = dirpath.count(os.sep) - base_depth
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIRS and depth < MAX_WALK_DEPTH
+        ]
+        for fname in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, fname), base)
+            names.append(rel.replace(os.sep, "/"))
+    return names
+
+
 def _walk_for_index_dirs(search_root: Path):
     """
-    Yield (dirpath, filenames) for all .nb_index/ directories found by walking
-    search_root. Skips SKIP_DIRS. Max depth: MAX_WALK_DEPTH.
-    Uses os.walk(followlinks=False).
+    Yield (dirpath, filenames) for all .nb_index/ directories relevant to
+    search_root:
+
+    1. The .nb_index of a git root found by walking UP from search_root
+       (if any, and only when strictly above search_root).
+    2. All .nb_index/ directories found by walking DOWN from search_root.
+
+    filenames are paths relative to the .nb_index dir (may contain
+    subdirectory components for git-root indexes). Skips SKIP_DIRS.
+    Max depth: MAX_WALK_DEPTH. Uses os.walk(followlinks=False).
     """
+    upward = _find_upward_index_dir(search_root)
+    if upward is not None:
+        yield str(upward), _collect_index_files(upward)
+
     root_str = str(search_root)
     root_depth = root_str.count(os.sep)
 
@@ -181,7 +256,10 @@ def _walk_for_index_dirs(search_root: Path):
         ]
 
         if os.path.basename(dirpath) == ".nb_index":
-            yield dirpath, filenames
+            # Collect recursively (git-root indexes nest by repo path);
+            # prevent os.walk from re-yielding the nested dirs.
+            dirnames[:] = []
+            yield dirpath, _collect_index_files(Path(dirpath))
 
 
 def _walk_for_ipynb(search_root: Path):
@@ -209,10 +287,20 @@ def _walk_for_ipynb(search_root: Path):
 # notebook_path validation (§12.12)
 # ---------------------------------------------------------------------------
 
-def _validate_notebook_path(np_str: str, search_root: Path) -> Path | None:
+def _validate_notebook_path(np_str: str, index_base: Path) -> Path | None:
     """
     Validate notebook_path from an index file.
-    Returns resolved candidate path, or None if invalid.
+
+    index_base is the parent directory of the .nb_index dir that contains the
+    index file (the git root for repo indexes, the notebook's own directory
+    otherwise). Index-stored relative paths are relative to that base — NOT
+    to search_root. The safety containment check is against the same base:
+    a notebook_path escaping its index base is UNSAFE → None (caller warns).
+
+    Scope filtering (under search_root) is a separate concern — see
+    _in_scope() — applied by callers after resolution.
+
+    Returns resolved candidate path, or None if invalid/unsafe.
     """
     # Null bytes are invalid in POSIX paths
     if "\x00" in np_str:
@@ -220,17 +308,29 @@ def _validate_notebook_path(np_str: str, search_root: Path) -> Path | None:
 
     raw = Path(np_str)
     try:
-        candidate = raw.resolve() if raw.is_absolute() else (search_root / np_str).resolve()
+        candidate = raw.resolve() if raw.is_absolute() else (index_base / np_str).resolve()
     except Exception:
         return None
 
     try:
-        if not candidate.is_relative_to(search_root.resolve()):
+        if not candidate.is_relative_to(index_base.resolve()):
             return None
     except Exception:
         return None
 
     return candidate
+
+
+def _in_scope(candidate: Path, search_root: Path) -> bool:
+    """
+    Scope check: is the (already safety-validated) notebook under search_root?
+    A notebook outside search_root but inside its index base is SAFE but OUT
+    OF SCOPE — callers skip it silently.
+    """
+    try:
+        return candidate.is_relative_to(search_root)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -302,23 +402,30 @@ def _symbols_json_is_fresh(symbols_data: dict, index_dir_path: Path) -> bool:
     except (ValueError, ImportError):
         return False
 
+    # Git-root index dirs mirror the repo layout, so per-notebook .json files
+    # live in subdirectories — the scan must be recursive or nested indexes
+    # newer than symbols.json never invalidate it.
     try:
-        for entry in os.scandir(str(index_dir_path)):
-            if entry.name.endswith(".json") and entry.name != "symbols.json":
-                try:
-                    if entry.stat().st_mtime > gen_ts:
-                        return False
-                except OSError:
-                    pass
+        for dirpath, _dirnames, filenames in os.walk(str(index_dir_path),
+                                                     followlinks=False):
+            for name in filenames:
+                if name.endswith(".json") and name != "symbols.json":
+                    try:
+                        st = os.stat(os.path.join(dirpath, name))
+                        if st.st_mtime > gen_ts:
+                            return False
+                    except OSError:
+                        pass
     except OSError:
         return False
 
     return True
 
 
-def _validate_location_string(loc: str, search_root: Path) -> tuple[str, int] | None:
+def _validate_location_string(loc: str, index_base: Path) -> tuple[str, int] | None:
     """
     Validate a location string 'notebook_path:cell_index' from symbols.json.
+    index_base is the parent of the .nb_index dir containing symbols.json.
     Returns (notebook_path_str, cell_index) or None if invalid.
     """
     parts = loc.rsplit(":", 1)
@@ -330,7 +437,7 @@ def _validate_location_string(loc: str, search_root: Path) -> tuple[str, int] | 
     except ValueError:
         return None
 
-    candidate = _validate_notebook_path(nb_part, search_root)
+    candidate = _validate_notebook_path(nb_part, index_base)
     if candidate is None:
         return None
 
@@ -373,6 +480,7 @@ def _search_keyword(
 
     for index_dir_str, filenames in _walk_for_index_dirs(search_root):
         index_dir_path = Path(index_dir_str)
+        index_base = index_dir_path.parent
         for fname in filenames:
             if fname == "symbols.json" or not fname.endswith(".json"):
                 continue
@@ -396,11 +504,14 @@ def _search_keyword(
             if not np_str:
                 continue
 
-            candidate = _validate_notebook_path(np_str, search_root)
+            candidate = _validate_notebook_path(np_str, index_base)
             if candidate is None:
                 print(f"[WARN] invalid or unsafe notebook_path in {json_file}",
                       file=sys.stderr)
                 continue
+
+            if not _in_scope(candidate, search_root):
+                continue  # safe, but outside the requested search scope
 
             indexed_nb_paths.add(candidate)
 
@@ -528,6 +639,7 @@ def _search_symbol(
 
     for index_dir_str, filenames in _walk_for_index_dirs(search_root):
         index_dir_path = Path(index_dir_str)
+        index_base = index_dir_path.parent
 
         # Try symbols.json fast path (§12.2)
         symbols_path = index_dir_path / "symbols.json"
@@ -547,14 +659,16 @@ def _search_symbol(
                     syms = sym_data.get("symbols", {})
                     locations = syms.get(query, [])
                     for loc in locations:
-                        result = _validate_location_string(loc, search_root)
+                        result = _validate_location_string(loc, index_base)
                         if result is None:
                             continue
                         nb_path_str, cell_idx = result
                         # For display purposes, use the nb_path_str relative to search_root
-                        candidate = _validate_notebook_path(nb_path_str, search_root)
+                        candidate = _validate_notebook_path(nb_path_str, index_base)
                         if candidate is None:
                             continue
+                        if not _in_scope(candidate, search_root):
+                            continue  # safe, but outside the requested search scope
                         try:
                             display = str(candidate.relative_to(search_root))
                         except ValueError:
@@ -615,10 +729,13 @@ def _search_symbol(
                 continue
 
             np_str = index_data.get("notebook_path", "")
-            candidate = _validate_notebook_path(np_str, search_root)
+            candidate = _validate_notebook_path(np_str, index_base)
             if candidate is None:
                 print(f"[WARN] invalid or unsafe notebook_path in {json_file}", file=sys.stderr)
                 continue
+
+            if not _in_scope(candidate, search_root):
+                continue  # safe, but outside the requested search scope
 
             try:
                 display = str(candidate.relative_to(search_root))
@@ -662,6 +779,7 @@ def _search_import(
 
     for index_dir_str, filenames in _walk_for_index_dirs(search_root):
         index_dir_path = Path(index_dir_str)
+        index_base = index_dir_path.parent
 
         # Try symbols.json fast path for imports
         symbols_path = index_dir_path / "symbols.json"
@@ -683,13 +801,15 @@ def _search_import(
                         if not _import_matches(key, query):
                             continue
                         for loc in locations:
-                            result = _validate_location_string(loc, search_root)
+                            result = _validate_location_string(loc, index_base)
                             if result is None:
                                 continue
                             nb_path_str, cell_idx = result
-                            candidate = _validate_notebook_path(nb_path_str, search_root)
+                            candidate = _validate_notebook_path(nb_path_str, index_base)
                             if candidate is None:
                                 continue
+                            if not _in_scope(candidate, search_root):
+                                continue  # safe, but out of scope
                             try:
                                 display = str(candidate.relative_to(search_root))
                             except ValueError:
@@ -744,10 +864,13 @@ def _search_import(
                 continue
 
             np_str = index_data.get("notebook_path", "")
-            candidate = _validate_notebook_path(np_str, search_root)
+            candidate = _validate_notebook_path(np_str, index_base)
             if candidate is None:
                 print(f"[WARN] invalid or unsafe notebook_path in {json_file}", file=sys.stderr)
                 continue
+
+            if not _in_scope(candidate, search_root):
+                continue  # safe, but outside the requested search scope
 
             try:
                 display = str(candidate.relative_to(search_root))

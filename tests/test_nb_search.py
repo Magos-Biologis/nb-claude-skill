@@ -1047,3 +1047,245 @@ class TestStreamingOutput:
         assert len(lines) <= 3, (
             f"--limit 3 must stop output at 3 results, got {len(lines)}: {r.stdout!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Git-repo index resolution — upward .nb_index discovery and per-index-base
+# notebook_path resolution
+# ---------------------------------------------------------------------------
+
+def make_git_repo(root, notebooks):
+    """
+    Create a fake git repo at root (a bare .git directory is enough for the
+    index-location walk) containing the given notebooks, and index them.
+
+    notebooks: list of (repo-relative-path, cells) tuples.
+    Returns list of notebook Paths.
+    """
+    (root / ".git").mkdir(parents=True, exist_ok=True)
+    paths = []
+    for rel, cells in notebooks:
+        rel = Path(rel)
+        nb_dir = root / rel.parent
+        nb_dir.mkdir(parents=True, exist_ok=True)
+        nb = make_notebook(cells, name=rel.name, tmp_path=nb_dir)
+        r = run_indexer(nb)
+        assert r.returncode == 0, f"Indexing {rel} failed: {r.stderr}"
+        paths.append(nb)
+    return paths
+
+
+class TestGitRepoResolution:
+
+    def test_search_from_subdirectory_finds_repo_root_index_keyword(self, tmp_path):
+        """Searching from a subdir must find notebooks indexed at the git root above."""
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub/analysis.ipynb", [code_cell("subdir_needle = 1\n")]),
+        ])
+        # Index lives at repo/.nb_index/sub/analysis.ipynb.json — above search root
+        assert (repo / ".nb_index" / "sub" / "analysis.ipynb.json").exists()
+        r = run_search(["subdir_needle", str(repo / "sub")])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "analysis.ipynb:0:" in r.stdout
+        # Notebook is indexed (via the upward index dir) — no false UNINDEXED
+        assert "[UNINDEXED]" not in r.stderr
+
+    def test_search_from_subdirectory_symbol_mode(self, tmp_path):
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub/defs.ipynb", [code_cell("def repo_sub_func():\n    pass\n")]),
+        ])
+        r = run_search(["--symbol", "repo_sub_func", str(repo / "sub")])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "defs.ipynb:0:" in r.stdout
+
+    def test_search_from_subdirectory_import_mode(self, tmp_path):
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub/imports.ipynb", [code_cell("import collections.abc\n")]),
+        ])
+        r = run_search(["--import", "collections", str(repo / "sub")])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "imports.ipynb:0:" in r.stdout
+
+    def test_search_from_subdirectory_symbols_json_fast_path(self, tmp_path):
+        """The symbols.json fast path must also resolve against the git root."""
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub/fast.ipynb", [code_cell("def fast_path_func():\n    pass\n")]),
+        ])
+        symbols_path = repo / ".nb_index" / "symbols.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json")
+        # Ensure the fast path is taken: bump generated_at far into the future
+        # is unnecessary — freshness is checked against per-notebook mtimes;
+        # just verify the search works with symbols.json present.
+        r = run_search(["--symbol", "fast_path_func", str(repo / "sub")])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "fast.ipynb:0:" in r.stdout
+
+    def test_parent_of_two_repos_resolves_each_correctly(self, tmp_path):
+        """Searching from a parent dir of two git repos must resolve each repo's
+        notebook_path values against that repo's root, not against search_root."""
+        make_git_repo(tmp_path / "repoA", [
+            ("nb_a.ipynb", [code_cell("shared_needle = 'A'\n")]),
+        ])
+        make_git_repo(tmp_path / "repoB", [
+            ("deep/nb_b.ipynb", [code_cell("shared_needle = 'B'\n")]),
+        ])
+        r = run_search(["shared_needle", str(tmp_path)])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        assert len(lines) == 2, f"Expected 2 results, got: {r.stdout!r}"
+        joined = "\n".join(lines)
+        assert os.path.join("repoA", "nb_a.ipynb") + ":0:" in joined
+        assert os.path.join("repoB", "deep", "nb_b.ipynb") + ":0:" in joined
+        assert "[WARN]" not in r.stderr
+
+    def test_parent_of_two_repos_symbol_mode(self, tmp_path):
+        make_git_repo(tmp_path / "repoA", [
+            ("nb_a.ipynb", [code_cell("def func_in_a():\n    pass\n")]),
+        ])
+        make_git_repo(tmp_path / "repoB", [
+            ("nb_b.ipynb", [code_cell("def func_in_b():\n    pass\n")]),
+        ])
+        ra = run_search(["--symbol", "func_in_a", str(tmp_path)])
+        rb = run_search(["--symbol", "func_in_b", str(tmp_path)])
+        assert ra.returncode == 0 and "nb_a.ipynb:0:" in ra.stdout, (
+            f"stdout: {ra.stdout!r} stderr: {ra.stderr!r}"
+        )
+        assert rb.returncode == 0 and "nb_b.ipynb:0:" in rb.stdout, (
+            f"stdout: {rb.stdout!r} stderr: {rb.stderr!r}"
+        )
+
+    def test_out_of_scope_notebook_excluded_silently(self, tmp_path):
+        """A notebook in the same repo but outside search_root is SAFE but OUT
+        OF SCOPE: excluded from results, with no warning."""
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub1/inside.ipynb", [code_cell("scope_needle = 1\n")]),
+            ("sub2/outside.ipynb", [code_cell("scope_needle = 2\n")]),
+        ])
+        r = run_search(["scope_needle", str(repo / "sub1")])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "inside.ipynb:0:" in r.stdout
+        assert "outside.ipynb" not in r.stdout
+        # Out of scope is not unsafe — must not warn
+        assert "outside.ipynb" not in r.stderr
+        assert "[WARN]" not in r.stderr
+
+    def test_out_of_scope_excluded_in_symbol_and_import_modes(self, tmp_path):
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub1/inside.ipynb", [code_cell("import scopemod\ndef scoped_func():\n    pass\n")]),
+            ("sub2/outside.ipynb", [code_cell("import scopemod\ndef scoped_func():\n    pass\n")]),
+        ])
+        rs = run_search(["--symbol", "scoped_func", str(repo / "sub1")])
+        ri = run_search(["--import", "scopemod", str(repo / "sub1")])
+        for r in (rs, ri):
+            assert r.returncode == 0, f"stderr: {r.stderr!r}"
+            assert "inside.ipynb:0:" in r.stdout
+            assert "outside.ipynb" not in r.stdout
+            assert "[WARN]" not in r.stderr
+
+    def test_escape_of_index_base_warned_and_skipped(self, tmp_path):
+        """notebook_path escaping its own index base (the git root) is UNSAFE:
+        warned on stderr and skipped."""
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("nb.ipynb", [code_cell("escape_needle = 1\n")]),
+        ])
+        # Plant a real notebook outside the repo that the escape points at
+        make_notebook([code_cell("escape_needle = 99\n")],
+                      name="victim.ipynb", tmp_path=tmp_path)
+        idx_file = repo / ".nb_index" / "nb.ipynb.json"
+        data = json.loads(idx_file.read_text(encoding="utf-8"))
+        data["notebook_path"] = "../victim.ipynb"
+        idx_file.write_text(json.dumps(data), encoding="utf-8")
+        r = run_search(["escape_needle", str(repo)])
+        assert "Traceback" not in r.stderr
+        assert "victim.ipynb" not in r.stdout
+        assert "[WARN] invalid or unsafe notebook_path" in r.stderr
+
+    def test_escape_warned_when_searching_from_parent(self, tmp_path):
+        """Even when search_root contains the escape target, a notebook_path
+        escaping its index base must still be rejected (containment is checked
+        against the index base, not search_root)."""
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("nb.ipynb", [code_cell("parent_escape = 1\n")]),
+        ])
+        make_notebook([code_cell("parent_escape = 99\n")],
+                      name="victim.ipynb", tmp_path=tmp_path)
+        idx_file = repo / ".nb_index" / "nb.ipynb.json"
+        data = json.loads(idx_file.read_text(encoding="utf-8"))
+        data["notebook_path"] = "../victim.ipynb"
+        idx_file.write_text(json.dumps(data), encoding="utf-8")
+        # Searching from tmp_path: ../victim.ipynb resolves inside search_root
+        # but escapes the repo's index base — must still be warned and skipped.
+        r = run_search(["parent_escape", str(tmp_path)])
+        assert "Traceback" not in r.stderr
+        assert "[WARN] invalid or unsafe notebook_path" in r.stderr
+        for line in r.stdout.splitlines():
+            assert not line.startswith("victim.ipynb:"), (
+                f"escaped notebook_path must not produce a result: {line!r}"
+            )
+
+    def test_symbols_json_escape_skipped_silently_in_fast_path(self, tmp_path):
+        """Location strings in symbols.json that escape the index base must not
+        produce results."""
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("nb.ipynb", [code_cell("def sym_escape_func():\n    pass\n")]),
+        ])
+        symbols_path = repo / ".nb_index" / "symbols.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json")
+        data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        data.setdefault("symbols", {})["sym_escape_func"] = ["../victim.ipynb:0"]
+        symbols_path.write_text(json.dumps(data), encoding="utf-8")
+        r = run_search(["--symbol", "sym_escape_func", str(repo)])
+        assert "Traceback" not in r.stderr
+        assert "victim.ipynb" not in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-11 review fix: symbols.json freshness must see NESTED index files
+# ---------------------------------------------------------------------------
+
+class TestSymbolsJsonNestedFreshness:
+
+    def test_nested_index_newer_than_symbols_json_invalidates_fast_path(self, tmp_path):
+        """Git-root index dirs store per-notebook .json in subdirectories;
+        a nested index newer than symbols.json must mark it stale so the
+        serial scan (which reads the fresh nested index) runs instead of
+        the fast path serving stale symbols."""
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub/fresh.ipynb", [code_cell("def nested_fresh_symbol():\n    pass\n")]),
+        ])
+        symbols_path = repo / ".nb_index" / "symbols.json"
+        nested_index = repo / ".nb_index" / "sub" / "fresh.ipynb.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json")
+        assert nested_index.exists()
+
+        # Simulate a dropped symbols.json update (known LOCK_NB contention
+        # gap): the symbol is missing from symbols.json...
+        data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        data.get("symbols", {}).pop("nested_fresh_symbol", None)
+        symbols_path.write_text(json.dumps(data), encoding="utf-8")
+        # ...but the nested per-notebook index (which has it) is NEWER.
+        future = time.time() + 60
+        os.utime(nested_index, (future, future))
+        # Keep symbols.json's mtime in the past relative to the nested index.
+        past = time.time() - 60
+        os.utime(symbols_path, (past, past))
+
+        r = run_search(["--symbol", "nested_fresh_symbol", str(repo)])
+        assert r.returncode == 0, (
+            "Serial scan must find the symbol from the fresh nested index; "
+            f"fast path served stale symbols.json instead: {r.stderr}"
+        )
+        assert "fresh.ipynb" in r.stdout
