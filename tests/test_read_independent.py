@@ -577,6 +577,16 @@ class TestErrorHandling:
         result = run([str(f)])
         assert result.returncode != 0
 
+    def test_case_insensitive_ipynb_extension(self, tmp_path):
+        """Files with .IPYNB or .IPynb extension should be accepted (case-insensitive)."""
+        nb = make_notebook([{"cell_type": "code", "source": "x = 1"}], tmp_path)
+        # Rename to uppercase extension
+        upper_nb = tmp_path / "notebook.IPYNB"
+        nb.rename(upper_nb)
+        result = run([str(upper_nb)])
+        assert result.returncode == 0
+        assert "x = 1" in result.stdout
+
     def test_missing_file_errors(self, tmp_path):
         """Non-existent file path exits non-zero."""
         result = run([str(tmp_path / "ghost.ipynb")])

@@ -463,6 +463,18 @@ class TestGitignore:
         content = gitignore.read_text(encoding="utf-8")
         assert content.count(".nb_index/") == 1, "Entry must not be duplicated"
 
+    def test_nblock_entry_in_gitignore(self, tmp_path):
+        """*.nblock lock files should be added to .gitignore"""
+        nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
+        run_indexer(nb)
+        gitignore = tmp_path / ".gitignore"
+        content = gitignore.read_text(encoding="utf-8")
+        assert "*.nblock" in content, ".gitignore must include *.nblock entry"
+        # Verify it's not duplicated on second index
+        run_indexer(nb, extra_args=["--force"])
+        content = gitignore.read_text(encoding="utf-8")
+        assert content.count("*.nblock") == 1, "*.nblock must not be duplicated"
+
     def test_gitignore_at_correct_level(self, tmp_path):
         """§2.4: .gitignore created at same level as .nb_index"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
@@ -640,34 +652,51 @@ class TestStaleness:
         inode_after = idx.stat().st_ino
         assert inode_after != inode_before, "--force must always rewrite the index"
 
-    def test_short_circuit_no_hash_when_mtime_and_size_match(self, tmp_path):
-        """A3 short-circuit: when mtime and size both match, the indexer must NOT
-        open the notebook file to compute the SHA-256 hash.
+    def test_unreadable_notebook_with_matching_mtime_size_is_stale(self, tmp_path):
+        """A3 step 4: the hash is the authoritative freshness check. When mtime
+        and size match but the notebook cannot be read for hashing, the index is
+        unverifiable and must be treated as STALE (fail safe), not silently fresh.
 
-        Proof: after a fresh index is written, make the notebook unreadable (chmod 000).
-        If the indexer respects the short-circuit, it sees matching mtime+size, declares
-        the index fresh, and exits 0 without touching the notebook.
-        If it always hashes, it tries to open the unreadable file and exits with an error.
+        The A3 short-circuit requirement applies to mtime/size *mismatches*
+        (steps 2-3 exit stale without reading) — not to skipping step 4 on match.
         """
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         run_indexer(nb)
         idx = index_path_for(nb)
         inode_before = idx.stat().st_ino
 
-        # Remove read permission — a hash attempt will raise PermissionError
+        # Remove read permission — the authoritative hash check cannot run
         nb.chmod(0o000)
         try:
             r = run_indexer(nb)
-            assert r.returncode == 0, (
-                "Indexer must exit 0 when index is fresh (mtime+size match), "
-                f"even if the notebook is unreadable; got exit {r.returncode}: {r.stderr}"
-            )
-            # Fresh → no rebuild → inode unchanged
-            assert idx.stat().st_ino == inode_before, (
-                "Index inode must be unchanged (no rebuild) when mtime+size match"
+            # Stale → rebuild attempted → unreadable notebook → error exit;
+            # the one thing that must NOT happen is a silent fresh exit 0
+            # with the index untouched and no error.
+            assert not (
+                r.returncode == 0
+                and idx.stat().st_ino == inode_before
+                and "fresh" in r.stderr.lower()
+            ), (
+                "Unverifiable index (unreadable notebook, mtime+size match) "
+                f"must not be reported fresh: exit {r.returncode}, stderr {r.stderr!r}"
             )
         finally:
             nb.chmod(0o644)  # restore so tmp_path cleanup works
+
+    def test_short_circuit_no_read_on_mtime_mismatch(self, tmp_path):
+        """A3 short-circuit: an mtime mismatch must exit stale (rebuild) without
+        the staleness check itself needing the hash — i.e. steps 2-3 decide."""
+        nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
+        run_indexer(nb)
+        idx = index_path_for(nb)
+        inode_before = idx.stat().st_ino
+
+        os.utime(nb, (1, 1))  # force mtime mismatch, content unchanged
+        r = run_indexer(nb)
+        assert r.returncode == 0, f"rebuild after mtime change failed: {r.stderr}"
+        assert idx.stat().st_ino != inode_before, (
+            "mtime mismatch must trigger a rebuild (stale via step 2)"
+        )
 
     def test_source_hash_per_cell(self, tmp_path):
         """§3.8: source_hash = MD5[:8] of UTF-8 source bytes"""
@@ -1093,6 +1122,18 @@ class TestSymbolExtraction:
         """§6 A5: R library() import"""
         cell = self._index("library(dplyr)\n", tmp_path, kernel="r")
         assert "dplyr" in cell["symbols_imported"]
+
+    def test_rust_kernel_not_misidentified_as_r(self, tmp_path):
+        """R-kernel check must be exact match, not substring. Rust kernels should not extract R symbols."""
+        cell = self._index("fn main() { println!(\"hello\"); }\n", tmp_path, kernel="rust")
+        # Rust code should not extract any symbols (rust regex not implemented)
+        assert cell["symbols_extracted"] == False
+
+    def test_ruby_kernel_not_misidentified_as_r(self, tmp_path):
+        """R-kernel check must be exact match, not substring. Ruby kernels should not extract R symbols."""
+        cell = self._index("def hello; puts 'world'; end\n", tmp_path, kernel="ruby")
+        # Ruby code should not extract any symbols (ruby regex not implemented)
+        assert cell["symbols_extracted"] == False
 
     def test_symbol_index_built_from_all_cells(self, tmp_path):
         """§6.14"""

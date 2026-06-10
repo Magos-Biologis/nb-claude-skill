@@ -31,7 +31,7 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
-SKIP_DIRS = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".tox", ".git", ".hg"})
+SKIP_DIRS = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".tox", ".git", ".hg", ".ipynb_checkpoints"})
 MAX_WALK_DEPTH = 20
 
 # ---------------------------------------------------------------------------
@@ -122,6 +122,15 @@ def _check_staleness(index_data: dict, nb_path: Path) -> bool:
         actual_mtime = os.path.getmtime(nb_path)
         actual_size = os.path.getsize(nb_path)
     except OSError:
+        return True
+
+    # Check file size limit
+    if actual_size > MAX_FILE_SIZE:
+        try:
+            display = str(nb_path.relative_to(Path.cwd()))
+        except (ValueError, OSError):
+            display = str(nb_path)
+        print(f"[WARN] {display}: exceeds 100 MB limit, skipped", file=sys.stderr)
         return True
 
     stored_mtime = index_data.get("notebook_mtime")
@@ -252,8 +261,9 @@ def _import_matches(key: str, query: str) -> bool:
 
 def _format_result(nb_display_path: str, cell_index: int, first_line: str) -> str:
     """Format: relative/path.ipynb:N: first source line"""
+    safe_path = _sanitise(nb_display_path)
     safe_line = _sanitise(first_line)
-    return f"{nb_display_path}:{cell_index}: {safe_line}"
+    return f"{safe_path}:{cell_index}: {safe_line}"
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +434,19 @@ def _search_keyword(
         if not candidate.exists():
             continue
 
+        # Check file size before opening
+        try:
+            file_size = os.path.getsize(candidate)
+        except OSError:
+            continue
+        if file_size > MAX_FILE_SIZE:
+            try:
+                display = str(candidate.relative_to(search_root))
+            except ValueError:
+                display = str(candidate)
+            print(f"[WARN] {display}: exceeds 100 MB limit, skipped", file=sys.stderr)
+            continue
+
         try:
             with open(candidate, encoding="utf-8-sig", errors="replace") as f:
                 nb = json.load(f)
@@ -431,7 +454,17 @@ def _search_keyword(
             continue
 
         cells_raw = nb.get("cells", [])
-        index_cells = {c["i"]: c for c in index_data.get("cells", [])} if index_data else {}
+        index_cells = {}
+        if index_data:
+            try:
+                index_cells = {c["i"]: c for c in index_data.get("cells", []) if isinstance(c, dict) and "i" in c}
+            except (KeyError, TypeError):
+                try:
+                    display = str(candidate.relative_to(search_root))
+                except ValueError:
+                    display = str(candidate)
+                print(f"[WARN] {display}: malformed index, skipped", file=sys.stderr)
+                continue
 
         try:
             display = str(candidate.relative_to(search_root))
@@ -538,6 +571,8 @@ def _search_symbol(
                                     nb_idx = json.load(nf)
                                 cells_list = nb_idx.get("cells", [])
                                 for c in cells_list:
+                                    if not isinstance(c, dict) or "i" not in c:
+                                        continue
                                     if c.get("i") == cell_idx:
                                         first_line = c.get("first_line", first_line)
                                         cell_type = c.get("type", cell_type)
@@ -591,6 +626,8 @@ def _search_symbol(
                 display = str(candidate)
 
             for cell in index_data.get("cells", []):
+                if not isinstance(cell, dict) or "i" not in cell:
+                    continue
                 if query not in cell.get("symbols_defined", []):
                     continue
 
@@ -665,6 +702,8 @@ def _search_import(
                                     with open(nb_index_file, encoding="utf-8") as nf:
                                         nb_idx = json.load(nf)
                                     for c in nb_idx.get("cells", []):
+                                        if not isinstance(c, dict) or "i" not in c:
+                                            continue
                                         if c.get("i") == cell_idx:
                                             first_line = c.get("first_line", first_line)
                                             cell_type = c.get("type", "code")
@@ -716,6 +755,8 @@ def _search_import(
                 display = str(candidate)
 
             for cell in index_data.get("cells", []):
+                if not isinstance(cell, dict) or "i" not in cell:
+                    continue
                 imported = cell.get("symbols_imported", [])
                 if not any(_import_matches(k, query) for k in imported):
                     continue
@@ -754,7 +795,16 @@ def main():
                         help="Filter by cell type")
     parser.add_argument("--section", dest="section",
                         help="Filter by section name")
-    parser.add_argument("--limit", type=int, default=None,
+    def validate_limit(value_str):
+        try:
+            value = int(value_str)
+            if value < 1:
+                raise argparse.ArgumentTypeError(f"--limit must be >= 1, got {value}")
+            return value
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"--limit must be an integer, got {value_str}")
+
+    parser.add_argument("--limit", type=validate_limit, default=None,
                         help="Stop after N results")
     parser.add_argument("query", help="Search query")
     parser.add_argument("search_root", help="Directory to search")

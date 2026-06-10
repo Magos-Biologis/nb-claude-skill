@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-nb-guard.py -- PreToolUse hook that blocks direct Read/Edit/Write/MultiEdit
+nb-guard.py -- PreToolUse hook that blocks direct Read/Edit/Write/MultiEdit/NotebookEdit
 on .ipynb files and redirects Claude to the nb skill scripts.
 
 Cross-platform replacement for nb-guard.sh. Requires only Python stdlib --
@@ -8,11 +8,11 @@ no jq, no bash, works on Linux, macOS, and Windows.
 
 Exit codes:
   0 -- non-.ipynb target (or fail-open on parse error): allow the operation
-  1 -- .ipynb target detected: block and print redirect message on stdout
+  2 -- .ipynb target detected: block and print redirect message on stderr
 
-Invocation (written into settings.json by install.py):
-  Linux/macOS:  python3 /abs/path/to/nb-guard.py
-  Windows:      python  C:\abs\path\to\nb-guard.py
+Invocation (declarative hooks.json with ${CLAUDE_PLUGIN_ROOT}):
+  "command": "python3",
+  "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py"]
 """
 # NOTE: raw docstring (r"""...""") above prevents \p \a invalid-escape warnings
 # on Python 3.12+ / 3.14.
@@ -86,24 +86,21 @@ def _extract_ipynb_path(data: dict) -> str:
     Return the first .ipynb file path found in the payload, or '' if none.
 
     Handles:
-      - Read / Edit / Write:  tool_input.file_path  (fallback: tool_input.path)
-      - MultiEdit:            tool_input.edits[].file_path
+      - Read / Edit / Write / NotebookEdit:  tool_input.file_path (or .path/.notebook_path)
+      - MultiEdit:                          tool_input.file_path (top-level)
     """
     tool = data.get("tool_name", "")
     ti = data.get("tool_input", {})
 
-    if tool == "MultiEdit":
-        for edit in ti.get("edits", []):
-            fp = edit.get("file_path", "")
-            if isinstance(fp, str) and fp.endswith(".ipynb"):
-                return fp
-        return ""
-    else:
-        # Use explicit None-check to avoid silently skipping empty-string file_path
-        fp = ti.get("file_path")
-        if fp is None:
-            fp = ti.get("path")
-        return fp if isinstance(fp, str) else ""
+    # MultiEdit and most tools: check top-level file_path first
+    # NotebookEdit uses notebook_path
+    fp = ti.get("file_path")
+    if fp is None:
+        fp = ti.get("notebook_path")
+    if fp is None:
+        fp = ti.get("path")
+
+    return fp if isinstance(fp, str) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +118,7 @@ def main() -> None:
     tool = str(data.get("tool_name", ""))
     file_path = _extract_ipynb_path(data)
 
-    if not file_path.endswith(".ipynb"):
+    if not file_path.lower().endswith(".ipynb"):
         sys.exit(0)
 
     # Sanitise before echoing to prevent ANSI / newline injection
@@ -131,9 +128,9 @@ def main() -> None:
     nb_scripts = _nb_scripts_dir()
     py = _python_cmd()
 
-    # Only block the four known file-access tools. For unrecognised / missing
+    # Only block the known file-access tools. For unrecognised / missing
     # tool names, fail open rather than blocking all file I/O unexpectedly.
-    KNOWN_TOOLS = {"Read", "Edit", "Write", "MultiEdit"}
+    KNOWN_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "NotebookEdit"}
     if safe_tool not in KNOWN_TOOLS:
         sys.exit(0)
 
@@ -141,19 +138,35 @@ def main() -> None:
     # command is safe to paste into a shell and cannot be used for injection via
     # a crafted filename containing $(), backticks, or other metacharacters.
     read_cmd  = f"{py} {shlex.quote(nb_scripts + '/nb-read.py')} {shlex.quote(safe_file)}"
-    write_cmd = (f"{py} {shlex.quote(nb_scripts + '/nb-write.py')} {shlex.quote(safe_file)}"
-                 f" patch <index> -f <source_file>")
+    write_create_cmd = (f"{py} {shlex.quote(nb_scripts + '/nb-write.py')} {shlex.quote(safe_file)}"
+                        f" create")
+    write_patch_cmd  = (f"{py} {shlex.quote(nb_scripts + '/nb-write.py')} {shlex.quote(safe_file)}"
+                        f" patch <index> -f <source_file>")
 
     if safe_tool == "Read":
-        print("Blocked: do not use Read on .ipynb files — raw JSON is ~15x more tokens than needed.")
-        print("Use the nb skill instead:")
-        print(f"  {read_cmd}")
-    else:  # Edit | Write | MultiEdit
-        print(f"Blocked: do not use {safe_tool} on .ipynb files directly.")
-        print("Use the nb skill instead:")
-        print(f"  {write_cmd}")
+        msg = "Blocked: do not use Read on .ipynb files — raw JSON is ~15x more tokens than needed.\n"
+        msg += "Use the nb skill instead:\n"
+        msg += f"  {read_cmd}"
+    elif safe_tool == "Write":
+        # Check if file exists on disk
+        import os.path
+        if os.path.exists(file_path):
+            # File exists: use patch
+            msg = f"Blocked: do not use {safe_tool} on .ipynb files directly.\n"
+            msg += "Use the nb skill instead:\n"
+            msg += f"  {write_patch_cmd}"
+        else:
+            # File does not exist: use create
+            msg = f"Blocked: do not use {safe_tool} on .ipynb files directly.\n"
+            msg += "Use the nb skill instead:\n"
+            msg += f"  {write_create_cmd}"
+    else:  # Edit | MultiEdit | NotebookEdit
+        msg = f"Blocked: do not use {safe_tool} on .ipynb files directly.\n"
+        msg += "Use the nb skill instead:\n"
+        msg += f"  {write_patch_cmd}"
 
-    sys.exit(1)
+    sys.stderr.write(msg + "\n")
+    sys.exit(2)
 
 
 if __name__ == "__main__":

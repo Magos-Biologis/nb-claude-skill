@@ -28,11 +28,12 @@ def _payload(tool_name: str, file_path: str | None = None,
              edits: list | None = None) -> str:
     """Build a realistic hook payload JSON string."""
     if tool_name == "MultiEdit":
-        # Use provided edits (even empty list); only fall back to default if None
-        if edits is None:
-            edits = [{"file_path": file_path or "nb.ipynb",
-                      "old_string": "x", "new_string": "y"}]
-        tool_input = {"edits": edits}
+        # MultiEdit has a top-level file_path and edits[] with only old_string/new_string/replace_all
+        tool_input = {"file_path": file_path or "nb.ipynb"}
+        if edits is not None:
+            tool_input["edits"] = edits
+        else:
+            tool_input["edits"] = [{"old_string": "x", "new_string": "y"}]
     else:
         tool_input = {}
         if file_path is not None:
@@ -71,8 +72,8 @@ class TestBlocking:
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write"])
     def test_ipynb_blocked(self, tool):
         r = run_guard(_payload(tool, "analysis.ipynb"))
-        assert r.returncode == 1, (
-            f"{tool} on .ipynb must exit 1, got {r.returncode}\n"
+        assert r.returncode == 2, (
+            f"{tool} on .ipynb must exit 2, got {r.returncode}\n"
             f"stdout: {r.stdout!r}\nstderr: {r.stderr!r}"
         )
 
@@ -82,38 +83,38 @@ class TestBlocking:
         assert r.returncode == 0
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write"])
-    def test_message_on_stdout_not_stderr(self, tool):
+    def test_message_on_stderr_not_stdout(self, tool):
         r = run_guard(_payload(tool, "nb.ipynb"))
-        assert r.returncode == 1
-        assert r.stdout.strip() != "", "Redirect message must go to stdout"
+        assert r.returncode == 2
+        assert r.stderr.strip() != "", "Redirect message must go to stderr"
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write"])
     def test_blocked_message_contains_blocked(self, tool):
         r = run_guard(_payload(tool, "nb.ipynb"))
-        assert "Blocked" in r.stdout
+        assert "Blocked" in r.stderr
 
     def test_read_message_references_nb_read_py(self):
         r = run_guard(_payload("Read", "nb.ipynb"))
-        assert "nb-read.py" in r.stdout
+        assert "nb-read.py" in r.stderr
 
     @pytest.mark.parametrize("tool", ["Edit", "Write"])
     def test_write_tools_reference_nb_write_py(self, tool):
         r = run_guard(_payload(tool, "nb.ipynb"))
-        assert "nb-write.py" in r.stdout
+        assert "nb-write.py" in r.stderr
 
     def test_subdirectory_path_blocked(self):
         r = run_guard(_payload("Read", "notebooks/data/analysis.ipynb"))
-        assert r.returncode == 1
+        assert r.returncode == 2
 
     def test_non_ipynb_no_blocking_message(self):
         r = run_guard(_payload("Read", "data.csv"))
         assert r.returncode == 0
-        assert "Blocked" not in r.stdout
+        assert "Blocked" not in r.stderr
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write"])
     def test_message_contains_file_path(self, tool):
         r = run_guard(_payload(tool, "project/analysis.ipynb"))
-        assert "project/analysis.ipynb" in r.stdout
+        assert "project/analysis.ipynb" in r.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -123,31 +124,28 @@ class TestBlocking:
 class TestMultiEdit:
 
     def test_multiedit_with_ipynb_blocked(self):
-        payload = _payload("MultiEdit", edits=[
-            {"file_path": "analysis.ipynb", "old_string": "x", "new_string": "y"}
-        ])
+        payload = _payload("MultiEdit", file_path="analysis.ipynb")
         r = run_guard(payload)
-        assert r.returncode == 1
+        assert r.returncode == 2
 
     def test_multiedit_without_ipynb_allowed(self):
-        payload = _payload("MultiEdit", edits=[
-            {"file_path": "script.py", "old_string": "x", "new_string": "y"},
-            {"file_path": "util.py",   "old_string": "a", "new_string": "b"},
-        ])
+        payload = _payload("MultiEdit", file_path="script.py")
         r = run_guard(payload)
         assert r.returncode == 0
 
-    def test_multiedit_mixed_blocked_on_first_ipynb(self):
-        payload = _payload("MultiEdit", edits=[
-            {"file_path": "script.py",   "old_string": "x", "new_string": "y"},
-            {"file_path": "nb.ipynb",    "old_string": "a", "new_string": "b"},
-            {"file_path": "readme.md",   "old_string": "c", "new_string": "d"},
-        ])
+    def test_multiedit_with_py_allowed(self):
+        payload = _payload("MultiEdit", file_path="util.py")
         r = run_guard(payload)
-        assert r.returncode == 1
+        assert r.returncode == 0
+
+    def test_multiedit_with_ipynb_shows_blocked(self):
+        payload = _payload("MultiEdit", file_path="nb.ipynb")
+        r = run_guard(payload)
+        assert r.returncode == 2
+        assert "Blocked" in r.stderr
 
     def test_multiedit_empty_edits_allowed(self):
-        payload = _payload("MultiEdit", edits=[])
+        payload = _payload("MultiEdit", file_path="script.py")
         r = run_guard(payload)
         assert r.returncode == 0
 
@@ -166,7 +164,7 @@ class TestPathKeyFallback:
             "session_id": "x",
         })
         r = run_guard(payload)
-        assert r.returncode == 1, (
+        assert r.returncode == 2, (
             "tool_input.path fallback must detect .ipynb and block"
         )
 
@@ -251,7 +249,7 @@ class TestNoDependencies:
         monkeypatch.setenv("PATH", str(tmp_path))
         r = run_guard(_payload("Read", "nb.ipynb"))
         # Must still block correctly — Python stdlib handles the JSON
-        assert r.returncode == 1
+        assert r.returncode == 2
 
     def test_no_bash_required(self):
         """nb-guard.py is invoked directly as Python — bash is not needed."""
@@ -259,7 +257,7 @@ class TestNoDependencies:
         # sys.executable (python), not bash. If the script required bash
         # internals it would fail here.
         r = run_guard(_payload("Edit", "test.ipynb"))
-        assert r.returncode == 1
+        assert r.returncode == 2
 
 
 # ---------------------------------------------------------------------------
@@ -271,18 +269,119 @@ class TestRedirectMessage:
     def test_redirect_message_contains_python_command(self):
         """The redirect message must show a runnable Python command."""
         r = run_guard(_payload("Read", "nb.ipynb"))
-        assert r.returncode == 1
+        assert r.returncode == 2
         # Must contain python3, python, or py (Windows Python Launcher) in the command
-        assert ("python3" in r.stdout or "python " in r.stdout
-                or "py " in r.stdout or "py -3" in r.stdout), (
-            f"Expected python cmd in message: {r.stdout!r}"
+        assert ("python3" in r.stderr or "python " in r.stderr
+                or "py " in r.stderr or "py -3" in r.stderr), (
+            f"Expected python cmd in message: {r.stderr!r}"
         )
 
     def test_redirect_message_contains_absolute_scripts_path(self):
         """The redirect message must contain the absolute path to the scripts dir."""
         r = run_guard(_payload("Read", "nb.ipynb"))
-        assert r.returncode == 1
+        assert r.returncode == 2
         # Must reference nb-read.py with an absolute path (starts with /)
         # or contain the skills/nb/scripts directory reference
-        assert "nb-read.py" in r.stdout
-        assert os.sep in r.stdout or "/" in r.stdout
+        assert "nb-read.py" in r.stderr
+        assert os.sep in r.stderr or "/" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# NotebookEdit
+# ---------------------------------------------------------------------------
+
+class TestNotebookEdit:
+
+    def test_notebookedit_with_ipynb_blocked(self):
+        """NotebookEdit on .ipynb must be blocked."""
+        payload = json.dumps({
+            "tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": "analysis.ipynb"},
+            "session_id": "test",
+        })
+        r = subprocess.run(
+            [sys.executable, str(GUARD_PY)],
+            input=payload,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 2, (
+            f"NotebookEdit on .ipynb must exit 2, got {r.returncode}\n"
+            f"stderr: {r.stderr!r}"
+        )
+
+    def test_notebookedit_message_on_stderr(self):
+        """NotebookEdit block message must go to stderr."""
+        payload = json.dumps({
+            "tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": "nb.ipynb"},
+            "session_id": "test",
+        })
+        r = subprocess.run(
+            [sys.executable, str(GUARD_PY)],
+            input=payload,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 2
+        assert "Blocked" in r.stderr
+        assert "nb-write.py" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Write to new file
+# ---------------------------------------------------------------------------
+
+class TestWriteToNewFile:
+
+    def test_write_to_new_ipynb_suggests_create(self, tmp_path, monkeypatch):
+        """Write to a new .ipynb file should suggest 'create', not 'patch'."""
+        # Ensure the file does not exist
+        new_file = str(tmp_path / "newfile.ipynb")
+        assert not os.path.exists(new_file)
+
+        # Change to tmp_path to test with a non-existent path
+        monkeypatch.chdir(tmp_path)
+
+        payload = json.dumps({
+            "tool_name": "Write",
+            "tool_input": {"file_path": "newfile.ipynb"},
+            "session_id": "test",
+        })
+        r = subprocess.run(
+            [sys.executable, str(GUARD_PY)],
+            input=payload,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 2
+        assert "create" in r.stderr, (
+            f"Write to new .ipynb should suggest 'create', got: {r.stderr!r}"
+        )
+        assert "patch" not in r.stderr or "create" in r.stderr.split("patch")[0], (
+            f"Should suggest 'create' before any 'patch' mention: {r.stderr!r}"
+        )
+
+    def test_write_to_existing_ipynb_suggests_patch(self, tmp_path, monkeypatch):
+        """Write to an existing .ipynb file should suggest 'patch'."""
+        # Create a temporary ipynb file
+        existing_file = tmp_path / "existing.ipynb"
+        existing_file.write_text("{}")
+
+        monkeypatch.chdir(tmp_path)
+
+        payload = json.dumps({
+            "tool_name": "Write",
+            "tool_input": {"file_path": "existing.ipynb"},
+            "session_id": "test",
+        })
+        r = subprocess.run(
+            [sys.executable, str(GUARD_PY)],
+            input=payload,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 2
+        assert "patch" in r.stderr, (
+            f"Write to existing .ipynb should suggest 'patch', got: {r.stderr!r}"
+        )

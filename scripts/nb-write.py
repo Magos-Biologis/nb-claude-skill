@@ -315,6 +315,13 @@ def cmd_create(path):
             os.link(tmp_path, path)
             os.unlink(tmp_path)
             tmp_path = None
+        except FileExistsError:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            die(f"file already exists: '{path}'")
         except (AttributeError, NotImplementedError, OSError):
             # Fallback for Windows or filesystems that don't support hard links:
             if os.path.exists(path):
@@ -323,13 +330,6 @@ def cmd_create(path):
                 die(f"file already exists: '{path}'")
             os.replace(tmp_path, path)
             tmp_path = None
-    except FileExistsError:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-        die(f"file already exists: '{path}'")
     except OSError as e:
         if tmp_path:
             try:

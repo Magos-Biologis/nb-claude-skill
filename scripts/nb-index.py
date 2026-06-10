@@ -200,9 +200,9 @@ def _index_file_path(nb_path: Path) -> tuple[Path, Path, Path | None]:
 # ---------------------------------------------------------------------------
 
 def _update_gitignore(index_dir: Path) -> None:
-    """Append '.nb_index/' to .gitignore at the same level as index_dir."""
+    """Append '.nb_index/' and '*.nblock' to .gitignore at the same level as index_dir."""
     gitignore = index_dir.parent / ".gitignore"
-    entry = ".nb_index/"
+    entries = [".nb_index/", "*.nblock"]
 
     if gitignore.is_symlink():
         print(f"[warn] .gitignore is a symlink — skipping gitignore update",
@@ -212,16 +212,18 @@ def _update_gitignore(index_dir: Path) -> None:
     try:
         if gitignore.exists():
             content = gitignore.read_text(encoding="utf-8")
-            # Check if entry already present (as a whole line)
-            for line in content.splitlines():
-                if line.strip() == entry:
-                    return  # already present
-            # Append (ensure newline before entry)
+            existing_lines = set(line.strip() for line in content.splitlines())
+            # Check which entries are missing
+            to_add = [e for e in entries if e not in existing_lines]
+            if not to_add:
+                return  # all entries already present
+            # Append missing entries
             if content and not content.endswith("\n"):
                 content += "\n"
-            content += entry + "\n"
+            for entry in to_add:
+                content += entry + "\n"
         else:
-            content = entry + "\n"
+            content = "\n".join(entries) + "\n"
         gitignore.write_text(content, encoding="utf-8")
     except OSError as e:
         print(f"[warn] could not update .gitignore: {e}", file=sys.stderr)
@@ -295,9 +297,9 @@ def _index_is_stale(index_file: Path, nb_path: Path, force: bool) -> tuple[bool,
         if current_hash != stored_hash:
             return True, mtime, size
     except OSError:
-        # Cannot read file for hashing — if mtime+size matched we already
-        # committed to checking hash; treat as fresh (short-circuit behaviour).
-        pass
+        # Cannot read file for hashing — fail safe: an unverifiable index
+        # must be treated as stale, not silently trusted.
+        return True, mtime, size
 
     # All match → fresh
     return False, mtime, size
@@ -431,7 +433,7 @@ def _extract_symbols(source_str: str, lang: str) -> tuple[list, list, bool]:
 
         return (_cap_symbols(defined), _cap_symbols(imported), True)
 
-    elif "r" in lang_lower and "ir" not in lang_lower:
+    elif lang_lower == "r":
         defined  = R_FUNC_RE.findall(filtered)
         imported = R_LIB_RE.findall(filtered)
         return (_cap_symbols(defined), _cap_symbols(imported), True)

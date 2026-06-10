@@ -60,11 +60,16 @@ class TestHooksManifest:
     def _load(self):
         return json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())
 
-    def _nb_guard_commands(self):
+    def _nb_guard_hooks(self):
+        """Return all hook entries for nb-guard."""
         data = self._load()
         entries = data.get("hooks", {}).get("PreToolUse", [])
-        return [h["command"] for e in entries for h in e.get("hooks", [])
-                if "nb-guard" in h.get("command", "")]
+        hooks = []
+        for e in entries:
+            for h in e.get("hooks", []):
+                if "nb-guard" in h.get("command", "") or any("nb-guard" in a for a in h.get("args", [])):
+                    hooks.append(h)
+        return hooks
 
     def test_hooks_json_exists(self):
         assert (REPO_ROOT / "hooks" / "hooks.json").exists()
@@ -85,45 +90,80 @@ class TestHooksManifest:
             "nb hook must not fire on PostToolUse"
         )
 
-    def test_hook_matcher_covers_all_four_tools(self):
+    def test_hook_matcher_covers_all_five_tools(self):
         data = self._load()
         entries = data["hooks"]["PreToolUse"]
         matchers = " | ".join(e.get("matcher", "") for e in entries)
-        for tool in ("Read", "Edit", "Write", "MultiEdit"):
+        for tool in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
             assert tool in matchers, f"hooks.json matcher must cover {tool!r}"
 
     def test_hook_uses_plugin_root_env_var(self):
-        cmds = self._nb_guard_commands()
-        assert cmds, "No nb-guard command found in hooks.json"
-        assert any("${CLAUDE_PLUGIN_ROOT}" in cmd for cmd in cmds), (
-            "hook command must use ${CLAUDE_PLUGIN_ROOT} for runtime path resolution, "
-            "not a hardcoded absolute path"
-        )
+        data = self._load()
+        entries = data["hooks"]["PreToolUse"]
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                if "nb-guard" in h.get("command", ""):
+                    args = h.get("args", [])
+                    assert any("${CLAUDE_PLUGIN_ROOT}" in arg for arg in args), (
+                        "hook args must use ${CLAUDE_PLUGIN_ROOT}, not hardcoded path"
+                    )
 
-    def test_no_absolute_paths_in_hook_command(self):
-        for cmd in self._nb_guard_commands():
-            stripped = cmd.replace("${CLAUDE_PLUGIN_ROOT}", "")
-            assert not re.search(r"(/home/|/Users/|[A-Z]:\\\\)", stripped), (
-                f"Hardcoded absolute path in hook command: {cmd!r}"
-            )
+    def test_no_absolute_paths_in_hook_args(self):
+        data = self._load()
+        entries = data["hooks"]["PreToolUse"]
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                if "nb-guard" in h.get("command", ""):
+                    args = h.get("args", [])
+                    for arg in args:
+                        stripped = arg.replace("${CLAUDE_PLUGIN_ROOT}", "")
+                        assert not re.search(r"(/home/|/Users/|[A-Z]:\\\\)", stripped), (
+                            f"Hardcoded absolute path in hook args: {arg!r}"
+                        )
 
     def test_hook_uses_python3(self):
-        cmds = self._nb_guard_commands()
-        assert cmds, "No nb-guard command found"
-        assert all(c.lstrip().startswith("python3") for c in cmds), (
-            "hook must invoke python3, not bash or sh"
-        )
+        data = self._load()
+        entries = data["hooks"]["PreToolUse"]
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                if "nb-guard" in h.get("command", ""):
+                    assert h.get("command") == "python3", (
+                        f"hook command must be 'python3': {h}"
+                    )
 
-    def test_hook_references_nb_guard_py(self):
-        cmds = self._nb_guard_commands()
-        assert any("nb-guard.py" in c for c in cmds)
+    def test_hook_references_nb_guard_py_in_args(self):
+        data = self._load()
+        entries = data["hooks"]["PreToolUse"]
+        found = False
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                if "nb-guard" in h.get("command", "") or any("nb-guard" in a for a in h.get("args", [])):
+                    assert any("nb-guard.py" in a for a in h.get("args", [])), (
+                        f"hook args must reference nb-guard.py: {h}"
+                    )
+                    found = True
+        assert found, "No nb-guard hook found in hooks.json"
+
+    def test_hook_uses_exec_form(self):
+        """Hook must use exec-form (command + args), not shell-form string."""
+        data = self._load()
+        entries = data["hooks"]["PreToolUse"]
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                if "nb-guard" in h.get("command", ""):
+                    assert isinstance(h.get("args"), list), (
+                        f"hook must use exec-form with 'args' list: {h}"
+                    )
+                    assert len(h.get("args", [])) > 0, (
+                        f"hook args must not be empty: {h}"
+                    )
 
     def test_hook_type_is_command(self):
         data = self._load()
         entries = data["hooks"]["PreToolUse"]
         for entry in entries:
             for h in entry.get("hooks", []):
-                if "nb-guard" in h.get("command", ""):
+                if "nb-guard" in h.get("command", "") or any("nb-guard" in a for a in h.get("args", [])):
                     assert h.get("type") == "command", (
                         f"hook 'type' must be 'command': {h}"
                     )

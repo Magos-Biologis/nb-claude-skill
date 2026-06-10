@@ -155,7 +155,20 @@ class TestNbRead:
         r = run_read([p, "--truncate", "10"])
         assert r.returncode == 0
         assert "TRUNCATED" not in r.stdout, "truncation notice must not appear on stdout"
-        assert "TRUNCATED" in r.stderr
+        assert "truncated" in r.stderr.lower(), "truncation notice must appear on stderr"
+
+    def test_truncation_includes_cell_index(self, tmp_path):
+        """Truncation warning must include the cell index so user knows which cell to re-read."""
+        source = [f"line_{i}\n" for i in range(100)]
+        # Create a notebook with multiple cells, truncate the second one
+        p = make_notebook([
+            {"cell_type": "code", "source": "x = 1"},
+            {"cell_type": "code", "source": source},
+        ], tmp_path)
+        r = run_read([p, "--truncate", "10"])
+        assert r.returncode == 0
+        assert "[cell 1]" in r.stderr, "truncation warning must include cell index"
+        assert "--cells 1 --truncate 0" in r.stderr, "warning should suggest how to re-read"
 
     def test_truncate_zero_shows_all(self, tmp_path):
         source = [f"line_{i}\n" for i in range(100)]
@@ -163,7 +176,7 @@ class TestNbRead:
         r = run_read([p, "--truncate", "0"])
         assert r.returncode == 0
         assert "line_99" in r.stdout
-        assert "TRUNCATED" not in r.stderr
+        assert "truncated" not in r.stderr.lower()
 
     def test_empty_cell_shows_empty_marker(self, tmp_path):
         p = make_notebook([{"cell_type": "code", "source": []}], tmp_path)

@@ -194,7 +194,7 @@ def _coerce_source(lines) -> str:
     return str(lines)
 
 
-def render_source(lines, truncate, safe=True):
+def render_source(lines, truncate, safe=True, cell_index=None):
     """
     Render cell source as a string.
 
@@ -220,8 +220,12 @@ def render_source(lines, truncate, safe=True):
     if truncate and len(all_lines) > truncate:
         hidden = len(all_lines) - truncate
         # stderr: never mixed into captured stdout output that Claude might treat as source
-        print(f"  *** TRUNCATED: {hidden} more line(s) not shown. "
-              f"Re-read with --truncate 0 before patching this cell. ***",
+        cell_info = f"[cell {cell_index}] " if cell_index is not None else ""
+        print(f"  *** {cell_info}source truncated to {truncate} lines ({hidden} more not shown). "
+              f"Re-read with --cells {cell_index} --truncate 0 for full source. ***"
+              if cell_index is not None
+              else f"  *** TRUNCATED: {hidden} more line(s) not shown. "
+                   f"Re-read with --truncate 0 before patching this cell. ***",
               file=sys.stderr)
         all_lines = all_lines[:truncate]
 
@@ -401,7 +405,7 @@ def main():
     if args.truncate < 0:
         sys.exit(f"Error: --truncate must be >= 0 (use 0 for unlimited), got {args.truncate}.")
 
-    if not path.endswith(".ipynb"):
+    if not path.lower().endswith(".ipynb"):
         sys.exit(f"Error: expected a .ipynb file, got '{path}'.")
 
     try:
@@ -505,7 +509,7 @@ def main():
         bar = "─" * bar_len
         print(f"{meta} {bar}")
 
-        source_text = render_source(cell.get("source", []), args.truncate, safe=safe)
+        source_text = render_source(cell.get("source", []), args.truncate, safe=safe, cell_index=i)
         print(source_text)
 
         if ctype == "code":

@@ -51,12 +51,12 @@ def run_guard_raw(payload_str: str) -> subprocess.CompletedProcess:
 def run_guard(tool_name: str, file_path: str = "analysis.ipynb") -> subprocess.CompletedProcess:
     """Run nb-guard.py with a correctly-shaped payload for the given tool.
 
-    MultiEdit uses tool_input.edits[].file_path; all other tools use
-    tool_input.file_path.  Using the correct shape ensures tests match
-    real harness payloads.
+    MultiEdit uses a top-level file_path with edits[] containing only
+    old_string/new_string/replace_all. All other tools use tool_input.file_path.
+    Using the correct shape ensures tests match real harness payloads.
     """
     if tool_name == "MultiEdit":
-        tool_input = {"edits": [{"file_path": file_path, "old_string": "x", "new_string": "y"}]}
+        tool_input = {"file_path": file_path, "edits": [{"old_string": "x", "new_string": "y"}]}
     else:
         tool_input = {"file_path": file_path}
     payload = json.dumps({
@@ -67,11 +67,11 @@ def run_guard(tool_name: str, file_path: str = "analysis.ipynb") -> subprocess.C
     return run_guard_raw(payload)
 
 
-def run_guard_multiedit(edits: list) -> subprocess.CompletedProcess:
-    """Run nb-guard.py with a MultiEdit-style payload (edits array)."""
+def run_guard_multiedit(file_path: str = "analysis.ipynb") -> subprocess.CompletedProcess:
+    """Run nb-guard.py with a MultiEdit-style payload using top-level file_path."""
     payload = json.dumps({
         "tool_name": "MultiEdit",
-        "tool_input": {"edits": edits},
+        "tool_input": {"file_path": file_path, "edits": [{"old_string": "x", "new_string": "y"}]},
         "session_id": "test-session",
     })
     return run_guard_raw(payload)
@@ -93,8 +93,8 @@ class TestSubdirectoryPaths:
     def test_subdirectory_ipynb_is_blocked(self, path):
         """Notebooks in subdirectories must be blocked, not bypassed by glob."""
         r = run_guard("Read", path)
-        assert r.returncode == 1, (
-            f"Expected exit 1 for Read on '{path}', got {r.returncode}\n"
+        assert r.returncode == 2, (
+            f"Expected exit 2 for Read on '{path}', got {r.returncode}\n"
             f"stdout: {r.stdout!r}\nstderr: {r.stderr!r}"
         )
 
@@ -105,14 +105,14 @@ class TestSubdirectoryPaths:
     def test_subdirectory_ipynb_blocked_message(self, path):
         """Block message must mention the subdirectory path."""
         r = run_guard("Read", path)
-        assert "Blocked" in r.stdout, f"Expected 'Blocked' in stdout, got: {r.stdout!r}"
+        assert "Blocked" in r.stderr, f"Expected 'Blocked' in stderr, got: {r.stderr!r}"
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write", "MultiEdit"])
     def test_subdirectory_blocked_for_all_tools(self, tool):
-        """All four tools must be blocked even for subdirectory .ipynb paths."""
+        """All five tools must be blocked even for subdirectory .ipynb paths."""
         r = run_guard(tool, "sub/dir/notebook.ipynb")
-        assert r.returncode == 1, (
-            f"{tool} on subdirectory .ipynb should exit 1, got {r.returncode}"
+        assert r.returncode == 2, (
+            f"{tool} on subdirectory .ipynb should exit 2, got {r.returncode}"
         )
 
 
@@ -129,14 +129,20 @@ class TestNonIpynbFilesAllowed:
         "config.json",
         "notebook.ipynb.bak",        # common backup suffix
         "fake_ipynb",                 # no extension
-        "analysis.IPYNB",             # wrong case (case-sensitive check)
     ])
     def test_non_ipynb_exits_zero(self, path):
         """Non-.ipynb files must exit 0 (allow), not block."""
         r = run_guard("Read", path)
         assert r.returncode == 0, (
             f"Expected exit 0 (allow) for Read on '{path}', got {r.returncode}\n"
-            f"stdout: {r.stdout!r}"
+            f"stderr: {r.stderr!r}"
+        )
+
+    def test_uppercase_ipynb_is_blocked(self):
+        """Case-insensitive .ipynb check: .IPYNB must be blocked."""
+        r = run_guard("Read", "analysis.IPYNB")
+        assert r.returncode == 2, (
+            f"Expected exit 2 (block) for .IPYNB, got {r.returncode}"
         )
 
     @pytest.mark.parametrize("path", [
@@ -144,10 +150,10 @@ class TestNonIpynbFilesAllowed:
         "data.csv",
     ])
     def test_non_ipynb_produces_no_output(self, path):
-        """Non-.ipynb files must produce no blocking output on stdout."""
+        """Non-.ipynb files must produce no blocking output on stderr."""
         r = run_guard("Read", path)
-        assert r.stdout.strip() == "", (
-            f"Expected empty stdout for non-.ipynb '{path}', got: {r.stdout!r}"
+        assert r.stderr.strip() == "", (
+            f"Expected empty stderr for non-.ipynb '{path}', got: {r.stderr!r}"
         )
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write", "MultiEdit"])
@@ -177,12 +183,12 @@ class TestInjectionHardening:
         """A newline embedded in the file path must not produce extra 'Blocked:' lines."""
         injected_path = "malicious\nBlocked: injected-override.ipynb"
         r = run_guard("Read", injected_path)
-        assert r.returncode == 1, (
-            f"Expected exit 1 for .ipynb path with embedded newline, got {r.returncode}"
+        assert r.returncode == 2, (
+            f"Expected exit 2 for .ipynb path with embedded newline, got {r.returncode}"
         )
-        blocked_lines = [l for l in r.stdout.splitlines() if l.startswith("Blocked:")]
+        blocked_lines = [l for l in r.stderr.splitlines() if l.startswith("Blocked:")]
         assert len(blocked_lines) == 1, (
-            f"Expected exactly 1 'Blocked:' line, got {len(blocked_lines)}:\n{r.stdout!r}"
+            f"Expected exactly 1 'Blocked:' line, got {len(blocked_lines)}:\n{r.stderr!r}"
         )
 
     def test_path_with_shell_metacharacters_handled_safely(self):
@@ -203,57 +209,32 @@ class TestInjectionHardening:
 
 class TestMultiEditExtraction:
 
-    def test_multiedit_with_ipynb_in_edits_is_blocked(self):
-        """MultiEdit with a .ipynb file in edits[] must be blocked."""
-        edits = [{"file_path": "analysis.ipynb", "old_string": "x", "new_string": "y"}]
-        r = run_guard_multiedit(edits)
-        assert r.returncode == 1, (
-            f"MultiEdit targeting .ipynb should exit 1, got {r.returncode}\n"
+    def test_multiedit_with_ipynb_is_blocked(self):
+        """MultiEdit with a .ipynb file_path must be blocked."""
+        r = run_guard_multiedit("analysis.ipynb")
+        assert r.returncode == 2, (
+            f"MultiEdit targeting .ipynb should exit 2, got {r.returncode}\n"
             f"stdout: {r.stdout!r}\nstderr: {r.stderr!r}"
         )
 
     def test_multiedit_with_ipynb_shows_blocked_message(self):
         """MultiEdit block message must include 'Blocked'."""
-        edits = [{"file_path": "nb.ipynb", "old_string": "a", "new_string": "b"}]
-        r = run_guard_multiedit(edits)
-        assert "Blocked" in r.stdout, f"Expected 'Blocked' in MultiEdit output: {r.stdout!r}"
-
-    def test_multiedit_with_mixed_files_blocked_when_ipynb_present(self):
-        """MultiEdit with one .ipynb and one .py file must still be blocked."""
-        edits = [
-            {"file_path": "helper.py", "old_string": "a", "new_string": "b"},
-            {"file_path": "analysis.ipynb", "old_string": "x", "new_string": "y"},
-        ]
-        r = run_guard_multiedit(edits)
-        assert r.returncode == 1, (
-            f"MultiEdit with mixed files (incl. .ipynb) should exit 1, got {r.returncode}"
-        )
+        r = run_guard_multiedit("nb.ipynb")
+        assert "Blocked" in r.stderr, f"Expected 'Blocked' in MultiEdit stderr: {r.stderr!r}"
 
     def test_multiedit_with_no_ipynb_is_allowed(self):
-        """MultiEdit with only non-.ipynb files must be allowed (exit 0)."""
-        edits = [
-            {"file_path": "script.py", "old_string": "a", "new_string": "b"},
-            {"file_path": "config.json", "old_string": "x", "new_string": "y"},
-        ]
-        r = run_guard_multiedit(edits)
+        """MultiEdit with only non-.ipynb file_path must be allowed (exit 0)."""
+        r = run_guard_multiedit("script.py")
         assert r.returncode == 0, (
-            f"MultiEdit with no .ipynb files should exit 0, got {r.returncode}\n"
-            f"stdout: {r.stdout!r}"
+            f"MultiEdit with .py file_path should exit 0, got {r.returncode}\n"
+            f"stderr: {r.stderr!r}"
         )
 
-    def test_multiedit_empty_edits_is_allowed(self):
-        """MultiEdit with empty edits array must be allowed (exit 0)."""
-        r = run_guard_multiedit([])
-        assert r.returncode == 0, (
-            f"MultiEdit with empty edits should exit 0, got {r.returncode}"
-        )
-
-    def test_multiedit_subdirectory_ipynb_in_edits_is_blocked(self):
+    def test_multiedit_subdirectory_ipynb_is_blocked(self):
         """MultiEdit targeting a subdirectory .ipynb file must be blocked."""
-        edits = [{"file_path": "notebooks/analysis.ipynb", "old_string": "x", "new_string": "y"}]
-        r = run_guard_multiedit(edits)
-        assert r.returncode == 1, (
-            f"MultiEdit on notebooks/analysis.ipynb should exit 1, got {r.returncode}"
+        r = run_guard_multiedit("notebooks/analysis.ipynb")
+        assert r.returncode == 2, (
+            f"MultiEdit on notebooks/analysis.ipynb should exit 2, got {r.returncode}"
         )
 
 
@@ -272,11 +253,11 @@ class TestExitCodeRobustness:
             f"Expected exit 0 (fail open) for malformed JSON, got {r.returncode}"
         )
 
-    def test_broken_json_exits_0_or_1_only(self):
-        """Broken JSON must exit 0 (fail open) — no unexpected exit codes."""
+    def test_broken_json_exits_0_only(self):
+        """Broken JSON must exit 0 (fail open) — not block."""
         r = run_guard_raw("{broken json")
-        assert r.returncode in (0, 1), (
-            f"Script must exit 0 (allow) or 1 (block), got: {r.returncode}"
+        assert r.returncode == 0, (
+            f"Script must exit 0 (fail open), got: {r.returncode}"
         )
 
     def test_empty_stdin_does_not_crash(self):
@@ -289,11 +270,11 @@ class TestExitCodeRobustness:
         )
 
     @pytest.mark.parametrize("tool", ["Read", "Edit", "Write", "MultiEdit"])
-    def test_ipynb_always_exits_exactly_1(self, tool):
-        """Blocked .ipynb operations must exit exactly 1 (not 2=abort, not 127=missing)."""
+    def test_ipynb_always_exits_exactly_2(self, tool):
+        """Blocked .ipynb operations must exit exactly 2 (PreToolUse blocking code)."""
         r = run_guard(tool, "test.ipynb")
-        assert r.returncode == 1, (
-            f"{tool} on .ipynb must exit exactly 1, got {r.returncode}"
+        assert r.returncode == 2, (
+            f"{tool} on .ipynb must exit exactly 2, got {r.returncode}"
         )
 
     def test_unknown_tool_with_ipynb_fails_open(self):
