@@ -89,7 +89,6 @@ def _extract_ipynb_path(data: dict) -> str:
       - Read / Edit / Write / NotebookEdit:  tool_input.file_path (or .path/.notebook_path)
       - MultiEdit:                          tool_input.file_path (top-level)
     """
-    tool = data.get("tool_name", "")
     ti = data.get("tool_input", {})
 
     # MultiEdit and most tools: check top-level file_path first
@@ -137,11 +136,12 @@ def main() -> None:
     # Use shlex.quote for both the script path and the file path so the printed
     # command is safe to paste into a shell and cannot be used for injection via
     # a crafted filename containing $(), backticks, or other metacharacters.
-    read_cmd  = f"{py} {shlex.quote(nb_scripts + '/nb-read.py')} {shlex.quote(safe_file)}"
-    write_create_cmd = (f"{py} {shlex.quote(nb_scripts + '/nb-write.py')} {shlex.quote(safe_file)}"
-                        f" create")
-    write_patch_cmd  = (f"{py} {shlex.quote(nb_scripts + '/nb-write.py')} {shlex.quote(safe_file)}"
-                        f" patch <index> -f <source_file>")
+    read_cmd  = (f"{py} {shlex.quote(os.path.join(nb_scripts, 'nb-read.py'))}"
+                 f" {shlex.quote(safe_file)}")
+    write_create_cmd = (f"{py} {shlex.quote(os.path.join(nb_scripts, 'nb-write.py'))}"
+                        f" {shlex.quote(safe_file)} create")
+    write_patch_cmd  = (f"{py} {shlex.quote(os.path.join(nb_scripts, 'nb-write.py'))}"
+                        f" {shlex.quote(safe_file)} patch <index> -f <source_file>")
 
     if safe_tool == "Read":
         msg = "Blocked: do not use Read on .ipynb files — raw JSON is ~15x more tokens than needed.\n"
@@ -149,7 +149,6 @@ def main() -> None:
         msg += f"  {read_cmd}"
     elif safe_tool == "Write":
         # Check if file exists on disk
-        import os.path
         if os.path.exists(file_path):
             # File exists: use patch
             msg = f"Blocked: do not use {safe_tool} on .ipynb files directly.\n"

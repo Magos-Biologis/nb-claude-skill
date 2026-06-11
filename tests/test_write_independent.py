@@ -18,7 +18,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 SCRIPT = str(Path(__file__).parent.parent / "scripts" / "nb-write.py")
-PYTHON = "python3"
+PYTHON = sys.executable
 
 
 # ---------------------------------------------------------------------------

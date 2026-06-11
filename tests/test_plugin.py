@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).parent.parent
 class TestPluginManifest:
 
     def _load(self):
-        return json.loads((REPO_ROOT / ".claude-plugin" / "plugin.json").read_text())
+        return json.loads((REPO_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
 
     def test_plugin_json_exists(self):
         assert (REPO_ROOT / ".claude-plugin" / "plugin.json").exists()
@@ -58,7 +58,7 @@ class TestPluginManifest:
 class TestHooksManifest:
 
     def _load(self):
-        return json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())
+        return json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
 
     def _nb_guard_hooks(self):
         """Return all hook entries for nb-guard."""
@@ -179,7 +179,7 @@ class TestSkillFiles:
         assert (REPO_ROOT / "skills" / "nb" / "SKILL.md").exists()
 
     def test_skill_md_is_nonempty(self):
-        content = (REPO_ROOT / "skills" / "nb" / "SKILL.md").read_text()
+        content = (REPO_ROOT / "skills" / "nb" / "SKILL.md").read_text(encoding="utf-8")
         assert len(content.strip()) > 500, (
             "SKILL.md looks suspiciously short — a real skill file needs at least "
             "a frontmatter block plus a protocol section (>500 chars)"
@@ -209,7 +209,7 @@ class TestScriptFiles:
         )
 
     def test_hook_script_is_python(self):
-        content = (REPO_ROOT / "scripts" / "nb-guard.py").read_text()
+        content = (REPO_ROOT / "scripts" / "nb-guard.py").read_text(encoding="utf-8")
         assert content.startswith("#!/usr/bin/env python3") or "import sys" in content
 
     def test_hook_script_is_executable(self):

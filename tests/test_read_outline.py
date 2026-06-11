@@ -281,10 +281,11 @@ class TestOutlineFallback:
             f"nb-index.py failed: {idx_result.stderr!r}"
         )
 
-        # Touch the notebook to make it newer than the index (simulate a write)
-        time.sleep(0.05)
+        # Advance the notebook mtime deterministically so it is strictly newer
+        # than the index (sleep+touch is flaky on coarse-mtime filesystems)
         nb_path = Path(p)
-        nb_path.touch()
+        t = nb_path.stat().st_mtime + 2.0
+        os.utime(nb_path, (t, t))
 
         r = run_read([p, "--outline"])
         assert r.returncode == 0

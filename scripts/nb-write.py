@@ -50,6 +50,30 @@ _REPLACE_RETRY_DELAY = 0.05   # 50 ms — AV scans typically release within one 
 
 _NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-level
 
+
+def _replace_with_retry(tmp_path, dst_path):
+    """Portable atomic-replace helper — verbatim copy shared with nb-index.py
+    (keep in sync).
+
+    os.replace with a short retry loop for transient PermissionError on
+    Windows (the replace target may be open in another process, e.g. an AV
+    scan or Jupyter holding the file). On final failure the temp file is
+    unlinked (best-effort) and the last PermissionError is re-raised for the
+    caller to report with its own message/exit semantics.
+    """
+    for _attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp_path, dst_path)
+            return
+        except PermissionError:
+            if _attempt == _REPLACE_RETRIES - 1:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+            time.sleep(_REPLACE_RETRY_DELAY)
+
 # ---------------------------------------------------------------------------
 # Portable lock helper — verbatim copy shared with nb-index.py (no shared
 # import between standalone scripts; keep both copies in sync).
@@ -150,7 +174,7 @@ def _cell_id():
 
 def _check_path(path):
     """Common path validation: must be .ipynb and not a symlink."""
-    if not path.endswith(".ipynb"):
+    if not path.lower().endswith(".ipynb"):
         die(f"expected a .ipynb file, got '{path}'.")
     if os.path.islink(path):
         die(f"refusing to operate on a symlink: {path}")
@@ -213,7 +237,10 @@ def load(path, allow_oversize=False):
     if _LOCK_BACKEND is not None:
         lpath = path + ".nblock"
         try:
-            lf = open(lpath, "a")  # "a" creates if absent without truncating
+            # "ab" creates if absent without truncating; binary mode because
+            # nothing is ever written (avoids any text-layer/EncodingWarning
+            # concern) and _lock_file's f.seek(0) works the same on binary.
+            lf = open(lpath, "ab")
         except OSError as e:
             die(f"cannot open lock file '{lpath}': {e}")
         try:
@@ -292,7 +319,10 @@ def save(path, nb, lock_fd=None):
     try:
         fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".nb_tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            # newline="\n" disables universal-newline translation so the bytes
+            # on disk match the pre-save byte count on every platform (no CRLF
+            # inflation on Windows).
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
@@ -300,17 +330,12 @@ def save(path, nb, lock_fd=None):
             os.unlink(tmp_path)
             tmp_path = None
             raise
-        for _attempt in range(_REPLACE_RETRIES):
-            try:
-                os.replace(tmp_path, path)
-                break
-            except PermissionError:
-                if _attempt == _REPLACE_RETRIES - 1:
-                    os.unlink(tmp_path)
-                    tmp_path = None
-                    die(f"cannot write '{path}': file is locked by another process "
-                        f"(is it open in Jupyter?). Close or checkpoint it first.")
-                time.sleep(_REPLACE_RETRY_DELAY)
+        try:
+            _replace_with_retry(tmp_path, path)
+        except PermissionError:
+            tmp_path = None  # already unlinked by the helper
+            die(f"cannot write '{path}': file is locked by another process "
+                f"(is it open in Jupyter?). Close or checkpoint it first.")
         tmp_path = None
     except OSError as e:
         if tmp_path:
@@ -415,7 +440,8 @@ def cmd_create(path):
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".nb_tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # newline="\n" — see save(): keep on-disk bytes platform-independent.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(skeleton, f, indent=1, ensure_ascii=False)
             f.write("\n")
             f.flush()
@@ -440,7 +466,7 @@ def cmd_create(path):
                 os.unlink(tmp_path)
                 tmp_path = None
                 die(f"file already exists: '{path}'")
-            os.replace(tmp_path, path)
+            _replace_with_retry(tmp_path, path)
             tmp_path = None
     except OSError as e:
         if tmp_path:
@@ -599,6 +625,8 @@ def main():
                 close_fds=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except Exception as e:
             print(f"[warn] indexing failed: {e}", file=sys.stderr)

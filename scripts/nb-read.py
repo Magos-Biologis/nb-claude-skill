@@ -111,7 +111,12 @@ def _find_index_dir(nb_path: Path) -> Path:
     """Walk upward from nb_path to find git root; fall back to nb_path.parent."""
     nb_path = nb_path.resolve()
     current = nb_path.parent
-    current_dev = os.stat(current).st_dev
+    try:
+        current_dev = os.stat(current).st_dev
+    except OSError:
+        # Same fallback as the canonical nb-index.py copy: unstatable start
+        # directory → per-directory index.
+        return nb_path.parent / ".nb_index"
     for _ in range(20):
         if _is_git_root_entry(current / ".git"):
             return current / ".nb_index"
@@ -119,12 +124,13 @@ def _find_index_dir(nb_path: Path) -> Path:
         if parent == current:
             break
         try:
-            if os.stat(parent).st_dev != current_dev:
-                break
+            parent_dev = os.stat(parent).st_dev
         except OSError:
             break
+        if parent_dev != current_dev:
+            break
         current = parent
-        current_dev = os.stat(current).st_dev
+        current_dev = parent_dev
     return nb_path.parent / ".nb_index"
 
 

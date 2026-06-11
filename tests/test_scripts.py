@@ -227,7 +227,7 @@ class TestNbRead:
 
     def test_rejects_non_ipynb(self, tmp_path):
         p = tmp_path / "file.txt"
-        p.write_text("hello")
+        p.write_text("hello", encoding="utf-8")
         r = run_read([str(p)])
         assert r.returncode != 0
         assert "Error" in r.stderr or "Error" in r.stdout
@@ -238,13 +238,13 @@ class TestNbRead:
 
     def test_malformed_json(self, tmp_path):
         p = tmp_path / "bad.ipynb"
-        p.write_text("not json at all")
+        p.write_text("not json at all", encoding="utf-8")
         r = run_read([str(p)])
         assert r.returncode != 0
 
     def test_missing_cells_key(self, tmp_path):
         p = tmp_path / "broken.ipynb"
-        p.write_text(json.dumps({"nbformat": 4, "metadata": {}}))
+        p.write_text(json.dumps({"nbformat": 4, "metadata": {}}), encoding="utf-8")
         r = run_read([str(p)])
         assert r.returncode != 0
         assert "cells" in r.stdout + r.stderr
@@ -302,7 +302,7 @@ class TestNbWrite:
              "outputs": [{"output_type": "stream", "text": ["old output"]}]},
         ], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("new code\n")
+        src.write_text("new code\n", encoding="utf-8")
         r = run_write([p, "patch", "0", "-f", str(src)])
         assert r.returncode == 0
         nb = read_nb(p)
@@ -314,7 +314,7 @@ class TestNbWrite:
              "outputs": [{"output_type": "stream", "text": ["hi"]}]},
         ], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("x = 2\n")
+        src.write_text("x = 2\n", encoding="utf-8")
         run_write([p, "patch", "0", "-f", str(src)])
         nb = read_nb(p)
         assert nb["cells"][0]["outputs"] == []
@@ -323,7 +323,7 @@ class TestNbWrite:
     def test_patch_markdown_cell_no_outputs_key(self, tmp_path):
         p = make_notebook([{"cell_type": "markdown", "source": ["## Old"]}], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("## New\n")
+        src.write_text("## New\n", encoding="utf-8")
         r = run_write([p, "patch", "0", "-f", str(src)])
         assert r.returncode == 0
         nb = read_nb(p)
@@ -348,7 +348,7 @@ class TestNbWrite:
             {"cell_type": "code", "source": ["c = 3"]},
         ], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("b = 2\n")
+        src.write_text("b = 2\n", encoding="utf-8")
         r = run_write([p, "insert", "1", "code", "-f", str(src)])
         assert r.returncode == 0
         nb = read_nb(p)
@@ -359,7 +359,7 @@ class TestNbWrite:
     def test_insert_append_minus_one(self, tmp_path):
         p = make_notebook([{"cell_type": "code", "source": ["a"]}], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("## End\n")
+        src.write_text("## End\n", encoding="utf-8")
         r = run_write([p, "insert", "-1", "markdown", "-f", str(src)])
         assert r.returncode == 0
         nb = read_nb(p)
@@ -369,7 +369,7 @@ class TestNbWrite:
     def test_insert_gives_cell_id(self, tmp_path):
         p = make_notebook([], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("x = 1\n")
+        src.write_text("x = 1\n", encoding="utf-8")
         run_write([p, "insert", "-1", "code", "-f", str(src)])
         nb = read_nb(p)
         assert "id" in nb["cells"][0]
@@ -402,7 +402,7 @@ class TestNbWrite:
     def test_write_is_valid_json(self, tmp_path):
         p = make_notebook([{"cell_type": "code", "source": ["x = 1"]}], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("x = 999\n")
+        src.write_text("x = 999\n", encoding="utf-8")
         run_write([p, "patch", "0", "-f", str(src)])
         nb = read_nb(p)  # would raise if JSON is invalid
         assert nb["cells"][0]["source"]
@@ -410,7 +410,7 @@ class TestNbWrite:
     def test_all_status_to_stderr_not_stdout(self, tmp_path):
         p = make_notebook([{"cell_type": "code", "source": ["x"]}], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("y\n")
+        src.write_text("y\n", encoding="utf-8")
         r = run_write([p, "patch", "0", "-f", str(src)])
         assert r.stdout.strip() == "", "stdout must be empty on success"
         assert "✓" in r.stderr
@@ -428,7 +428,7 @@ class TestNbWrite:
 
     def test_rejects_non_ipynb(self, tmp_path):
         p = tmp_path / "file.txt"
-        p.write_text("hello")
+        p.write_text("hello", encoding="utf-8")
         r = run_write([str(p), "patch", "0"], stdin="x\n")
         assert r.returncode != 0
 
@@ -452,7 +452,7 @@ class TestNbWrite:
 
     def test_missing_cells_key(self, tmp_path):
         p = tmp_path / "broken.ipynb"
-        p.write_text(json.dumps({"nbformat": 4, "metadata": {}}))
+        p.write_text(json.dumps({"nbformat": 4, "metadata": {}}), encoding="utf-8")
         r = run_write([str(p), "delete", "0"])
         assert r.returncode != 0
         assert "cells" in r.stderr
@@ -461,7 +461,7 @@ class TestNbWrite:
         """The word EOF on its own line must not truncate when using -f."""
         p = make_notebook([{"cell_type": "code", "source": ["old"]}], tmp_path)
         src = tmp_path / "src.txt"
-        src.write_text("line1\nEOF\nline3\n")
+        src.write_text("line1\nEOF\nline3\n", encoding="utf-8")
         run_write([p, "patch", "0", "-f", str(src)])
         nb = read_nb(p)
         source_str = "".join(nb["cells"][0]["source"])

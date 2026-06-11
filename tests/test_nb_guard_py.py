@@ -366,7 +366,7 @@ class TestWriteToNewFile:
         """Write to an existing .ipynb file should suggest 'patch'."""
         # Create a temporary ipynb file
         existing_file = tmp_path / "existing.ipynb"
-        existing_file.write_text("{}")
+        existing_file.write_text("{}", encoding="utf-8")
 
         monkeypatch.chdir(tmp_path)
 

@@ -5,5 +5,16 @@
   "author": {
     "name": "Magos-Biologis"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "homepage": "https://github.com/Magos-Biologis/nb-claude-skill",
+  "repository": "https://github.com/Magos-Biologis/nb-claude-skill",
+  "keywords": [
+    "jupyter",
+    "notebook",
+    "ipynb",
+    "token-efficient",
+    "cells",
+    "index",
+    "search"
+  ]
 }

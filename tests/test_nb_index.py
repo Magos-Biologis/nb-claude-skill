@@ -652,6 +652,10 @@ class TestStaleness:
         inode_after = idx.stat().st_ino
         assert inode_after != inode_before, "--force must always rewrite the index"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or getattr(os, "geteuid", lambda: -1)() == 0,
+        reason="chmod 000 is not enforceable on Windows or as root",
+    )
     def test_unreadable_notebook_with_matching_mtime_size_is_stale(self, tmp_path):
         """A3 step 4: the hash is the authoritative freshness check. When mtime
         and size match but the notebook cannot be read for hashing, the index is
@@ -1180,8 +1184,9 @@ class TestSymbolExtraction:
         r = run_indexer(nb)
         elapsed = time.monotonic() - start
         assert r.returncode == 0
-        # Per spec: < 100ms for adversarial lines; use 2s as practical subprocess budget
-        assert elapsed < 2.0, f"Indexer took {elapsed:.2f}s on adversarial input (limit 2s)"
+        # Per spec: < 100ms for adversarial lines; use 5s as practical subprocess
+        # budget (catastrophic backtracking would take minutes, not seconds)
+        assert elapsed < 5.0, f"Indexer took {elapsed:.2f}s on adversarial input (limit 5s)"
         # The long line must be silently skipped — no spurious import must be captured
         data = load_index(index_path_for(nb))
         captured = data["cells"][0].get("symbols_imported", [])
@@ -1710,14 +1715,14 @@ class TestSymbolCache:
         """§13.7"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         run_indexer(nb)
-        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
+        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8"))
         assert data["version"] == 1
         assert isinstance(data["version"], int)
 
     def test_symbols_json_has_generated_at(self, tmp_path):
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         run_indexer(nb)
-        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
+        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8"))
         assert "generated_at" in data
         ts = data["generated_at"]
         # Must be full ISO 8601 UTC format: YYYY-MM-DDTHH:MM:SSZ
@@ -1729,7 +1734,7 @@ class TestSymbolCache:
         """§12.2 / schema: max_indexed_at field required"""
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         run_indexer(nb)
-        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
+        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8"))
         assert "max_indexed_at" in data, (
             "symbols.json must store max_indexed_at for O(1) freshness check"
         )
@@ -1738,7 +1743,7 @@ class TestSymbolCache:
         """§13.1"""
         nb = make_notebook([code_cell("def process(x):\n    return x\n")], tmp_path=tmp_path)
         run_indexer(nb)
-        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
+        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8"))
         assert "process" in data.get("symbols", {}), (
             f"'process' not found in symbols.json symbols: {list(data.get('symbols', {}).keys())[:10]}"
         )
@@ -1746,7 +1751,7 @@ class TestSymbolCache:
     def test_symbols_json_contains_imports(self, tmp_path):
         nb = make_notebook([code_cell("import numpy as np\n")], tmp_path=tmp_path)
         run_indexer(nb)
-        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
+        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8"))
         assert "numpy" in data.get("imports", {})
 
     def test_symbols_json_updated_on_reindex(self, tmp_path):
@@ -1757,7 +1762,7 @@ class TestSymbolCache:
         # Rewrite notebook to define 'beta' instead
         nb = make_notebook([code_cell("beta = 2\n")], tmp_path=tmp_path)
         run_indexer(nb, extra_args=["--force"])
-        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
+        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8"))
         # 'alpha' should be gone, 'beta' should be present
         symbols = data.get("symbols", {})
         assert "alpha" not in symbols, "Stale 'alpha' entry must be removed on re-index"
@@ -1809,7 +1814,7 @@ class TestSymbolCache:
         run_indexer(nb)
         symbols_path = tmp_path / ".nb_index" / "symbols.json"
         # symbols.json should not have a 'cells' key (it's not a notebook index)
-        data = json.loads(symbols_path.read_text())
+        data = json.loads(symbols_path.read_text(encoding="utf-8"))
         assert "cells" not in data
 
     def test_symbols_json_location_format(self, tmp_path):
@@ -1819,7 +1824,7 @@ class TestSymbolCache:
             tmp_path=tmp_path, name="mynotebook.ipynb"
         )
         run_indexer(nb)
-        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text())
+        data = json.loads((tmp_path / ".nb_index" / "symbols.json").read_text(encoding="utf-8"))
         locs = data.get("symbols", {}).get("foo", [])
         assert locs, f"Expected at least one location for 'foo', got: {locs}"
         # Spec §13.1: format is "<notebook_path>:<cell_index>" (e.g. "nb.ipynb:0")
@@ -2855,9 +2860,14 @@ class TestWalkBoundaryNotes:
 
     def test_20_level_cap_prints_note(self, tmp_path):
         deep = tmp_path
+        # Single-character segments keep the 25-level path short enough
+        # to stay under Windows MAX_PATH
         for i in range(25):
-            deep = deep / f"d{i}"
-        deep.mkdir(parents=True)
+            deep = deep / "abcdefghijklmnopqrstuvwxy"[i]
+        try:
+            deep.mkdir(parents=True)
+        except OSError:
+            pytest.skip("path too long for this platform")
         nb = make_notebook([code_cell("x = 1")], tmp_path=deep, name="nb.ipynb")
         r = run_indexer(nb)
         assert r.returncode == 0, r.stderr
@@ -2874,9 +2884,14 @@ class TestWalkBoundaryNotes:
         must fire and the index must land next to the notebook."""
         (tmp_path / ".git").mkdir()
         deep = tmp_path
+        # Single-character segments keep the 25-level path short enough
+        # to stay under Windows MAX_PATH
         for i in range(25):
-            deep = deep / f"e{i}"
-        deep.mkdir(parents=True)
+            deep = deep / "abcdefghijklmnopqrstuvwxy"[i]
+        try:
+            deep.mkdir(parents=True)
+        except OSError:
+            pytest.skip("path too long for this platform")
         nb = make_notebook([code_cell("x = 1")], tmp_path=deep, name="nb.ipynb")
         r = run_indexer(nb)
         assert r.returncode == 0, r.stderr

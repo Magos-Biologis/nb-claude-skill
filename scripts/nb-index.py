@@ -122,6 +122,33 @@ MAX_SYMBOL_LEN      = 256
 MAX_SYMBOLS_PER_CELL = 500
 MAX_LINE_LEN        = 500                 # ReDoS protection
 
+_REPLACE_RETRIES    = 3
+_REPLACE_RETRY_DELAY = 0.05   # 50 ms — AV scans typically release within one window
+
+
+def _replace_with_retry(tmp_path, dst_path):
+    """Portable atomic-replace helper — verbatim copy shared with nb-index.py
+    (keep in sync).
+
+    os.replace with a short retry loop for transient PermissionError on
+    Windows (the replace target may be open in another process, e.g. an AV
+    scan or Jupyter holding the file). On final failure the temp file is
+    unlinked (best-effort) and the last PermissionError is re-raised for the
+    caller to report with its own message/exit semantics.
+    """
+    for _attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp_path, dst_path)
+            return
+        except PermissionError:
+            if _attempt == _REPLACE_RETRIES - 1:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+            time.sleep(_REPLACE_RETRY_DELAY)
+
 # ---------------------------------------------------------------------------
 # ANSI sanitisation  (same patterns as nb-read.py)
 # ---------------------------------------------------------------------------
@@ -214,6 +241,27 @@ def _cap_symbols(names: list) -> list:
 # §1 — Index path resolution
 # ---------------------------------------------------------------------------
 
+def _is_git_root_entry(git_candidate: Path) -> bool:
+    """True if .git marks a repo root: a real (non-symlink) directory, or a
+    regular (non-symlink) file starting with 'gitdir:' (worktrees/submodules).
+    Verbatim-shared detection — canonical copy lives in nb-index.py."""
+    try:
+        if git_candidate.is_symlink():
+            return False  # never accept a symlinked .git (security stance)
+        if git_candidate.is_dir():
+            return True
+        if git_candidate.is_file():
+            try:
+                with open(git_candidate, "rb") as gf:
+                    head = gf.read(4096)
+            except OSError:
+                return False
+            return head.startswith(b"gitdir:")
+    except OSError:
+        pass
+    return False
+
+
 def _find_index_dir(nb_path: Path) -> tuple[Path, Path | None]:
     """
     Return (index_dir, git_root_or_None).
@@ -243,25 +291,15 @@ def _find_index_dir(nb_path: Path) -> tuple[Path, Path | None]:
 
     for level in range(20):
         git_candidate = cur / ".git"
+        # _is_git_root_entry returns False for a symlinked .git, so track the
+        # rejection here (for the fallback [note]) before delegating to it.
         try:
             if git_candidate.is_symlink():
-                # Never accept a symlinked .git (dir or file).
                 saw_symlink_git = True
-            elif git_candidate.is_dir():
-                return (cur / ".nb_index", cur)
-            elif git_candidate.is_file():
-                # Worktree / submodule: .git is a regular file containing
-                # 'gitdir: <path>'. Read at most 4096 bytes; tolerate read
-                # errors by ignoring the candidate.
-                try:
-                    with open(git_candidate, "rb") as gf:
-                        head = gf.read(4096)
-                except OSError:
-                    head = b""
-                if head.startswith(b"gitdir:"):
-                    return (cur / ".nb_index", cur)
         except OSError:
             pass  # unreadable candidate — ignore and keep walking
+        if _is_git_root_entry(git_candidate):
+            return (cur / ".nb_index", cur)
 
         parent = cur.parent
         if parent == cur:
@@ -350,7 +388,10 @@ def _update_gitignore(index_dir: Path) -> None:
     lock_fd = None
     if _LOCK_BACKEND is not None:
         try:
-            lock_fd = open(index_dir / "gitignore.nblock", "a")
+            # "ab": creates if absent without truncating; binary because nothing
+            # is written (no text-layer/EncodingWarning; seek(0) in the lock
+            # helper works the same on binary).
+            lock_fd = open(index_dir / "gitignore.nblock", "ab")
         except OSError:
             lock_fd = None  # cannot create lock file — proceed unlocked (best effort)
         if lock_fd is not None and not _lock_file_timeout(lock_fd, timeout=5.0):
@@ -374,7 +415,10 @@ def _update_gitignore(index_dir: Path) -> None:
                 content += entry + "\n"
         else:
             content = "\n".join(entries) + "\n"
-        gitignore.write_text(content, encoding="utf-8")
+        # Explicit newline="\n" so .gitignore bytes are identical on Windows
+        # (write_text would translate "\n" → "\r\n" there).
+        with open(gitignore, "w", encoding="utf-8", newline="\n") as gi:
+            gi.write(content)
     except OSError as e:
         print(f"[warn] could not update .gitignore: {e}", file=sys.stderr)
     finally:
@@ -768,7 +812,8 @@ def _update_symbols_json(
     symbols_path = index_dir / "symbols.json"
 
     try:
-        lock_fd = open(lock_path, "a")
+        # "ab" — create-without-truncate, binary (see gitignore.nblock note).
+        lock_fd = open(lock_path, "ab")
     except OSError:
         print("[warn] cannot open symbols.nblock — symbol update skipped",
               file=sys.stderr)
@@ -865,24 +910,25 @@ def _update_symbols_json(
             "imports": new_imports,
         }
 
-        # Atomic write
+        # Atomic write (best-effort: symbols.json failures warn, never fail
+        # the indexing run)
+        tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(dir=index_dir, suffix=".sym_tmp")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(new_data, f, ensure_ascii=False)
-                    f.write("\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(new_data, f, ensure_ascii=False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            _replace_with_retry(tmp_path, symbols_path)
+            tmp_path = None
+        except OSError as e:
+            if tmp_path is not None:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-                return
-            os.replace(tmp_path, symbols_path)
-        except OSError:
-            pass  # Non-fatal
+            print(f"[warn] symbols.json not written: {e}", file=sys.stderr)
 
     finally:
         # NOTE: the lock file is deliberately NOT unlinked. Deleting it after
@@ -905,9 +951,10 @@ def _coerce_source(src) -> str:
     return str(src)
 
 
-def _build_index(nb_path: Path, nb_path_str: str, mtime: float, size: int, git_root: Path | None) -> dict:
+def _build_index(nb_path: Path, nb_path_str: str, mtime: float, size: int, git_root: Path | None) -> tuple[dict, str]:
     """
     Read the notebook and build the full index dict.
+    Returns (index_dict, indexed_at_timestamp).
     nb_path_str is the 'notebook_path' field value (relative or absolute).
     """
     # Read notebook
@@ -922,12 +969,10 @@ def _build_index(nb_path: Path, nb_path_str: str, mtime: float, size: int, git_r
     try:
         text = raw_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
-        try:
-            text = raw_bytes.decode("latin-1")
-            print("[warn] notebook is not valid UTF-8; falling back to latin-1",
-                  file=sys.stderr)
-        except Exception as e:
-            _die(f"Cannot decode notebook: {e}")
+        # latin-1 maps every byte value, so this decode cannot fail.
+        text = raw_bytes.decode("latin-1")
+        print("[warn] notebook is not valid UTF-8; falling back to latin-1",
+              file=sys.stderr)
 
     try:
         nb = json.loads(text)
@@ -1059,7 +1104,7 @@ def main() -> None:
     nb_arg = args[0]
 
     # Validate extension
-    if not nb_arg.endswith(".ipynb"):
+    if not nb_arg.lower().endswith(".ipynb"):
         _die(f"Expected a .ipynb file, got '{nb_arg}'.")
 
     # Reject symlinks before resolve (resolve() follows them)
@@ -1138,7 +1183,8 @@ def main() -> None:
     nb_lock_fd = None
     if _LOCK_BACKEND is not None:
         try:
-            nb_lock_fd = open(str(nb_path) + ".nblock", "a")
+            # "ab" — create-without-truncate, binary (see gitignore.nblock note).
+            nb_lock_fd = open(str(nb_path) + ".nblock", "ab")
         except OSError:
             nb_lock_fd = None  # cannot create lock file — proceed unlocked
         if nb_lock_fd is not None and not _lock_file_timeout(nb_lock_fd, timeout=10.0):
@@ -1176,10 +1222,11 @@ def main() -> None:
             _die(f"Cannot create index subdirectory: {e}")
 
         # Atomic write of per-notebook index
+        tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(dir=index_file.parent, suffix=".idx_tmp")
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                     json.dump(index, f, ensure_ascii=False)
                     f.write("\n")
                     f.flush()
@@ -1191,16 +1238,18 @@ def main() -> None:
                     pass
                 _die(f"Failed to write index file: {e}")
             try:
-                os.replace(tmp_path, index_file)
+                _replace_with_retry(tmp_path, index_file)
             except PermissionError:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+                # Helper already unlinked the temp after the final retry.
                 print(f"[warn] index not written (transient file lock): {index_file}",
                       file=sys.stderr)
                 sys.exit(0)
         except OSError as e:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             _die(f"Failed to write index file: {e}")
     finally:
         _release_nb_lock()

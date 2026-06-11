@@ -116,6 +116,7 @@ notebook.ipynb | 12 cells | python3
 - **File locking:** both scripts share a verbatim-copied portable lock helper — `fcntl` on POSIX, `msvcrt.locking` on Windows, no-op only if neither exists. nb-write holds the notebook's `.nblock` exclusively for the read-modify-write cycle (source is read *before* locking). nb-index takes `symbols.nblock` blocking-with-timeout (~10 s, then `[warn]` + skip) and holds the notebook's `.nblock` across the final stat + index write. Lockfiles are never unlinked (unlink-after-release is an inode race); `*.nblock` is gitignored.
 - **`ensure_ascii=False`** in all `json.dump` calls (prevents 6× size inflation on CJK/Unicode output).
 - **stdout is always silent on success** for all scripts; all status messages go to stderr.
+- **Conventions are test-enforced** (`tests/test_conventions.py`): Python 3.8 floor (AST parse + banned-API list — extend the list when a new post-3.8 API is found), byte-identity of all verbatim-shared helpers, explicit `encoding=` on every text open, `newline="\n"` on every text-mode write, `sys.executable` in test runners.
 
 ## Test Coverage
 

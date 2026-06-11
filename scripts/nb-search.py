@@ -350,7 +350,7 @@ def _walk_for_ipynb(search_root: Path):
         ]
 
         for fname in filenames:
-            if fname.endswith(".ipynb"):
+            if fname.lower().endswith(".ipynb"):
                 yield Path(dirpath) / fname
 
 
@@ -382,13 +382,13 @@ def _validate_notebook_path(np_str: str, index_base: Path) -> Path | None:
     raw = Path(np_str)
     try:
         candidate = raw.resolve() if raw.is_absolute() else (index_base / np_str).resolve()
-    except Exception:
+    except (ValueError, OSError):
         return None
 
+    # 3.8-safe containment check (Path.is_relative_to is 3.9+)
     try:
-        if not candidate.is_relative_to(index_base):
-            return None
-    except Exception:
+        candidate.relative_to(index_base)
+    except ValueError:
         return None
 
     return candidate
@@ -400,10 +400,12 @@ def _in_scope(candidate: Path, search_root: Path) -> bool:
     A notebook outside search_root but inside its index base is SAFE but OUT
     OF SCOPE — callers skip it silently.
     """
+    # 3.8-safe containment check (Path.is_relative_to is 3.9+)
     try:
-        return candidate.is_relative_to(search_root)
-    except Exception:
+        candidate.relative_to(search_root)
+    except ValueError:
         return False
+    return True
 
 
 def _resolve_candidate(np_str: str, index_base: Path, search_root: Path,

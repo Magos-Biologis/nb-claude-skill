@@ -110,7 +110,7 @@ class TestCreate:
         p = str(tmp_path / "fresh.ipynb")
         run_write([p, "create"])
         src = tmp_path / "src.txt"
-        src.write_text("x = 1\n")
+        src.write_text("x = 1\n", encoding="utf-8")
         r = run_write([p, "insert", "-1", "code", "-f", str(src)])
         assert r.returncode == 0
         nb = read_nb(p)
@@ -224,9 +224,9 @@ class TestConcurrentWriteSerialisation:
         ], tmp_path)
 
         src0 = tmp_path / "src0.txt"
-        src0.write_text("patched_cell_0\n")
+        src0.write_text("patched_cell_0\n", encoding="utf-8")
         src1 = tmp_path / "src1.txt"
-        src1.write_text("patched_cell_1\n")
+        src1.write_text("patched_cell_1\n", encoding="utf-8")
 
         results = [None, None]
 
@@ -249,9 +249,9 @@ class TestConcurrentWriteSerialisation:
         ], tmp_path)
 
         src0 = tmp_path / "src0.txt"
-        src0.write_text("final_cell_0\n")
+        src0.write_text("final_cell_0\n", encoding="utf-8")
         src1 = tmp_path / "src1.txt"
-        src1.write_text("final_cell_1\n")
+        src1.write_text("final_cell_1\n", encoding="utf-8")
 
         threads = []
         for idx, src in [(0, src0), (1, src1)]:
