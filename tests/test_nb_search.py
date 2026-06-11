@@ -151,13 +151,20 @@ class TestWalkStrategy:
         assert "tox_hidden" not in r.stdout
 
     def test_skips_git_dir(self, tmp_path):
-        """§12 walk: .git must be skipped"""
+        """§12 walk: .git must be skipped by the DOWNWARD tree walk.
+
+        Updated for the mirror-pruning fix: an *explicitly indexed* notebook
+        is now visible through the git-root index mirror even when it lives
+        under .git/ (SKIP_DIRS pruning no longer applies inside .nb_index),
+        so this test no longer indexes the notebook. The intent preserved
+        here is that the downward walk never descends into .git/ — the raw
+        notebook must be neither found nor flagged [UNINDEXED]."""
         git = tmp_path / ".git" / "hooks"
         git.mkdir(parents=True)
-        nb = make_notebook([code_cell("git_hidden = 1")], tmp_path=git, name="nb.ipynb")
-        run_indexer(nb)
+        make_notebook([code_cell("git_hidden = 1")], tmp_path=git, name="nb.ipynb")
         r = run_search(["git_hidden", str(tmp_path)])
         assert "git_hidden" not in r.stdout
+        assert "[UNINDEXED]" not in r.stderr
 
     def test_skips_pycache(self, tmp_path):
         """§12 walk: __pycache__ must be skipped"""
@@ -708,13 +715,36 @@ class TestOversizedNotebooks:
 class TestStaleUnindexed:
 
     def test_unindexed_notebook_notice(self, tmp_path):
-        """§12.7: unindexed notebook prints notice on stderr"""
+        """§12.7: unindexed notebook prints notice on stderr.
+
+        Updated: keyword mode now searches unindexed notebooks directly
+        (it opens .ipynb files anyway), so the token IS found (exit 0) and
+        the stderr note says the notebook was searched directly."""
         # Create a notebook but do NOT index it
         nb = make_notebook([code_cell("unindexed_token = 1")], tmp_path=tmp_path)
         r = run_search(["unindexed_token", str(tmp_path)])
-        # Exit code 1 (no match) and a notice on stderr
-        assert r.returncode == 1
-        assert "UNINDEXED" in r.stderr or "unindexed" in r.stderr.lower()
+        assert "[UNINDEXED]" in r.stderr
+        assert "searched directly" in r.stderr
+        assert r.returncode == 0, (
+            "Unindexed notebooks must now be searched directly in keyword "
+            f"mode; got exit {r.returncode}; stderr: {r.stderr!r}"
+        )
+        assert "test.ipynb:0:" in r.stdout
+
+    def test_unindexed_notebook_in_keyword_results(self, tmp_path):
+        """Unindexed + indexed notebooks both contribute keyword results."""
+        make_indexed_project(tmp_path, [
+            ("indexed.ipynb", [code_cell("mixed_needle = 'indexed'\n")])
+        ])
+        make_notebook([code_cell("mixed_needle = 'direct'\n")],
+                      name="direct.ipynb", tmp_path=tmp_path)
+        r = run_search(["mixed_needle", str(tmp_path)])
+        assert r.returncode == 0
+        assert "indexed.ipynb:0:" in r.stdout
+        assert "direct.ipynb:0:" in r.stdout
+        # Only the unindexed one is flagged
+        assert "direct.ipynb" in r.stderr and "searched directly" in r.stderr
+        assert "indexed.ipynb" not in r.stderr
 
     def test_stale_index_warns_on_stderr(self, tmp_path):
         """§12.6: stale index prints warning on stderr AND still returns results"""
@@ -1227,10 +1257,12 @@ class TestGitRepoResolution:
         r = run_search(["parent_escape", str(tmp_path)])
         assert "Traceback" not in r.stderr
         assert "[WARN] invalid or unsafe notebook_path" in r.stderr
-        for line in r.stdout.splitlines():
-            assert not line.startswith("victim.ipynb:"), (
-                f"escaped notebook_path must not produce a result: {line!r}"
-            )
+        # Updated: victim.ipynb is itself an in-scope unindexed notebook, so
+        # keyword mode now legitimately finds it via the DIRECT search route.
+        # The index-derived escape entry must still be rejected, which we
+        # verify by requiring the [UNINDEXED] note for victim.ipynb (the only
+        # remaining route to it) alongside the unsafe-path warning.
+        assert "victim.ipynb" in r.stderr and "searched directly" in r.stderr
 
     def test_symbols_json_escape_skipped_silently_in_fast_path(self, tmp_path):
         """Location strings in symbols.json that escape the index base must not
@@ -1289,3 +1321,349 @@ class TestSymbolsJsonNestedFreshness:
             f"fast path served stale symbols.json instead: {r.stderr}"
         )
         assert "fresh.ipynb" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-11 fixes — staleness in symbol/import modes (Fix #1)
+# ---------------------------------------------------------------------------
+
+class TestSymbolImportStaleness:
+
+    def test_symbol_mode_warns_stale_and_returns_result(self, tmp_path):
+        """--symbol: stale notebook → [STALE] on stderr, result still printed."""
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("def stale_sym_func():\n    pass\n")])
+        ])
+        nb = tmp_path / "nb.ipynb"
+        t = nb.stat().st_mtime + 10
+        os.utime(nb, (t, t))
+        r = run_search(["--symbol", "stale_sym_func", str(tmp_path)])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "nb.ipynb:0:" in r.stdout
+        assert "[STALE]" in r.stderr
+
+    def test_import_mode_warns_stale_and_returns_result(self, tmp_path):
+        """--import: stale notebook → [STALE] on stderr, result still printed."""
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("import stalemod.sub\n")])
+        ])
+        nb = tmp_path / "nb.ipynb"
+        t = nb.stat().st_mtime + 10
+        os.utime(nb, (t, t))
+        r = run_search(["--import", "stalemod", str(tmp_path)])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "nb.ipynb:0:" in r.stdout
+        assert "[STALE]" in r.stderr
+
+    def test_symbol_serial_scan_warns_stale(self, tmp_path):
+        """Staleness is also reported on the serial-scan route (no symbols.json)."""
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("def serial_stale_func():\n    pass\n")])
+        ])
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        if symbols_path.exists():
+            symbols_path.unlink()
+        nb = tmp_path / "nb.ipynb"
+        t = nb.stat().st_mtime + 10
+        os.utime(nb, (t, t))
+        r = run_search(["--symbol", "serial_stale_func", str(tmp_path)])
+        assert r.returncode == 0
+        assert "[STALE]" in r.stderr
+
+    def test_symbol_mode_fresh_no_stale_warning(self, tmp_path):
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("def fresh_sym_func():\n    pass\n")])
+        ])
+        r = run_search(["--symbol", "fresh_sym_func", str(tmp_path)])
+        assert r.returncode == 0
+        assert "[STALE]" not in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Fix #2 — staleness fast path: mtime+size match must not read the notebook
+# ---------------------------------------------------------------------------
+
+class TestStalenessFastPath:
+
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="chmod 000 is not enforced on Windows")
+    def test_mtime_size_match_skips_file_read(self, tmp_path):
+        """When stored mtime+size match, the notebook must be reported fresh
+        WITHOUT being opened: an unreadable (chmod 000) notebook stays
+        fresh and the search neither warns [STALE] nor crashes."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("chmod 000 does not block reads for root")
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("def unreadable_fresh_func():\n    pass\n")])
+        ])
+        nb = tmp_path / "nb.ipynb"
+        os.chmod(nb, 0)
+        try:
+            r = run_search(["--symbol", "unreadable_fresh_func", str(tmp_path)])
+        finally:
+            os.chmod(nb, 0o644)
+        assert "Traceback" not in r.stderr
+        assert r.returncode == 0, (
+            "mtime+size match must be decided by stat alone; "
+            f"stderr: {r.stderr!r}"
+        )
+        # If the implementation tried to read+hash the file, the failed open
+        # would have flagged the index stale.
+        assert "[STALE]" not in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Fix #4 — fast-path --type/--section filtering with unreadable index
+# ---------------------------------------------------------------------------
+
+class TestFastPathFilterSkip:
+
+    def test_filter_with_unreadable_index_skips_result(self, tmp_path):
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("def filt_skip_func():\n    pass\n")])
+        ])
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json")
+        # Remove the per-notebook index so filters cannot be applied;
+        # symbols.json stays fresh, forcing the fast path.
+        (tmp_path / ".nb_index" / "nb.ipynb.json").unlink()
+        r = run_search(["--symbol", "--type", "code", "filt_skip_func", str(tmp_path)])
+        assert "cannot apply --type/--section filter" in r.stderr
+        assert "filt_skip_func" not in r.stdout
+        assert r.returncode == 1, (
+            "Filtered fast-path result with unreadable index must be skipped, "
+            f"not emitted unfiltered: {r.stdout!r}"
+        )
+
+    def test_no_filter_with_unreadable_index_still_returns(self, tmp_path):
+        """Without filters the fast path still returns the (unfilterable) result."""
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("def filt_ok_func():\n    pass\n")])
+        ])
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json")
+        (tmp_path / ".nb_index" / "nb.ipynb.json").unlink()
+        r = run_search(["--symbol", "filt_ok_func", str(tmp_path)])
+        assert r.returncode == 0
+        assert "cannot apply --type/--section filter" not in r.stderr
+
+    def test_import_filter_with_unreadable_index_skips_result(self, tmp_path):
+        make_indexed_project(tmp_path, [
+            ("nb.ipynb", [code_cell("import filtskipmod\n")])
+        ])
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        if not symbols_path.exists():
+            pytest.skip("Implementation does not produce symbols.json")
+        (tmp_path / ".nb_index" / "nb.ipynb.json").unlink()
+        r = run_search(["--import", "--type", "code", "filtskipmod", str(tmp_path)])
+        assert "cannot apply --type/--section filter" in r.stderr
+        assert r.returncode == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix #5 — cross-index dedup (legacy per-dir index + git-root index)
+# ---------------------------------------------------------------------------
+
+class TestCrossIndexDedup:
+
+    def _make_double_indexed(self, tmp_path):
+        """Notebook indexed under a legacy per-dir .nb_index AND a git-root
+        .nb_index (legacy index created before `git init`)."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        nb = make_notebook(
+            [code_cell("dedup_needle = 1\ndef dedup_func():\n    pass\n")],
+            tmp_path=sub, name="nb.ipynb")
+        r = run_indexer(nb)  # no .git yet → legacy per-dir index
+        assert r.returncode == 0, r.stderr
+        assert (sub / ".nb_index" / "nb.ipynb.json").exists()
+        (tmp_path / ".git").mkdir()
+        r = run_indexer(nb)  # now indexes at the git root
+        assert r.returncode == 0, r.stderr
+        assert (tmp_path / ".nb_index" / "sub" / "nb.ipynb.json").exists()
+        return nb
+
+    def test_keyword_dedup(self, tmp_path):
+        self._make_double_indexed(tmp_path)
+        r = run_search(["dedup_needle", str(tmp_path)])
+        assert r.returncode == 0
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        assert len(lines) == 1, (
+            f"Notebook reachable via two indexes must match once: {r.stdout!r}"
+        )
+        assert "[DUP]" in r.stderr
+        assert "shadowed by another index" in r.stderr
+
+    def test_symbol_dedup(self, tmp_path):
+        self._make_double_indexed(tmp_path)
+        r = run_search(["--symbol", "dedup_func", str(tmp_path)])
+        assert r.returncode == 0
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        assert len(lines) == 1, f"Expected 1 deduped result: {r.stdout!r}"
+
+    def test_dedup_does_not_consume_limit(self, tmp_path):
+        """--limit must count unique results, not duplicates."""
+        self._make_double_indexed(tmp_path)
+        r = run_search(["dedup_needle", "--limit", "1", str(tmp_path)])
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        assert len(lines) == 1
+        assert r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix #6 — symlinked .nb_index accepted (nb-index writes through one)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="symlink creation requires admin on Windows")
+class TestSymlinkedIndexDir:
+
+    def _symlink_index(self, tmp_path):
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("sub/nb.ipynb", [code_cell("symlink_idx_needle = 1\n"
+                                        "def symlink_idx_func():\n    pass\n")]),
+        ])
+        real = tmp_path / "real_index_store"
+        (repo / ".nb_index").rename(real)
+        (repo / ".nb_index").symlink_to(real, target_is_directory=True)
+        return repo
+
+    def test_upward_walk_accepts_symlinked_nb_index(self, tmp_path):
+        repo = self._symlink_index(tmp_path)
+        # Search from the subdirectory → upward walk route
+        r = run_search(["symlink_idx_needle", str(repo / "sub")])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "nb.ipynb:0:" in r.stdout
+        assert "[UNINDEXED]" not in r.stderr
+
+    def test_downward_walk_accepts_symlinked_nb_index(self, tmp_path):
+        repo = self._symlink_index(tmp_path)
+        # Search from the repo root → downward walk route
+        r = run_search(["symlink_idx_needle", str(repo)])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "[UNINDEXED]" not in r.stderr
+
+    def test_symbol_mode_with_symlinked_nb_index(self, tmp_path):
+        repo = self._symlink_index(tmp_path)
+        r = run_search(["--symbol", "symlink_idx_func", str(repo / "sub")])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# Fix #7 — explicitly indexed notebooks under SKIP_DIRS-named dirs are
+# searchable through the git-root index mirror
+# ---------------------------------------------------------------------------
+
+class TestIndexMirrorNotPruned:
+
+    def test_indexed_notebook_under_venv_searchable_keyword(self, tmp_path):
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("venv/nb.ipynb", [code_cell("venv_indexed_needle = 1\n"
+                                         "def venv_indexed_func():\n    pass\n")]),
+        ])
+        assert (repo / ".nb_index" / "venv" / "nb.ipynb.json").exists()
+        r = run_search(["venv_indexed_needle", str(repo)])
+        assert r.returncode == 0, (
+            "Explicitly indexed notebook under venv/ must be searchable via "
+            f"the index mirror; stderr: {r.stderr!r}"
+        )
+        assert "venv_indexed_needle" in r.stdout
+
+    def test_indexed_notebook_under_venv_searchable_symbol(self, tmp_path):
+        repo = tmp_path / "repo"
+        make_git_repo(repo, [
+            ("venv/nb.ipynb", [code_cell("def venv_sym_func():\n    pass\n")]),
+        ])
+        r = run_search(["--symbol", "venv_sym_func", str(repo)])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+
+    def test_unindexed_notebook_under_venv_still_hidden(self, tmp_path):
+        """The downward tree walk still prunes venv/ — only *explicitly
+        indexed* mirror entries become visible."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        venv = repo / "venv"
+        venv.mkdir()
+        make_notebook([code_cell("venv_unindexed_needle = 1")],
+                      tmp_path=venv, name="nb.ipynb")
+        r = run_search(["venv_unindexed_needle", str(repo)])
+        assert "venv_unindexed_needle" not in r.stdout
+        assert "[UNINDEXED]" not in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Fix #9 — --in-outputs (keyword mode only)
+# ---------------------------------------------------------------------------
+
+class TestInOutputs:
+
+    def test_stream_output_matched_only_with_flag(self, tmp_path):
+        cell = code_cell("print('hello')", outputs=[
+            {"output_type": "stream", "name": "stdout",
+             "text": ["magic_output_needle appeared\n", "second line\n"]}
+        ])
+        make_indexed_project(tmp_path, [("nb.ipynb", [cell])])
+        # Without the flag: source-only search → no match
+        r0 = run_search(["magic_output_needle", str(tmp_path)])
+        assert r0.returncode == 1
+        # With the flag: output line matched, marked clearly
+        r = run_search(["--in-outputs", "magic_output_needle", str(tmp_path)])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "nb.ipynb:0: [output] magic_output_needle appeared" in r.stdout
+
+    def test_execute_result_text_plain_matched(self, tmp_path):
+        cell = code_cell("compute()", outputs=[
+            {"output_type": "execute_result", "execution_count": 1,
+             "metadata": {},
+             "data": {"text/plain": ["exec_result_needle_value"]}}
+        ])
+        make_indexed_project(tmp_path, [("nb.ipynb", [cell])])
+        r = run_search(["--in-outputs", "exec_result_needle_value", str(tmp_path)])
+        assert r.returncode == 0
+        assert "[output]" in r.stdout
+
+    def test_error_traceback_matched(self, tmp_path):
+        cell = code_cell("boom()", outputs=[
+            {"output_type": "error", "ename": "ValueError",
+             "evalue": "bad", "traceback": ["Traceback line",
+                                            "ValueError: traceback_needle_here"]}
+        ])
+        make_indexed_project(tmp_path, [("nb.ipynb", [cell])])
+        r = run_search(["--in-outputs", "traceback_needle_here", str(tmp_path)])
+        assert r.returncode == 0
+        assert "[output]" in r.stdout
+
+    def test_in_outputs_searches_unindexed_notebooks(self, tmp_path):
+        cell = code_cell("x = 1", outputs=[
+            {"output_type": "stream", "name": "stdout",
+             "text": ["unindexed_output_needle\n"]}
+        ])
+        make_notebook([cell], tmp_path=tmp_path)  # NOT indexed
+        r = run_search(["--in-outputs", "unindexed_output_needle", str(tmp_path)])
+        assert r.returncode == 0, f"stderr: {r.stderr!r}"
+        assert "[output]" in r.stdout
+
+    def test_output_text_sanitised(self, tmp_path):
+        cell = code_cell("x = 1", outputs=[
+            {"output_type": "stream", "name": "stdout",
+             "text": ["\x1b[31mansi_output_needle\x1b[0m\n"]}
+        ])
+        make_indexed_project(tmp_path, [("nb.ipynb", [cell])])
+        r = run_search(["--in-outputs", "ansi_output_needle", str(tmp_path)])
+        assert r.returncode == 0
+        assert "\x1b" not in r.stdout, "ANSI must be stripped from shown output text"
+        assert "ansi_output_needle" in r.stdout
+
+    def test_rejected_with_symbol_mode(self, tmp_path):
+        r = run_search(["--symbol", "--in-outputs", "x", str(tmp_path)])
+        assert r.returncode == 2
+        assert "in-outputs" in r.stderr
+
+    def test_rejected_with_import_mode(self, tmp_path):
+        r = run_search(["--import", "--in-outputs", "x", str(tmp_path)])
+        assert r.returncode == 2
+        assert "in-outputs" in r.stderr

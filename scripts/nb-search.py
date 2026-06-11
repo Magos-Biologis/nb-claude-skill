@@ -4,7 +4,10 @@ nb-search.py — Search across indexed Jupyter notebooks.
 
 Usage:
   python3 nb-search.py [--symbol | --import] [--type TYPE] [--section SECTION]
-                       [--limit N] QUERY SEARCH_ROOT
+                       [--limit N] [--in-outputs] QUERY SEARCH_ROOT
+
+--in-outputs (keyword mode only): also match output text of code cells;
+output hits show "[output] <line>" as the result text.
 
 Exit codes:
   0: one or more matches
@@ -12,7 +15,7 @@ Exit codes:
   2: usage error (missing args, invalid flags, search_root is a file)
 
 stdout: results (one per line)  format: relative/path.ipynb:N: first source line
-stderr: warnings ([STALE], [UNINDEXED], [WARN])
+stderr: warnings ([STALE], [UNINDEXED], [WARN], [DUP])
 """
 
 from __future__ import annotations
@@ -137,16 +140,17 @@ def _check_staleness(index_data: dict, nb_path: Path) -> bool:
     stored_size = index_data.get("notebook_size")
     stored_hash = index_data.get("nb_content_hash")
 
-    if stored_mtime != actual_mtime:
-        return True
-    if stored_size != actual_size:
-        return True
+    if stored_mtime is not None and stored_size is not None:
+        if stored_mtime != actual_mtime or stored_size != actual_size:
+            return True
+        # True fast path: stored mtime AND size both match — treat as fresh
+        # WITHOUT reading the notebook (same freshness rule as nb-read.py).
+        return False
 
-    # Both match — skip file read (fast path)
+    # Cannot decide from mtime+size (stored values missing) — fall back to
+    # the content hash, which requires reading the file.
     if stored_hash is None:
         return True
-
-    # Read file for hash check (only when mtime+size both match)
     try:
         with open(nb_path, "rb") as f:
             raw = f.read()
@@ -167,9 +171,12 @@ def _find_upward_index_dir(search_root: Path) -> Path | None:
     <= MAX_WALK_DEPTH levels, real .git dir that is_dir() and not is_symlink(),
     stop on st_dev change) looking for a git root strictly ABOVE search_root.
 
-    Returns that git root's .nb_index directory if it exists (and is a real
-    directory, not a symlink), else None. A git root equal to search_root is
-    already covered by the downward walk, so None is returned in that case.
+    Returns that git root's .nb_index directory if it exists, else None.
+    A symlinked .nb_index is accepted — nb-index.py writes through one, so
+    rejecting it here would make indexed notebooks silently unsearchable
+    (symlink checks on notebooks and other paths are unaffected). A git root
+    equal to search_root is already covered by the downward walk, so None is
+    returned in that case.
     """
     cur = search_root
     try:
@@ -183,7 +190,7 @@ def _find_upward_index_dir(search_root: Path) -> Path | None:
             if cur == search_root:
                 return None  # downward walk already covers this dir
             index_dir = cur / ".nb_index"
-            if index_dir.is_dir() and not index_dir.is_symlink():
+            if index_dir.is_dir():  # symlinked .nb_index accepted (see docstring)
                 return index_dir
             return None
 
@@ -206,9 +213,20 @@ def _collect_index_files(index_dir: Path):
     """
     Return relative (posix-style) paths of all files under index_dir,
     recursing into subdirectories (git-root indexes mirror the repo layout:
-    .nb_index/<repo-relative-path>.json). Because the layout mirrors the
-    repo, SKIP_DIRS pruning applies here too (e.g. notebooks under .git/ or
-    node_modules/ stay hidden). followlinks=False; depth-capped.
+    .nb_index/<repo-relative-path>.json).
+
+    SKIP_DIRS pruning is deliberately NOT applied inside the mirror: every
+    entry under .nb_index was explicitly indexed (nb-index.py also writes
+    indexes for notebooks under venv/, node_modules/, ...) and the mirror is
+    small. Nested `.nb_index` directory names ARE pruned, so a nested index
+    dir is never collected under the wrong index_base (the downward walk
+    yields it separately with its own base).
+
+    Depth note: the MAX_WALK_DEPTH cap here is measured from the .nb_index
+    dir itself, not from search_root. The mirror replicates repo-relative
+    paths starting at the index base, so its depth budget mirrors the
+    indexer's repo-relative depth and is intentionally independent of where
+    the search was started from. followlinks=False; depth-capped.
     """
     names = []
     base = str(index_dir)
@@ -217,7 +235,7 @@ def _collect_index_files(index_dir: Path):
         depth = dirpath.count(os.sep) - base_depth
         dirnames[:] = [
             d for d in dirnames
-            if d not in SKIP_DIRS and depth < MAX_WALK_DEPTH
+            if d != ".nb_index" and depth < MAX_WALK_DEPTH
         ]
         for fname in filenames:
             rel = os.path.relpath(os.path.join(dirpath, fname), base)
@@ -254,12 +272,27 @@ def _walk_for_index_dirs(search_root: Path):
             d for d in dirnames
             if d not in SKIP_DIRS and current_depth < MAX_WALK_DEPTH
         ]
+        # Deterministic order so cross-index dedup has a stable winner
+        # (".nb_index" sorts before typical subdir names, so the index
+        # closest to search_root is claimed first).
+        dirnames.sort()
 
         if os.path.basename(dirpath) == ".nb_index":
             # Collect recursively (git-root indexes nest by repo path);
             # prevent os.walk from re-yielding the nested dirs.
             dirnames[:] = []
             yield dirpath, _collect_index_files(Path(dirpath))
+            continue
+
+        # os.walk(followlinks=False) never descends into a *symlinked*
+        # .nb_index, but nb-index.py happily writes through one — yield it
+        # explicitly so indexed notebooks stay searchable. Real .nb_index
+        # dirs are handled above when os.walk reaches them as dirpath.
+        for d in dirnames:
+            if d == ".nb_index":
+                p = os.path.join(dirpath, d)
+                if os.path.islink(p) and os.path.isdir(p):
+                    yield p, _collect_index_files(Path(p))
 
 
 def _walk_for_ipynb(search_root: Path):
@@ -456,16 +489,153 @@ def _coerce_source(src) -> str:
     return str(src)
 
 
+def _display_path(candidate: Path, search_root: Path) -> str:
+    try:
+        return str(candidate.relative_to(search_root))
+    except ValueError:
+        return str(candidate)
+
+
+def _claim_notebook(candidate: Path, index_dir_str: str, dedup: dict,
+                    search_root: Path) -> bool:
+    """
+    Cross-index dedup by RESOLVED notebook path. A notebook reachable via
+    two index files (legacy per-dir .nb_index + git-root .nb_index) must not
+    print every match twice. The first index file to claim a notebook wins
+    (the upward/git-root index is yielded first by _walk_for_index_dirs —
+    that is the preferred one); later index entries for an already-seen
+    notebook are skipped with a one-line [DUP] stderr note.
+    """
+    claimed = dedup["claimed"]
+    owner = claimed.get(candidate)
+    if owner is None:
+        claimed[candidate] = index_dir_str
+        return True
+    if owner == index_dir_str:
+        return True  # same index source (e.g. several symbols.json locations)
+    if candidate not in dedup["warned"]:
+        dedup["warned"].add(candidate)
+        display = _display_path(candidate, search_root)
+        print(f"[DUP] {_sanitise(display)}: shadowed by another index, skipped",
+              file=sys.stderr)
+    return False
+
+
+def _open_notebook(candidate: Path, display: str):
+    """
+    Open a notebook JSON with the MAX_FILE_SIZE guard.
+    Returns the parsed dict, or None if missing/oversized/corrupt.
+    """
+    try:
+        file_size = os.path.getsize(candidate)
+    except OSError:
+        return None
+    if file_size > MAX_FILE_SIZE:
+        print(f"[WARN] {_sanitise(display)}: exceeds 100 MB limit, skipped",
+              file=sys.stderr)
+        return None
+    try:
+        with open(candidate, encoding="utf-8-sig", errors="replace") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+
+
+def _iter_output_lines(cell: dict):
+    """
+    Yield text lines from a code cell's outputs (--in-outputs): stream
+    text, data['text/plain'], and error tracebacks. list/str coerced the
+    same way as cell sources.
+    """
+    outputs = cell.get("outputs")
+    if not isinstance(outputs, list):
+        return
+    for out in outputs:
+        if not isinstance(out, dict):
+            continue
+        parts = []
+        if "text" in out:
+            parts.append(_coerce_source(out.get("text")))
+        data = out.get("data")
+        if isinstance(data, dict) and "text/plain" in data:
+            parts.append(_coerce_source(data.get("text/plain")))
+        tb = out.get("traceback")
+        if isinstance(tb, list):
+            parts.append("\n".join(str(t) for t in tb))
+        elif isinstance(tb, str):
+            parts.append(tb)
+        for part in parts:
+            yield from part.splitlines()
+
+
+def _search_notebook_cells(
+    nb: dict,
+    index_cells: dict,
+    q_lower: str,
+    type_filter: str | None,
+    section_filter: str | None,
+    in_outputs: bool,
+):
+    """
+    Yield (cell_index, shown_text) keyword matches in one loaded notebook.
+    Used for both indexed and unindexed notebooks (index_cells may be {}).
+    """
+    cells_raw = nb.get("cells", [])
+    if not isinstance(cells_raw, list):
+        return
+    for i, cell in enumerate(cells_raw):
+        if not isinstance(cell, dict):
+            continue
+        ctype = cell.get("cell_type", "unknown")
+
+        # Type filter
+        if type_filter is not None and ctype != type_filter:
+            continue
+
+        # Section filter uses index metadata; without it the cell is skipped
+        if section_filter is not None:
+            idx_cell = index_cells.get(i)
+            if idx_cell is None:
+                continue
+            if not _cell_passes_section(idx_cell, section_filter):
+                continue
+
+        source_str = _coerce_source(cell.get("source", []))
+
+        # Case-insensitive keyword search over source
+        if q_lower in source_str.lower():
+            first_line = "(empty)"
+            idx_cell = index_cells.get(i)
+            if idx_cell:
+                first_line = idx_cell.get("first_line", "(empty)")
+            else:
+                for line in source_str.splitlines():
+                    s = line.strip()
+                    if s:
+                        first_line = s[:120]
+                        break
+            yield i, first_line
+
+        # --in-outputs: also match output text of code cells
+        if in_outputs and ctype == "code":
+            for line in _iter_output_lines(cell):
+                if q_lower in line.lower():
+                    yield i, "[output] " + line.strip()[:120]
+
+
 def _search_keyword(
     query: str,
     search_root: Path,
     type_filter: str | None,
     section_filter: str | None,
     limit: int | None,
+    in_outputs: bool = False,
 ) -> int:
     """
-    Keyword search: open each .ipynb file and scan cell source text.
-    Uses index to locate notebooks and get metadata.
+    Keyword search: open each .ipynb file and scan cell source text
+    (and, with --in-outputs, output text of code cells).
+    Uses index to locate notebooks and get metadata; unindexed notebooks
+    found by the directory walk are searched directly.
     Returns number of results printed.
     """
     q_lower = query.lower()
@@ -474,9 +644,10 @@ def _search_keyword(
     # Collect all indexed notebook paths and their index data
     # Also track all .ipynb files to detect unindexed ones
     indexed_nb_paths = set()  # resolved Path objects
+    dedup = {"claimed": {}, "warned": set()}
 
     # First pass: find all indexed notebooks
-    indexed_notebooks = []  # list of (nb_candidate_path, index_data, is_stale, nb_display)
+    indexed_notebooks = []  # list of (nb_candidate_path, index_data, is_stale)
 
     for index_dir_str, filenames in _walk_for_index_dirs(search_root):
         index_dir_path = Path(index_dir_str)
@@ -515,109 +686,66 @@ def _search_keyword(
 
             indexed_nb_paths.add(candidate)
 
+            if not _claim_notebook(candidate, index_dir_str, dedup, search_root):
+                continue  # duplicate entry from a second index file
+
             # Check staleness
             stale = _check_staleness(index_data, candidate)
             if stale:
-                # Use relative path for display
-                try:
-                    display = str(candidate.relative_to(search_root))
-                except ValueError:
-                    display = str(candidate)
+                display = _display_path(candidate, search_root)
                 print(f"[STALE] {display}", file=sys.stderr)
 
             indexed_notebooks.append((candidate, index_data, stale))
 
-    # Second pass: detect unindexed notebooks
+    # Second pass: detect unindexed notebooks — keyword mode opens .ipynb
+    # files anyway, so these are searched directly (with a stderr note).
+    unindexed_notebooks = []
     for nb_path in _walk_for_ipynb(search_root):
         try:
             resolved = nb_path.resolve()
         except OSError:
             resolved = nb_path
         if resolved not in indexed_nb_paths:
-            try:
-                display = str(nb_path.relative_to(search_root))
-            except ValueError:
-                display = str(nb_path)
-            print(f"[UNINDEXED] {display} — run nb-index.py first", file=sys.stderr)
+            display = _display_path(nb_path, search_root)
+            print(f"[UNINDEXED] {_sanitise(display)} — searched directly",
+                  file=sys.stderr)
+            unindexed_notebooks.append(resolved)
 
-    # Third pass: actually search
+    # Third pass: search indexed notebooks
     for candidate, index_data, stale in indexed_notebooks:
-        if not candidate.exists():
+        display = _display_path(candidate, search_root)
+        nb = _open_notebook(candidate, display)
+        if nb is None:
             continue
 
-        # Check file size before opening
-        try:
-            file_size = os.path.getsize(candidate)
-        except OSError:
-            continue
-        if file_size > MAX_FILE_SIZE:
-            try:
-                display = str(candidate.relative_to(search_root))
-            except ValueError:
-                display = str(candidate)
-            print(f"[WARN] {display}: exceeds 100 MB limit, skipped", file=sys.stderr)
-            continue
-
-        try:
-            with open(candidate, encoding="utf-8-sig", errors="replace") as f:
-                nb = json.load(f)
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            continue
-
-        cells_raw = nb.get("cells", [])
         index_cells = {}
         if index_data:
             try:
                 index_cells = {c["i"]: c for c in index_data.get("cells", []) if isinstance(c, dict) and "i" in c}
             except (KeyError, TypeError):
-                try:
-                    display = str(candidate.relative_to(search_root))
-                except ValueError:
-                    display = str(candidate)
                 print(f"[WARN] {display}: malformed index, skipped", file=sys.stderr)
                 continue
 
-        try:
-            display = str(candidate.relative_to(search_root))
-        except ValueError:
-            display = str(candidate)
-
-        for i, cell in enumerate(cells_raw):
-            ctype = cell.get("cell_type", "unknown")
-
-            # Type filter
-            if type_filter is not None and ctype != type_filter:
-                continue
-
-            source_str = _coerce_source(cell.get("source", []))
-
-            # Case-insensitive keyword search
-            if q_lower not in source_str.lower():
-                continue
-
-            # Section filter using index metadata
-            if section_filter is not None:
-                idx_cell = index_cells.get(i)
-                if idx_cell is None:
-                    continue
-                if not _cell_passes_section(idx_cell, section_filter):
-                    continue
-
-            # First line for display
-            first_line = "(empty)"
-            idx_cell = index_cells.get(i)
-            if idx_cell:
-                first_line = idx_cell.get("first_line", "(empty)")
-            else:
-                for line in source_str.splitlines():
-                    s = line.strip()
-                    if s:
-                        first_line = s[:120]
-                        break
-
-            print(_format_result(display, i, first_line))
+        for i, shown in _search_notebook_cells(nb, index_cells, q_lower,
+                                               type_filter, section_filter,
+                                               in_outputs):
+            print(_format_result(display, i, shown))
             count += 1
+            if limit is not None and count >= limit:
+                return count
 
+    # Fourth pass: search unindexed notebooks directly (no index metadata —
+    # --section can never match, first_line falls back to the source).
+    for candidate in unindexed_notebooks:
+        display = _display_path(candidate, search_root)
+        nb = _open_notebook(candidate, display)
+        if nb is None:
+            continue
+        for i, shown in _search_notebook_cells(nb, {}, q_lower,
+                                               type_filter, section_filter,
+                                               in_outputs):
+            print(_format_result(display, i, shown))
+            count += 1
             if limit is not None and count >= limit:
                 return count
 
@@ -636,6 +764,8 @@ def _search_symbol(
     Returns number of results printed.
     """
     count = 0
+    dedup = {"claimed": {}, "warned": set()}
+    stale_checked = set()  # notebooks whose staleness was already reported
 
     for index_dir_str, filenames in _walk_for_index_dirs(search_root):
         index_dir_path = Path(index_dir_str)
@@ -669,34 +799,50 @@ def _search_symbol(
                             continue
                         if not _in_scope(candidate, search_root):
                             continue  # safe, but outside the requested search scope
-                        try:
-                            display = str(candidate.relative_to(search_root))
-                        except ValueError:
-                            display = str(candidate)
+                        display = _display_path(candidate, search_root)
+                        if not _claim_notebook(candidate, index_dir_str,
+                                               dedup, search_root):
+                            continue
                         # We need cell metadata — load per-notebook index
                         # to apply type/section filters and get first_line
                         # Find per-notebook index file
                         nb_index_file, _, _ = _index_file_path(candidate)
                         first_line = f"cell {cell_idx}"
                         cell_type = "code"
-                        if nb_index_file.exists():
-                            try:
-                                with open(nb_index_file, encoding="utf-8") as nf:
-                                    nb_idx = json.load(nf)
-                                cells_list = nb_idx.get("cells", [])
-                                for c in cells_list:
-                                    if not isinstance(c, dict) or "i" not in c:
-                                        continue
-                                    if c.get("i") == cell_idx:
-                                        first_line = c.get("first_line", first_line)
-                                        cell_type = c.get("type", cell_type)
-                                        if type_filter and cell_type != type_filter:
-                                            first_line = None
-                                        if section_filter and not _cell_passes_section(c, section_filter):
-                                            first_line = None
-                                        break
-                            except (json.JSONDecodeError, OSError):
-                                pass
+                        nb_idx = None
+                        try:
+                            with open(nb_index_file, encoding="utf-8") as nf:
+                                nb_idx = json.load(nf)
+                        except (json.JSONDecodeError, OSError):
+                            nb_idx = None
+                        if nb_idx is None:
+                            # Cannot apply requested filters without the
+                            # per-notebook index — skip rather than emit an
+                            # unfiltered result.
+                            if type_filter or section_filter:
+                                print(f"[WARN] {_sanitise(display)}: cannot apply "
+                                      "--type/--section filter (index unreadable), "
+                                      "result skipped", file=sys.stderr)
+                                continue
+                        else:
+                            # Per-notebook staleness (§12.6): warn, return anyway
+                            if candidate not in stale_checked:
+                                stale_checked.add(candidate)
+                                if _check_staleness(nb_idx, candidate):
+                                    print(f"[STALE] {_sanitise(display)}",
+                                          file=sys.stderr)
+                            cells_list = nb_idx.get("cells", [])
+                            for c in cells_list:
+                                if not isinstance(c, dict) or "i" not in c:
+                                    continue
+                                if c.get("i") == cell_idx:
+                                    first_line = c.get("first_line", first_line)
+                                    cell_type = c.get("type", cell_type)
+                                    if type_filter and cell_type != type_filter:
+                                        first_line = None
+                                    if section_filter and not _cell_passes_section(c, section_filter):
+                                        first_line = None
+                                    break
 
                         if first_line is None:
                             continue
@@ -737,10 +883,10 @@ def _search_symbol(
             if not _in_scope(candidate, search_root):
                 continue  # safe, but outside the requested search scope
 
-            try:
-                display = str(candidate.relative_to(search_root))
-            except ValueError:
-                display = str(candidate)
+            if not _claim_notebook(candidate, index_dir_str, dedup, search_root):
+                continue
+
+            display = _display_path(candidate, search_root)
 
             for cell in index_data.get("cells", []):
                 if not isinstance(cell, dict) or "i" not in cell:
@@ -753,6 +899,13 @@ def _search_symbol(
                     continue
                 if section_filter and not _cell_passes_section(cell, section_filter):
                     continue
+
+                # Per-notebook staleness (§12.6): warn on first match for
+                # this notebook, return the result anyway.
+                if candidate not in stale_checked:
+                    stale_checked.add(candidate)
+                    if _check_staleness(index_data, candidate):
+                        print(f"[STALE] {_sanitise(display)}", file=sys.stderr)
 
                 first_line = cell.get("first_line", f"cell {cell['i']}")
                 print(_format_result(display, cell["i"], first_line))
@@ -776,6 +929,8 @@ def _search_import(
     Returns number of results printed.
     """
     count = 0
+    dedup = {"claimed": {}, "warned": set()}
+    stale_checked = set()  # notebooks whose staleness was already reported
 
     for index_dir_str, filenames in _walk_for_index_dirs(search_root):
         index_dir_path = Path(index_dir_str)
@@ -810,30 +965,46 @@ def _search_import(
                                 continue
                             if not _in_scope(candidate, search_root):
                                 continue  # safe, but out of scope
-                            try:
-                                display = str(candidate.relative_to(search_root))
-                            except ValueError:
-                                display = str(candidate)
+                            display = _display_path(candidate, search_root)
+                            if not _claim_notebook(candidate, index_dir_str,
+                                                   dedup, search_root):
+                                continue
                             # Load per-notebook index for filters and first_line
                             nb_index_file, _, _ = _index_file_path(candidate)
                             first_line = f"cell {cell_idx}"
-                            if nb_index_file.exists():
-                                try:
-                                    with open(nb_index_file, encoding="utf-8") as nf:
-                                        nb_idx = json.load(nf)
-                                    for c in nb_idx.get("cells", []):
-                                        if not isinstance(c, dict) or "i" not in c:
-                                            continue
-                                        if c.get("i") == cell_idx:
-                                            first_line = c.get("first_line", first_line)
-                                            cell_type = c.get("type", "code")
-                                            if type_filter and cell_type != type_filter:
-                                                first_line = None
-                                            if section_filter and not _cell_passes_section(c, section_filter):
-                                                first_line = None
-                                            break
-                                except (json.JSONDecodeError, OSError):
-                                    pass
+                            nb_idx = None
+                            try:
+                                with open(nb_index_file, encoding="utf-8") as nf:
+                                    nb_idx = json.load(nf)
+                            except (json.JSONDecodeError, OSError):
+                                nb_idx = None
+                            if nb_idx is None:
+                                # Cannot apply requested filters without the
+                                # per-notebook index — skip rather than emit
+                                # an unfiltered result.
+                                if type_filter or section_filter:
+                                    print(f"[WARN] {_sanitise(display)}: cannot apply "
+                                          "--type/--section filter (index unreadable), "
+                                          "result skipped", file=sys.stderr)
+                                    continue
+                            else:
+                                # Per-notebook staleness (§12.6): warn, return anyway
+                                if candidate not in stale_checked:
+                                    stale_checked.add(candidate)
+                                    if _check_staleness(nb_idx, candidate):
+                                        print(f"[STALE] {_sanitise(display)}",
+                                              file=sys.stderr)
+                                for c in nb_idx.get("cells", []):
+                                    if not isinstance(c, dict) or "i" not in c:
+                                        continue
+                                    if c.get("i") == cell_idx:
+                                        first_line = c.get("first_line", first_line)
+                                        cell_type = c.get("type", "code")
+                                        if type_filter and cell_type != type_filter:
+                                            first_line = None
+                                        if section_filter and not _cell_passes_section(c, section_filter):
+                                            first_line = None
+                                        break
                             if first_line is None:
                                 continue
                             print(_format_result(display, cell_idx, first_line))
@@ -872,10 +1043,10 @@ def _search_import(
             if not _in_scope(candidate, search_root):
                 continue  # safe, but outside the requested search scope
 
-            try:
-                display = str(candidate.relative_to(search_root))
-            except ValueError:
-                display = str(candidate)
+            if not _claim_notebook(candidate, index_dir_str, dedup, search_root):
+                continue
+
+            display = _display_path(candidate, search_root)
 
             for cell in index_data.get("cells", []):
                 if not isinstance(cell, dict) or "i" not in cell:
@@ -889,6 +1060,13 @@ def _search_import(
                     continue
                 if section_filter and not _cell_passes_section(cell, section_filter):
                     continue
+
+                # Per-notebook staleness (§12.6): warn on first match for
+                # this notebook, return the result anyway.
+                if candidate not in stale_checked:
+                    stale_checked.add(candidate)
+                    if _check_staleness(index_data, candidate):
+                        print(f"[STALE] {_sanitise(display)}", file=sys.stderr)
 
                 first_line = cell.get("first_line", f"cell {cell['i']}")
                 print(_format_result(display, cell["i"], first_line))
@@ -929,12 +1107,18 @@ def main():
 
     parser.add_argument("--limit", type=validate_limit, default=None,
                         help="Stop after N results")
+    parser.add_argument("--in-outputs", dest="in_outputs", action="store_true",
+                        help="Keyword mode only: also match output text "
+                             "(stream text, text/plain, tracebacks) of code cells")
     parser.add_argument("query", help="Search query")
     parser.add_argument("search_root", help="Directory to search")
 
     # Custom error handling for exit code 2
     try:
         args = parser.parse_args()
+        if args.in_outputs and (args.symbol or args.import_mode):
+            parser.error("--in-outputs is only valid in keyword mode "
+                         "(cannot be combined with --symbol/--import)")
     except SystemExit:
         sys.exit(2)
 
@@ -961,7 +1145,8 @@ def main():
     elif args.import_mode:
         count = _search_import(query, search_root, type_filter, section_filter, limit)
     else:
-        count = _search_keyword(query, search_root, type_filter, section_filter, limit)
+        count = _search_keyword(query, search_root, type_filter, section_filter,
+                                limit, in_outputs=args.in_outputs)
 
     sys.exit(0 if count > 0 else 1)
 

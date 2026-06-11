@@ -186,12 +186,12 @@ Catalogue of known limitations/faults from an adversarial code review. Severity 
 
 - [x] **Searching from a repo subdirectory finds nothing** (`nb-search.py:155-175`): indexes live at `<git-root>/.nb_index/`, above the search root, so the walk never reaches them — exit 1, "no matches".
 - [x] **Relative `notebook_path` resolved against search root, not git root** (`nb-search.py:214`): searching from a parent of several repos resolves every path wrong and silently excludes the notebooks as unsafe.
-- [ ] **`--symbol`/`--import` modes never check staleness** — only keyword mode calls `_check_staleness`; stale results print with no `[STALE]` warning.
-- [ ] **Unindexed notebooks excluded from keyword results** (`nb-search.py:409-423`) even though keyword mode opens the `.ipynb` anyway; `[UNINDEXED]` goes to stderr only. In symbol/import modes they are invisible with no warning at all.
-- [ ] symbols.json fast path drops `--type`/`--section` filtering when the per-notebook index is missing/unreadable (`nb-search.py:535-553, 663-677`) — results that should be excluded are included.
+- [x] **`--symbol`/`--import` modes never check staleness** — only keyword mode calls `_check_staleness`; stale results print with no `[STALE]` warning.
+- [x] **Unindexed notebooks excluded from keyword results** (`nb-search.py:409-423`) even though keyword mode opens the `.ipynb` anyway; `[UNINDEXED]` goes to stderr only. In symbol/import modes they are invisible with no warning at all.
+- [x] symbols.json fast path drops `--type`/`--section` filtering when the per-notebook index is missing/unreadable (`nb-search.py:535-553, 663-677`) — results that should be excluded are included.
 - [x] Inconsistent case sensitivity: keyword search case-insensitive, symbol/import exact-match only; undocumented.
 - [x] `MAX_FILE_SIZE` (`nb-search.py:33`) defined but never enforced — violates the 100 MB invariant; keyword mode `json.load`s and staleness hashing reads every notebook in full.
-- [ ] Staleness "fast path" comment is false (`nb-search.py:136-148`): the full notebook is hashed even when mtime+size match, making every keyword search O(total notebook bytes).
+- [x] Staleness "fast path" comment is false (`nb-search.py:136-148`): the full notebook is hashed even when mtime+size match, making every keyword search O(total notebook bytes).
 - [x] `.ipynb_checkpoints` not in `SKIP_DIRS` — Jupyter checkpoint copies generate `[UNINDEXED]` noise and potential duplicate hits.
 - [x] Unguarded `c["i"]` access crashes the whole search on a malformed-but-parseable index file (`nb-search.py:434, 604, 730`); corrupt notebooks in pass 3 are skipped with no signal (`:428-431`).
 - [x] `--limit 0`/negative behaves inconsistently across modes (`nb-search.py:477, 557-561`); no argparse validation.
@@ -225,7 +225,7 @@ Catalogue of known limitations/faults from an adversarial code review. Severity 
 - [ ] Safe mode strips ANSI from source but not C0 controls (`nb-read.py:213-214`) — raw BEL/backspace/`\r` in source pass through, weakening the documented sanitisation invariant.
 - [ ] Outline mode trusts index structure: cells missing `"i"` raise uncaught `KeyError` instead of falling back (`nb-read.py:454-455`); freshness check validates mtime/size only, not schema.
 - [ ] Freshness is mtime+size only (`nb-read.py:129-137`): same-size writes within mtime granularity (or `cp -p`/git checkout) yield falsely-fresh outlines with no `[STALE INDEX]` warning.
-- [ ] `_extract_output_text` joins parts with `""` (`nb-read.py:299`) — outputs without trailing newlines glue onto one line.
+- [x] `_extract_output_text` joins parts with `""` (`nb-read.py:299`) — closed as BY DESIGN: `""`-joining is correct Jupyter stream semantics (partial writes form one logical line); deliberately restored in the 2026-06-11 --outputs fix.
 - [ ] `MAX_RANGE_SIZE = 10_000` rejects valid `--cells` ranges on genuinely huge notebooks, no override (`nb-read.py:159-161`).
 - [ ] Markdown `attachments` (embedded images) and raw-cell mimetypes never rendered or summarised.
 
@@ -242,10 +242,10 @@ Catalogue of known limitations/faults from an adversarial code review. Severity 
 
 ### Open findings from 2026-06-11 adversarial review of commit 799a973
 
-- [ ] **Duplicate results, no cross-index dedup** (`nb-search.py`): a notebook with a legacy pre-`git init` per-directory `.nb_index` plus a git-root index is reachable via both walks — matches print twice, `--limit` consumed by duplicates. Needs result dedup by resolved notebook path (and ideally legacy-index GC).
-- [ ] **Symlinked `.nb_index` divergence** (`nb-search.py:186` vs nb-index): upward walk rejects a symlinked `.nb_index` silently while nb-index writes through one — writes succeed, searches find nothing, no warning.
-- [ ] **Indexed-but-unsearchable notebooks** (`nb-search.py` `_collect_index_files`): nb-index writes indexes for notebooks under `venv/`/`node_modules/` etc., but search prunes those names inside the index mirror — written, invisible, and no `[UNINDEXED]` warning either.
-- [ ] **Route-dependent depth budgets** (`nb-search.py`): downward walk caps `MAX_WALK_DEPTH` from search_root, `_collect_index_files` caps from the `.nb_index` dir (~double effective budget); nested `.nb_index` dirs under a discovered one are collected under the wrong `index_base` instead of being yielded separately.
+- [x] **Duplicate results, no cross-index dedup** (`nb-search.py`): a notebook with a legacy pre-`git init` per-directory `.nb_index` plus a git-root index is reachable via both walks — matches print twice, `--limit` consumed by duplicates. Needs result dedup by resolved notebook path (and ideally legacy-index GC).
+- [x] **Symlinked `.nb_index` divergence** (`nb-search.py:186` vs nb-index): upward walk rejects a symlinked `.nb_index` silently while nb-index writes through one — writes succeed, searches find nothing, no warning.
+- [x] **Indexed-but-unsearchable notebooks** (`nb-search.py` `_collect_index_files`): nb-index writes indexes for notebooks under `venv/`/`node_modules/` etc., but search prunes those names inside the index mirror — written, invisible, and no `[UNINDEXED]` warning either.
+- [x] **Route-dependent depth budgets** (`nb-search.py`): downward walk caps `MAX_WALK_DEPTH` from search_root, `_collect_index_files` caps from the `.nb_index` dir (~double effective budget); nested `.nb_index` dirs under a discovered one are collected under the wrong `index_base` instead of being yielded separately.
 - [ ] Synthetic `--outputs` placeholder/truncation-marker lines are spoofable: genuine output text identical to them renders byte-for-byte the same (`nb-read.py` `_render_output_block`); related to the open `│ `-prefix ambiguity item.
 - [ ] `_find_upward_index_dir` is a third divergently-shaped copy of the git-root walk (`nb-search.py:164`; canonical `_find_index_dir` at `:59`) — when the worktree `.git`-as-file fix lands it must cover all three; make it a thin wrapper.
 - [ ] `_join_text` (`nb-read.py:312`) duplicates `_coerce_source` (`:184`); the text/plain-vs-legacy-`text` classification also lives in both `_placeholder_mimes` and the render branch — fold into one `_rich_text(out)` helper.
@@ -254,7 +254,7 @@ Catalogue of known limitations/faults from an adversarial code review. Severity 
 - [ ] `--outputs` truncation materialises and sanitises all lines (100k for a big stream) before slicing to `truncate` — stop accumulating at `truncate`+1.
 - [ ] Re-read hint strings are built separately in `render_source` and `_render_output_block` with different wording — extract a shared hint builder.
 - [ ] `test_search_from_subdirectory_symbols_json_fast_path` never forces the fast path (serial scan satisfies the same assertions) — false coverage; corrupt the per-notebook index to make it real.
-- [ ] **Keyword search matches cell source only, never output text** (`nb-search.py` keyword pass): "find the notebook that printed this error" returns nothing even though the index stores `output_text` — either search indexed output text too (opt-in flag or by default) or document the limitation in SKILL.md. Found during 2026-06-11 smoke testing.
+- [x] **Keyword search matches cell source only, never output text** (`nb-search.py` keyword pass): "find the notebook that printed this error" returns nothing even though the index stores `output_text` — either search indexed output text too (opt-in flag or by default) or document the limitation in SKILL.md. Found during 2026-06-11 smoke testing.
 - [ ] Summary/`--outputs` placeholder agreement is a bolt-on `+1` against a structurally different counter — derive the summary count from the renderer (blocked on the still-open `out["text"]` vs `data["text/plain"]` summary item).
 
 ### Harness-assumption vetting (2026-06-11, against code.claude.com docs)

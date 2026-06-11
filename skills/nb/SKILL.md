@@ -140,10 +140,14 @@ python3 "$NB_SCRIPTS/nb-search.py" --import pandas .       # import statements (
 | `--type code\|markdown\|raw` | Filter by cell type |
 | `--section <name>` | Filter by markdown section |
 | `--limit N` | Stop after N results (must be ≥ 1) |
+| `--in-outputs` | Keyword mode only: also match output text (streams, results, tracebacks); hits show `[output]` |
 
 Result format: `<notebook-path>:<cell-index>: <first line of cell>`. Keyword mode is
 case-insensitive; `--symbol` and `--import` are exact-match and case-sensitive.
-Warnings like `[UNINDEXED]` / `[STALE]` go to stderr — see Failures below.
+Unindexed notebooks are still searched in keyword mode (noted `[UNINDEXED] … searched
+directly` on stderr); all modes warn `[STALE]` on stderr when an index is out of date
+but still return results — re-run `nb-index.py` to refresh. `[DUP]` notes a notebook
+shadowed by a second index file.
 
 ---
 
