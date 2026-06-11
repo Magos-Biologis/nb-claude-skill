@@ -373,3 +373,120 @@ class TestAtomicWriteRetry:
                 f"_die() — this exits 1 but index write failures must exit 0 "
                 f"(§15.3 / §2.14 Bug B3).\nBlock body:\n{block_src}"
             )
+
+
+# ===========================================================================
+# Portable lock helper — fcntl → msvcrt fallback (2026-06 concurrency batch)
+# ===========================================================================
+
+import importlib.util
+import types
+from unittest import mock
+
+LOCKING_SCRIPTS = [NB_WRITE_PY, NB_INDEX_PY]
+
+
+def _fake_msvcrt():
+    """A stand-in msvcrt module whose locking() calls are recorded."""
+    return types.SimpleNamespace(
+        LK_LOCK=1, LK_UNLCK=0, LK_NBLCK=2, locking=mock.Mock()
+    )
+
+
+def _load_script_module(script: Path, modules_patch: dict):
+    """Exec a script as a module with selected entries forced into sys.modules.
+
+    Mapping a name to None makes 'import <name>' raise ImportError, which is
+    how we simulate a platform without fcntl.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "lock_helper_under_test_" + script.stem.replace("-", "_"), str(script)
+    )
+    mod = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(sys.modules, modules_patch):
+        spec.loader.exec_module(mod)
+    return mod
+
+
+class TestPortableLockHelper:
+    """The lock helper must fall back to msvcrt.locking when fcntl is absent
+    (Windows), and only no-op when neither primitive exists."""
+
+    @pytest.mark.parametrize("script", LOCKING_SCRIPTS, ids=lambda p: p.name)
+    def test_msvcrt_branch_selected_when_fcntl_absent(self, script):
+        fake = _fake_msvcrt()
+        mod = _load_script_module(script, {"fcntl": None, "msvcrt": fake})
+        assert mod._LOCK_BACKEND == "msvcrt", (
+            f"{script.name}: without fcntl the helper must select the msvcrt "
+            f"backend, got {mod._LOCK_BACKEND!r}"
+        )
+
+    @pytest.mark.parametrize("script", LOCKING_SCRIPTS, ids=lambda p: p.name)
+    def test_msvcrt_locking_invoked_on_lock(self, script, tmp_path):
+        fake = _fake_msvcrt()
+        mod = _load_script_module(script, {"fcntl": None, "msvcrt": fake})
+        with open(tmp_path / "x.nblock", "a") as f:
+            assert mod._lock_file(f, blocking=True) is True
+            fake.locking.assert_called_once()
+            fd_arg, mode_arg, nbytes_arg = fake.locking.call_args[0]
+            assert fd_arg == f.fileno()
+            assert mode_arg == fake.LK_LOCK, (
+                "Blocking acquire must use LK_LOCK (blocking exclusive)"
+            )
+            assert nbytes_arg >= 1
+
+    @pytest.mark.parametrize("script", LOCKING_SCRIPTS, ids=lambda p: p.name)
+    def test_msvcrt_nonblocking_uses_lk_nblck(self, script, tmp_path):
+        fake = _fake_msvcrt()
+        mod = _load_script_module(script, {"fcntl": None, "msvcrt": fake})
+        with open(tmp_path / "x.nblock", "a") as f:
+            mod._lock_file(f, blocking=False)
+            assert fake.locking.call_args[0][1] == fake.LK_NBLCK
+
+    @pytest.mark.parametrize("script", LOCKING_SCRIPTS, ids=lambda p: p.name)
+    def test_msvcrt_unlock_uses_lk_unlck(self, script, tmp_path):
+        fake = _fake_msvcrt()
+        mod = _load_script_module(script, {"fcntl": None, "msvcrt": fake})
+        with open(tmp_path / "x.nblock", "a") as f:
+            mod._lock_file(f, blocking=True)
+            mod._unlock_file(f)
+            assert fake.locking.call_args[0][1] == fake.LK_UNLCK, (
+                "_unlock_file must release via msvcrt.locking(..., LK_UNLCK, ...)"
+            )
+
+    @pytest.mark.parametrize("script", LOCKING_SCRIPTS, ids=lambda p: p.name)
+    def test_no_backend_is_noop(self, script, tmp_path):
+        """With neither fcntl nor msvcrt, locking degrades to a no-op."""
+        mod = _load_script_module(script, {"fcntl": None, "msvcrt": None})
+        assert mod._LOCK_BACKEND is None
+        with open(tmp_path / "x.nblock", "a") as f:
+            assert mod._lock_file(f, blocking=True) is True
+            mod._unlock_file(f)  # must not raise
+
+    @pytest.mark.parametrize("script", LOCKING_SCRIPTS, ids=lambda p: p.name)
+    def test_fcntl_preferred_when_available(self, script):
+        """On POSIX (fcntl importable) the fcntl backend is selected."""
+        if importlib.util.find_spec("fcntl") is None:
+            pytest.skip("fcntl not available on this platform")
+        mod = _load_script_module(script, {})
+        assert mod._LOCK_BACKEND == "fcntl"
+
+    def test_helper_is_verbatim_copy_in_both_scripts(self):
+        """The repo convention is no shared imports between standalone scripts:
+        the _lock_file/_unlock_file helper bodies must be identical copies."""
+        import re as _re
+
+        def _extract(src: str, name: str) -> str:
+            # def line followed by indented-or-blank lines (the function body)
+            m = _re.search(
+                rf"^def {name}\(.*\n(?:(?:[ \t].*)?\n)*", src, _re.MULTILINE
+            )
+            assert m, f"{name} not found"
+            return m.group(0).strip()
+
+        write_src = NB_WRITE_PY.read_text(encoding="utf-8")
+        index_src = NB_INDEX_PY.read_text(encoding="utf-8")
+        for fn in ("_lock_file", "_unlock_file"):
+            assert _extract(write_src, fn) == _extract(index_src, fn), (
+                f"{fn} must be a verbatim copy in nb-write.py and nb-index.py"
+            )

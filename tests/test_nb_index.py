@@ -1643,6 +1643,48 @@ class TestWriteIntegration:
             f"got: {lines[1]!r}"
         )
 
+    # -- synchronous indexing (2026-06 concurrency batch) -------------------
+
+    def test_sync_indexing_index_fresh_when_patch_returns(self, tmp_path):
+        """Indexing is synchronous: by the time nb-write patch returns, the
+        per-notebook index already reflects the change — no sleep/poll."""
+        nb = make_notebook([code_cell("old_value = 1\n")], tmp_path=tmp_path)
+        src = tmp_path / "src.py"
+        src.write_text("brand_new_symbol = 42\n", encoding="utf-8")
+
+        r = self._run_write([nb, "patch", "0", "-f", src])
+
+        assert r.returncode == 0, r.stderr
+        idx = index_path_for(nb)
+        assert idx.exists(), (
+            "Index must already exist when nb-write returns (synchronous indexing)"
+        )
+        data = load_index(idx)
+        assert data["cells"][0]["first_line"] == "brand_new_symbol = 42"
+        assert "brand_new_symbol" in data["cells"][0]["symbols_defined"]
+
+    def test_index_failure_surfaces_warn_on_stderr(self, tmp_path):
+        """A failing nb-index run must surface '[warn] indexing failed' on
+        nb-write's stderr — but the write itself still exits 0."""
+        nb = make_notebook([code_cell("x = 1\n")], tmp_path=tmp_path)
+        # Sabotage indexing: .nb_index exists as a FILE, so mkdir() fails.
+        (tmp_path / ".nb_index").write_text("not a directory", encoding="utf-8")
+        src = tmp_path / "src.py"
+        src.write_text("y = 2\n", encoding="utf-8")
+
+        r = self._run_write([nb, "patch", "0", "-f", src])
+
+        assert r.returncode == 0, (
+            f"The write succeeded — indexing failure must not change the exit "
+            f"code: {r.stderr}"
+        )
+        assert "[warn] indexing failed" in r.stderr, (
+            f"Expected '[warn] indexing failed: ...' on stderr, got: {r.stderr!r}"
+        )
+        # The notebook write itself happened
+        data = json.loads(nb.read_text(encoding="utf-8"))
+        assert "y = 2" in "".join(data["cells"][0]["source"])
+
 
 # ---------------------------------------------------------------------------
 # §13 — Project-level symbol cache (symbols.json)
@@ -1793,6 +1835,50 @@ class TestSymbolCache:
                 assert index_part.isdigit(), (
                     f"Cell index in location must be a non-negative integer, got: {index_part!r}"
                 )
+
+    # -- GC + lockfile persistence (2026-06 concurrency batch) --------------
+
+    def test_symbols_gc_removes_entries_for_deleted_notebook(self, tmp_path):
+        """Location entries whose notebook no longer exists on disk are dropped
+        during the next symbols.json update (garbage collection)."""
+        nb_keep = make_notebook(
+            [code_cell("def keeper_fn():\n    pass\n")],
+            tmp_path=tmp_path, name="keep.ipynb"
+        )
+        nb_gone = make_notebook(
+            [code_cell("def goner_fn():\n    pass\n")],
+            tmp_path=tmp_path, name="gone.ipynb"
+        )
+        run_indexer(nb_keep)
+        run_indexer(nb_gone)
+        symbols_path = tmp_path / ".nb_index" / "symbols.json"
+        data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        assert "goner_fn" in data["symbols"], "Precondition: goner_fn indexed"
+
+        # Delete the notebook from disk, then reindex the surviving one
+        nb_gone.unlink()
+        r = run_indexer(nb_keep, extra_args=["--force"])
+        assert r.returncode == 0, r.stderr
+
+        data = json.loads(symbols_path.read_text(encoding="utf-8"))
+        assert "goner_fn" not in data.get("symbols", {}), (
+            "Symbols of a deleted notebook must be garbage-collected"
+        )
+        assert "keeper_fn" in data.get("symbols", {}), (
+            "Symbols of existing notebooks must survive GC"
+        )
+
+    def test_symbols_nblock_not_deleted_after_run(self, tmp_path):
+        """symbols.nblock must persist after the indexer exits — deleting it
+        after release is a lock-identity race (two processes could each lock
+        a different inode of 'the same' lock file)."""
+        nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
+        r = run_indexer(nb)
+        assert r.returncode == 0
+        lock_path = tmp_path / ".nb_index" / "symbols.nblock"
+        assert lock_path.exists(), (
+            "symbols.nblock must NOT be unlinked after the lock is released"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1981,6 +2067,9 @@ class TestEdgeCases:
         We check for ALL non-.json files in .nb_index/ — this catches .nb_tmp, .tmp,
         .json.tmp, randomly-named temp files, and any other intermediate suffix the
         implementation might use, not just the single *.nb_tmp pattern.
+
+        *.nblock lock files are exempt: they persist by design (deleting a lock
+        file after release is a race) and are gitignored.
         """
         nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
         for _ in range(5):
@@ -1988,7 +2077,7 @@ class TestEdgeCases:
         nb_index_dir = tmp_path / ".nb_index"
         non_json = [
             p for p in nb_index_dir.iterdir()
-            if p.suffix != ".json"
+            if p.suffix not in (".json", ".nblock")
         ]
         assert non_json == [], (
             f"Orphaned non-JSON files found in .nb_index/: {non_json}"

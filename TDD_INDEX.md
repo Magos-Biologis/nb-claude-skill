@@ -247,7 +247,9 @@ the current `nb-index.py` file; if it is later replaced (hot-reload, symlink
 swap), the import-time-resolved path points to the old inode while the
 existence check passes for the new one.
 
-The Popen call must be:
+The invocation is **synchronous, best-effort** (amended 2026-06-11: the
+original fire-and-forget Popen with DEVNULL stdio made every indexing
+failure invisible — symbols.json silently diverged with no retry):
 
 ```python
 _NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-level
@@ -255,17 +257,23 @@ _NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-
 # … inside the post-save code path …
 if _NB_INDEX_SIBLING.exists():   # follows symlinks; correct for symlink nb-index.py
     _script = _NB_INDEX_SIBLING.resolve()   # resolved HERE, at call time
-    subprocess.Popen(
+    r = subprocess.run(
         [sys.executable, str(_script), str(Path(nb_path).resolve())],
         shell=False,          # NEVER shell=True — path may contain metacharacters
         close_fds=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True, text=True,
     )
+    if r.returncode != 0:
+        # surface the tail of the child's stderr; the write still succeeds
+        print(f"[warn] indexing failed: <stderr tail>", file=sys.stderr)
 else:
     print(f"[warn] nb-index.py not found at {_NB_INDEX_SIBLING}; "
           f"skipping auto-index", file=sys.stderr)
 ```
+
+Synchronous execution also guarantees the index is current the moment
+nb-write returns (no write→index race window). Single-notebook indexing
+is milliseconds, so write latency is unaffected.
 
 The existence check uses the **unresolved sibling path** so that a symlink
 `nb-index.py -> real_script.py` is treated as present. The `.resolve()` call
@@ -287,14 +295,21 @@ be detected and rebuilt on next access.' The lock on the notebook's
 `.nblock` file (from nb-write.py) ensures sequential writes; the
 optimistic check is a second-layer defence for external modifications.
 
-**Per-notebook index writes do not use flock.** Serialisation for the
-per-notebook `.json` file relies on the optimistic concurrency check above
-plus the `os.replace()` atomicity guarantee. `flock` is used only for
-`symbols.json` (§13.6) because that file is shared across all notebooks.
+**Per-notebook index writes hold the notebook's `.nblock`** (amended
+2026-06-11: the lock-free design left a stat→`os.replace` window where a
+stale index could clobber a fresher one). The indexer acquires the same
+companion `.nblock` nb-write uses, blocking with a ~10 s timeout, across
+the final re-stat + atomic replace; on timeout it warns and skips the
+index write (exit 0). The optimistic re-stat check above is retained as
+the second-layer defence for external modifications. Lockfiles are never
+unlinked after release — unlink-after-release is an inode race (process B
+can lock the old inode just before it is unlinked while process C creates
+and locks a fresh one).
 
-**Indexing failures must not fail the write:** if the Popen call raises
-or the child exits non-zero, `nb-write.py` continues normally. Indexing
-is best-effort.
+**Indexing failures must not fail the write:** if the subprocess call
+raises or the child exits non-zero, `nb-write.py` prints a `[warn]` with
+the child's stderr tail and continues normally (exit 0). Indexing is
+best-effort but no longer silent.
 
 ---
 
@@ -1044,14 +1059,20 @@ without `Popen` + line-by-line reading. A follow-up test using `Popen` with
 ### 12.11 `--limit N` flag
 Stop after N results (default: no limit).
 
-### 12.12 `notebook_path` field validated against search root
+### 12.12 `notebook_path` field validated against its index base
 A crafted index file with `"notebook_path": "../../../../etc/passwd"`
 must not cause nb-search to open that path.
 
+(Amended 2026-06-11: containment is checked against the parent of the
+`.nb_index` dir that contains the index file — `index_base` — because
+stored relative paths are index-base-relative, not search-root-relative.
+A separate `_in_scope` filter then restricts results to `search_root`:
+out-of-scope is a silent skip, escaping the index base is a warned skip.)
+
 Implementation must use:
 ```python
-candidate = (search_root / index["notebook_path"]).resolve()
-if not candidate.is_relative_to(search_root.resolve()):
+candidate = (index_base / index["notebook_path"]).resolve()
+if not candidate.is_relative_to(index_base.resolve()):
     warn_and_skip()
     continue
 # Only now open `candidate`
@@ -1144,11 +1165,19 @@ nb-search.py works correctly without it.
 ### 13.6 Atomic write with lock for concurrent indexers
 symbols.json is written using the same temp-file + fsync + `os.replace()`
 pattern as notebook writes. Before reading and writing symbols.json,
-acquire a `LOCK_EX` flock on `.nb_index/symbols.nblock` (companion lock
-file). Use non-blocking try (`LOCK_EX | LOCK_NB`): if the lock is
-unavailable, skip the symbols.json update silently — the other indexer
-will write a consistent version. nb-search falls back to serial scan per
-§13.3.
+acquire an exclusive lock on `.nb_index/symbols.nblock` (companion lock
+file) using the portable lock helper (fcntl on POSIX, msvcrt on Windows),
+**blocking with a ~10 s timeout** implemented as a non-blocking poll loop.
+On timeout, print `[warn] symbols.json lock busy — symbol update skipped`
+to stderr and skip the update. (Amended 2026-06-11: the original
+`LOCK_EX | LOCK_NB` silent skip rested on the false premise that "the
+other indexer will write a consistent version" — updates are incremental
+per-notebook merges, so a skipped update was simply lost until the next
+write to that specific notebook.) The lockfile is never unlinked after
+release (inode race). nb-search falls back to serial scan per §13.3.
+During the update, location entries whose notebook no longer exists on
+disk are garbage-collected (resolved against the index base, one
+existence check per distinct notebook per run).
 
 ### 13.7 Version compatibility
 `version > 1` → log warning to stderr, skip, fall back to serial scan.
@@ -1157,7 +1186,8 @@ per-notebook indices.
 ### 13.8 Location strings in symbols.json validated on read
 Location strings (e.g. `"analysis.ipynb:22"`) are split on `:` to
 extract the notebook path portion. That path is then validated with
-the same `is_relative_to(search_root.resolve())` check as §12.12.
+the same `is_relative_to(index_base.resolve())` containment check as
+§12.12 (index_base = parent of the `.nb_index` dir holding symbols.json).
 A crafted `symbols.json` with `"../../../../etc/passwd:0"` must not
 cause nb-search to open `/etc/passwd`.
 

@@ -5,7 +5,12 @@ Tests for new/fixed nb-write.py features:
   - PermissionError on os.replace gives a useful message
   - File locking serialises concurrent writers (POSIX only)
 
-All tests red until the corresponding changes are made to nb-write.py.
+2026-06 concurrency/data-safety batch:
+  - no-op patch leaves the file byte-identical and skips the reindex
+  - cell ids follow the notebook's nbformat_minor (>= 4.5 only)
+  - duplicate pre-existing cell ids produce a stderr warning
+  - 100 MB policy: patch/delete may shrink an oversized file; growth refused
+  - nb["cells"] of wrong type dies cleanly
 """
 
 import json
@@ -263,3 +268,362 @@ class TestConcurrentWriteSerialisation:
         src_1 = "".join(nb["cells"][1]["source"])
         assert "final_cell_0" in src_0, f"Cell 0 lost: {src_0!r}"
         assert "final_cell_1" in src_1, f"Cell 1 lost: {src_1!r}"
+
+
+# ---------------------------------------------------------------------------
+# § no-op patch (source identical → no write, no reindex)
+# ---------------------------------------------------------------------------
+
+class TestNoOpPatch:
+
+    def _nb_with_outputs(self, tmp_path):
+        """Notebook whose cell 0 has outputs and an execution_count."""
+        return _make_nb([{
+            "cell_type": "code",
+            "source": ["x = 1\n", "print(x)\n"],
+            "outputs": [{"output_type": "stream", "name": "stdout", "text": ["1\n"]}],
+            "execution_count": 7,
+        }], tmp_path)
+
+    def test_noop_patch_exits_zero_and_prints_notice(self, tmp_path):
+        p = self._nb_with_outputs(tmp_path)
+        src = tmp_path / "same.py"
+        src.write_text("x = 1\nprint(x)\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0, f"no-op patch must exit 0: {r.stderr}"
+        assert "unchanged" in r.stderr and "no write" in r.stderr, (
+            f"Expected 'cell 0 unchanged — no write' notice, got: {r.stderr!r}"
+        )
+        assert r.stdout == ""
+
+    def test_noop_patch_leaves_file_byte_identical(self, tmp_path):
+        p = self._nb_with_outputs(tmp_path)
+        before_bytes = Path(p).read_bytes()
+        before_mtime = os.stat(p).st_mtime_ns
+        src = tmp_path / "same.py"
+        src.write_text("x = 1\nprint(x)\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0
+        assert Path(p).read_bytes() == before_bytes, (
+            "No-op patch must not rewrite the file (outputs/execution_count "
+            "must be preserved)"
+        )
+        assert os.stat(p).st_mtime_ns == before_mtime, (
+            "No-op patch must not touch the file at all (mtime changed)"
+        )
+
+    def test_noop_patch_preserves_outputs(self, tmp_path):
+        p = self._nb_with_outputs(tmp_path)
+        src = tmp_path / "same.py"
+        src.write_text("x = 1\nprint(x)\n", encoding="utf-8")
+
+        run_write([p, "patch", "0", "-f", str(src)])
+
+        nb = read_nb(p)
+        assert nb["cells"][0]["outputs"] != [], "Outputs must survive a no-op patch"
+        assert nb["cells"][0]["execution_count"] == 7
+
+    def test_noop_patch_skips_reindex(self, tmp_path):
+        p = self._nb_with_outputs(tmp_path)
+        src = tmp_path / "same.py"
+        src.write_text("x = 1\nprint(x)\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0
+        assert not (tmp_path / ".nb_index").exists(), (
+            "No-op patch must not trigger indexing"
+        )
+
+    def test_non_identical_patch_still_clears_outputs(self, tmp_path):
+        """Sanity: a real patch keeps the clear-outputs behaviour."""
+        p = self._nb_with_outputs(tmp_path)
+        src = tmp_path / "diff.py"
+        src.write_text("x = 2\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0
+        nb = read_nb(p)
+        assert nb["cells"][0]["outputs"] == []
+        assert nb["cells"][0]["execution_count"] is None
+
+
+# ---------------------------------------------------------------------------
+# § cell ids follow nbformat_minor (ids only for >= 4.5; never bump version)
+# ---------------------------------------------------------------------------
+
+class TestCellIdNbformatMinor:
+
+    def _make_nb_minor(self, tmp_path, minor, with_ids):
+        nb = {
+            "nbformat": 4, "nbformat_minor": minor,
+            "metadata": {"kernelspec": {"name": "python3", "language": "python",
+                                        "display_name": "Python 3"}},
+            "cells": [],
+        }
+        cell = {"cell_type": "code", "metadata": {}, "source": ["x = 1\n"],
+                "outputs": [], "execution_count": None}
+        if with_ids:
+            cell["id"] = _cell_id()
+        nb["cells"].append(cell)
+        p = tmp_path / "minor.ipynb"
+        p.write_text(json.dumps(nb, indent=1), encoding="utf-8")
+        return str(p)
+
+    def test_insert_into_minor4_emits_no_id(self, tmp_path):
+        p = self._make_nb_minor(tmp_path, minor=4, with_ids=False)
+        src = tmp_path / "src.py"
+        src.write_text("y = 2\n", encoding="utf-8")
+
+        r = run_write([p, "insert", "0", "code", "-f", str(src)])
+
+        assert r.returncode == 0, r.stderr
+        nb = read_nb(p)
+        new_cell = nb["cells"][0]
+        assert "id" not in new_cell, (
+            f"nbformat 4.4 notebooks must not gain cell ids, got: {new_cell.get('id')!r}"
+        )
+
+    def test_insert_into_minor4_does_not_bump_version(self, tmp_path):
+        p = self._make_nb_minor(tmp_path, minor=4, with_ids=False)
+        src = tmp_path / "src.py"
+        src.write_text("y = 2\n", encoding="utf-8")
+
+        run_write([p, "insert", "0", "code", "-f", str(src)])
+
+        nb = read_nb(p)
+        assert nb["nbformat"] == 4
+        assert nb["nbformat_minor"] == 4, "nbformat_minor must never be bumped"
+
+    def test_insert_into_minor5_emits_id(self, tmp_path):
+        p = self._make_nb_minor(tmp_path, minor=5, with_ids=True)
+        src = tmp_path / "src.py"
+        src.write_text("y = 2\n", encoding="utf-8")
+
+        r = run_write([p, "insert", "0", "code", "-f", str(src)])
+
+        assert r.returncode == 0, r.stderr
+        nb = read_nb(p)
+        cid = nb["cells"][0].get("id", "")
+        assert len(cid) == 8 and cid.isalnum(), (
+            f"nbformat 4.5 notebooks must get an 8-char alnum id, got: {cid!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# § duplicate pre-existing cell ids → one-line warning (no repair)
+# ---------------------------------------------------------------------------
+
+class TestPatchIdAutofill:
+    """nbformat 4.5+ requires an id on every cell (JEP-62); patching a 4.5
+    cell that lacks one must auto-fill it. Pre-4.5 cells must NOT gain ids."""
+
+    def _nb(self, tmp_path, minor):
+        nb = {
+            "nbformat": 4, "nbformat_minor": minor,
+            "metadata": {"kernelspec": {"name": "python3", "language": "python",
+                                        "display_name": "Python 3"}},
+            "cells": [{"cell_type": "code", "metadata": {}, "source": ["a = 1\n"],
+                       "outputs": [], "execution_count": None}],  # no id
+        }
+        path = tmp_path / "t.ipynb"
+        path.write_text(json.dumps(nb), encoding="utf-8")
+        return path
+
+    def test_patch_45_cell_missing_id_gets_one(self, tmp_path):
+        nb_path = self._nb(tmp_path, 5)
+        src = tmp_path / "s.txt"; src.write_text("b = 2\n", encoding="utf-8")
+        r = run_write([str(nb_path), "patch", "0", "-f", str(src)])
+        assert r.returncode == 0, r.stderr
+        cell = json.loads(nb_path.read_text(encoding="utf-8"))["cells"][0]
+        assert "id" in cell and 1 <= len(cell["id"]) <= 64
+        assert "had no id" in r.stderr
+
+    def test_patch_44_cell_does_not_gain_id(self, tmp_path):
+        nb_path = self._nb(tmp_path, 4)
+        src = tmp_path / "s.txt"; src.write_text("b = 2\n", encoding="utf-8")
+        r = run_write([str(nb_path), "patch", "0", "-f", str(src)])
+        assert r.returncode == 0, r.stderr
+        cell = json.loads(nb_path.read_text(encoding="utf-8"))["cells"][0]
+        assert "id" not in cell
+
+    def test_noop_patch_does_not_add_id(self, tmp_path):
+        """No-op patches must stay true no-ops even when an id is missing."""
+        nb_path = self._nb(tmp_path, 5)
+        src = tmp_path / "s.txt"; src.write_text("a = 1\n", encoding="utf-8")
+        before = nb_path.read_bytes()
+        r = run_write([str(nb_path), "patch", "0", "-f", str(src)])
+        assert r.returncode == 0
+        assert nb_path.read_bytes() == before
+
+
+class TestDuplicateIdWarning:
+
+    def _nb_with_dup_ids(self, tmp_path):
+        nb = {
+            "nbformat": 4, "nbformat_minor": 5,
+            "metadata": {},
+            "cells": [
+                {"id": "dupdupd1", "cell_type": "code", "metadata": {},
+                 "source": ["a = 1\n"], "outputs": [], "execution_count": None},
+                {"id": "dupdupd1", "cell_type": "code", "metadata": {},
+                 "source": ["b = 2\n"], "outputs": [], "execution_count": None},
+            ],
+        }
+        p = tmp_path / "dups.ipynb"
+        p.write_text(json.dumps(nb, indent=1), encoding="utf-8")
+        return str(p)
+
+    def test_duplicate_ids_warn_on_stderr(self, tmp_path):
+        p = self._nb_with_dup_ids(tmp_path)
+        src = tmp_path / "src.py"
+        src.write_text("c = 3\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0, r.stderr
+        assert "duplicate" in r.stderr.lower(), (
+            f"Expected duplicate-id warning on stderr, got: {r.stderr!r}"
+        )
+        assert "dupdupd1" in r.stderr
+
+    def test_duplicate_ids_not_repaired(self, tmp_path):
+        p = self._nb_with_dup_ids(tmp_path)
+        src = tmp_path / "src.py"
+        src.write_text("c = 3\n", encoding="utf-8")
+
+        run_write([p, "patch", "0", "-f", str(src)])
+
+        nb = read_nb(p)
+        assert nb["cells"][0]["id"] == "dupdupd1"
+        assert nb["cells"][1]["id"] == "dupdupd1", (
+            "Duplicate ids must be warned about, not repaired"
+        )
+
+    def test_no_warning_for_unique_ids(self, tmp_path):
+        p = _make_nb([{"cell_type": "code", "source": ["a\n"]},
+                      {"cell_type": "code", "source": ["b\n"]}], tmp_path)
+        src = tmp_path / "src.py"
+        src.write_text("c = 3\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0
+        assert "duplicate" not in r.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# § 100 MB policy: shrink allowed on oversized files, growth refused
+# ---------------------------------------------------------------------------
+
+MAX_FILE_SIZE = 100 * 1024 * 1024
+
+
+def _make_oversized_nb(tmp_path, name="big.ipynb"):
+    """Write a notebook just over the 100 MB limit (one huge cell + one small)."""
+    huge_source = "a" * (MAX_FILE_SIZE + 2 * 1024 * 1024)  # ~102 MB cell
+    nb = {
+        "nbformat": 4, "nbformat_minor": 5,
+        "metadata": {},
+        "cells": [
+            {"id": "hugecell", "cell_type": "code", "metadata": {},
+             "source": [huge_source], "outputs": [], "execution_count": None},
+            {"id": "tinycell", "cell_type": "code", "metadata": {},
+             "source": ["x = 1\n"], "outputs": [], "execution_count": None},
+        ],
+    }
+    p = tmp_path / name
+    p.write_text(json.dumps(nb), encoding="utf-8")
+    assert p.stat().st_size > MAX_FILE_SIZE
+    return str(p)
+
+
+class TestOversizePolicy:
+
+    def test_delete_allowed_on_oversized_file(self, tmp_path):
+        p = _make_oversized_nb(tmp_path)
+
+        r = run_write([p, "delete", "0"])
+
+        assert r.returncode == 0, (
+            f"delete must be allowed on an oversized file (it shrinks it): {r.stderr}"
+        )
+        assert Path(p).stat().st_size < MAX_FILE_SIZE
+        nb = read_nb(p)
+        assert len(nb["cells"]) == 1
+        assert nb["cells"][0]["id"] == "tinycell"
+
+    def test_patch_shrink_allowed_on_oversized_file(self, tmp_path):
+        p = _make_oversized_nb(tmp_path)
+        src = tmp_path / "small.py"
+        src.write_text("tiny = True\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0, (
+            f"shrinking patch must be allowed on an oversized file: {r.stderr}"
+        )
+        assert Path(p).stat().st_size < MAX_FILE_SIZE
+        nb = read_nb(p)
+        assert "tiny = True" in "".join(nb["cells"][0]["source"])
+
+    def test_patch_growth_refused_on_oversized_file(self, tmp_path):
+        p = _make_oversized_nb(tmp_path)
+        size_before = Path(p).stat().st_size
+        src = tmp_path / "grow.py"
+        src.write_text("g = '" + "b" * (4 * 1024 * 1024) + "'\n", encoding="utf-8")
+
+        r = run_write([p, "patch", "1", "-f", str(src)])
+
+        assert r.returncode != 0, (
+            "a patch that grows an already-oversized file past the limit must be refused"
+        )
+        assert "Traceback" not in r.stderr
+        assert Path(p).stat().st_size == size_before, (
+            "Refused write must leave the file untouched"
+        )
+
+    def test_insert_into_oversized_file_refused(self, tmp_path):
+        p = _make_oversized_nb(tmp_path)
+        src = tmp_path / "src.py"
+        src.write_text("y = 2\n", encoding="utf-8")
+
+        r = run_write([p, "insert", "0", "code", "-f", str(src)])
+
+        assert r.returncode != 0, "insert keeps the hard 100 MB load limit"
+        assert "too large" in r.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# § nb["cells"] of wrong type dies cleanly
+# ---------------------------------------------------------------------------
+
+class TestCellsTypeCheck:
+
+    def _nb_with_dict_cells(self, tmp_path):
+        nb = {"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": {}}
+        p = tmp_path / "badcells.ipynb"
+        p.write_text(json.dumps(nb), encoding="utf-8")
+        return str(p)
+
+    @pytest.mark.parametrize("op_args", [
+        ["patch", "0"], ["insert", "0", "code"], ["delete", "0"],
+    ], ids=["patch", "insert", "delete"])
+    def test_cells_as_dict_dies_cleanly(self, tmp_path, op_args):
+        p = self._nb_with_dict_cells(tmp_path)
+        stdin = "x\n" if op_args[0] in ("patch", "insert") else None
+
+        r = run_write([p] + op_args, stdin=stdin)
+
+        assert r.returncode != 0
+        assert "Traceback" not in r.stderr, (
+            f"cells-as-dict must die with a clean message, got:\n{r.stderr}"
+        )
+        assert "list" in r.stderr.lower(), (
+            f"Error must mention that 'cells' should be a list: {r.stderr!r}"
+        )

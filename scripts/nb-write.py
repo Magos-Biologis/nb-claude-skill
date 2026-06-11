@@ -27,7 +27,11 @@ Notes:
   - The script refuses to operate on symlinks.
   - Only .ipynb files are accepted.
   - All status messages go to stderr; stdout is silent on success.
-  - On POSIX, an exclusive file lock serialises concurrent writes.
+  - An exclusive file lock on a companion .nblock file serialises concurrent
+    writes (fcntl on POSIX, msvcrt.locking on Windows).
+  - Source files (-f) must be valid UTF-8 (a leading BOM is tolerated).
+  - A patch whose source is identical to the cell's current source is a
+    no-op: the file is not rewritten and outputs are preserved.
 """
 
 import json
@@ -46,12 +50,67 @@ _REPLACE_RETRY_DELAY = 0.05   # 50 ms — AV scans typically release within one 
 
 _NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-level
 
-# Optional file locking (POSIX only; not available on Windows)
+# ---------------------------------------------------------------------------
+# Portable lock helper — verbatim copy shared with nb-index.py (no shared
+# import between standalone scripts; keep both copies in sync).
+# Tries fcntl (POSIX), falls back to msvcrt (Windows); no-op only if neither
+# is available.
+# ---------------------------------------------------------------------------
 try:
     import fcntl
-    _have_flock = True
+    _LOCK_BACKEND = "fcntl"
 except ImportError:
-    _have_flock = False  # Windows: no flock; concurrent writes are not serialised
+    try:
+        import msvcrt
+        _LOCK_BACKEND = "msvcrt"
+    except ImportError:
+        _LOCK_BACKEND = None  # no locking primitive available
+
+
+def _lock_file(f, blocking=True):
+    """
+    Acquire an exclusive lock on open file object *f*.
+
+    Returns True on success; False if non-blocking and the lock is busy.
+    Blocking acquisition failures raise OSError. With no backend, no-op True.
+    """
+    if _LOCK_BACKEND == "fcntl":
+        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(f, flags)
+            return True
+        except OSError:
+            if blocking:
+                raise
+            return False
+    elif _LOCK_BACKEND == "msvcrt":
+        # msvcrt.locking locks a byte range at the current file position.
+        # LK_LOCK retries for ~10s (blocking-ish); LK_NBLCK fails immediately.
+        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), mode, 1)
+            return True
+        except OSError:
+            if blocking:
+                raise
+            return False
+    return True
+
+
+def _unlock_file(f):
+    """Release a lock taken with _lock_file (best-effort)."""
+    if _LOCK_BACKEND == "fcntl":
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    elif _LOCK_BACKEND == "msvcrt":
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -97,14 +156,41 @@ def _check_path(path):
         die(f"refusing to operate on a symlink: {path}")
 
 
-def load(path):
+def _validate_cells(path, nb, lock_fd):
+    """
+    Post-load validation: nb['cells'] (when present) must be a list, and
+    duplicate cell ids get a one-line stderr warning (not repaired).
+    """
+    cells = nb.get("cells")
+    if cells is not None and not isinstance(cells, list):
+        if lock_fd:
+            lock_fd.close()
+        die(f"notebook 'cells' must be a list, got {type(cells).__name__} "
+            f"in {path} (malformed notebook).")
+    if isinstance(cells, list):
+        seen = set()
+        dupes = set()
+        for cell in cells:
+            if isinstance(cell, dict) and "id" in cell:
+                cid = cell["id"]
+                if cid in seen:
+                    dupes.add(cid)
+                seen.add(cid)
+        if dupes:
+            print(f"Warning: duplicate cell id(s) in {path}: "
+                  f"{', '.join(sorted(str(d) for d in dupes))} (not repaired)",
+                  file=sys.stderr)
+
+
+def load(path, allow_oversize=False):
     """
     Load notebook JSON from *path* and return ``(nb, lock_fd)``.
 
-    On POSIX, *lock_fd* is an open file object holding a LOCK_EX flock on a
-    companion ``<notebook>.nblock`` lock file.  This lock **must** be released
-    (by calling ``lock_fd.close()``) only *after* ``save()`` has completed its
-    ``os.replace()``.  Pass it to ``save(path, nb, lock_fd=lock_fd)``.
+    *lock_fd* is an open file object holding an exclusive lock (fcntl flock
+    on POSIX, msvcrt.locking on Windows) on a companion ``<notebook>.nblock``
+    lock file.  This lock **must** be released only *after* ``save()`` has
+    completed its ``os.replace()``.  Pass it to ``save(path, nb,
+    lock_fd=lock_fd)``.
 
     Why a separate lock file?  ``os.replace()`` (atomic rename) swaps the
     inode at *path*.  A flock held on the original notebook inode would be
@@ -113,21 +199,25 @@ def load(path):
     its lock immediately — then read stale data.  Locking a stable companion
     file avoids this inode-swap hazard.
 
-    On Windows (no fcntl), *lock_fd* is ``None``.
+    If neither locking primitive exists, *lock_fd* is ``None``.
+
+    *allow_oversize* — when True (patch/delete, which can shrink the file),
+    the 100 MB load-time limit is not enforced; ``save()`` still refuses a
+    result that both exceeds the limit and grew relative to the original.
     """
     _check_path(path)
 
     # Acquire exclusive lock on a companion lock file BEFORE reading the
     # notebook so that the lock scope covers the full read-modify-write cycle.
     lock_fd = None
-    if _have_flock:
+    if _LOCK_BACKEND is not None:
         lpath = path + ".nblock"
         try:
             lf = open(lpath, "a")  # "a" creates if absent without truncating
         except OSError as e:
             die(f"cannot open lock file '{lpath}': {e}")
         try:
-            fcntl.flock(lf, fcntl.LOCK_EX)
+            _lock_file(lf, blocking=True)
         except OSError as e:
             lf.close()
             die(f"cannot acquire lock on '{lpath}': {e}")
@@ -143,7 +233,7 @@ def load(path):
         if lock_fd:
             lock_fd.close()
         die(f"cannot stat '{path}': {e}")
-    if size > MAX_FILE_SIZE:
+    if size > MAX_FILE_SIZE and not allow_oversize:
         if lock_fd:
             lock_fd.close()
         die(f"file too large ({size:,} bytes). Max is {MAX_FILE_SIZE:,} bytes.")
@@ -151,6 +241,7 @@ def load(path):
         # utf-8-sig handles UTF-8 BOM transparently
         with open(path, encoding="utf-8-sig") as f:
             nb = json.load(f)
+        _validate_cells(path, nb, lock_fd)
         return nb, lock_fd
     except FileNotFoundError:
         if lock_fd:
@@ -175,18 +266,34 @@ def save(path, nb, lock_fd=None):
     never a partial write.
 
     *lock_fd* — if not None, the open file object returned by ``load()``
-    holding a POSIX LOCK_EX flock.  It is closed (releasing the lock)
-    *after* os.replace() succeeds so the lock spans the full read-modify-write
-    cycle.
+    holding the exclusive lock.  It is released and closed *after*
+    os.replace() succeeds so the lock spans the full read-modify-write cycle.
+
+    Size policy: the serialised result is refused (error, no write) only if
+    it both exceeds MAX_FILE_SIZE *and* is larger than the original file —
+    shrinking an already-oversized notebook is always allowed.
     """
     dir_ = os.path.dirname(os.path.abspath(path))
+
+    # Serialise up-front so the size policy can be enforced before any write.
+    payload = json.dumps(nb, indent=1, ensure_ascii=False) + "\n"
+    new_size = len(payload.encode("utf-8"))
+    if new_size > MAX_FILE_SIZE:
+        try:
+            orig_size = os.path.getsize(path)
+        except OSError:
+            orig_size = 0
+        if new_size > orig_size:
+            die(f"refusing to write: result would be {new_size:,} bytes "
+                f"(exceeds the {MAX_FILE_SIZE:,}-byte limit and is larger "
+                f"than the original {orig_size:,} bytes). File left untouched.")
+
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".nb_tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(nb, f, indent=1, ensure_ascii=False)
-                f.write("\n")
+                f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
         except Exception:
@@ -216,6 +323,7 @@ def save(path, nb, lock_fd=None):
         # Release the exclusive lock after the rename so the entire
         # read-modify-write cycle is serialised.
         if lock_fd is not None:
+            _unlock_file(lock_fd)
             try:
                 lock_fd.close()
             except OSError:
@@ -235,20 +343,14 @@ def read_source(flag_args):
             die("-f requires a file path argument.")
         fpath = flag_args[idx + 1]
         try:
-            with open(fpath, encoding="utf-8") as f:
+            # utf-8-sig tolerates a leading UTF-8 BOM
+            with open(fpath, encoding="utf-8-sig") as f:
                 text = f.read()
         except FileNotFoundError:
             die(f"source file not found: {fpath}")
-        except UnicodeDecodeError:
-            # File is not valid UTF-8 — fall back to latin-1, which accepts
-            # every possible byte value. Warn so the user knows what happened.
-            print(f"Warning: '{fpath}' is not valid UTF-8; "
-                  f"falling back to latin-1 encoding.", file=sys.stderr)
-            try:
-                with open(fpath, encoding="latin-1") as f:
-                    text = f.read()
-            except OSError as e:
-                die(f"cannot read source file '{fpath}': {e}")
+        except UnicodeDecodeError as e:
+            die(f"source file is not valid UTF-8: '{fpath}' ({e}). "
+                f"Re-encode it as UTF-8 and retry; the notebook was not modified.")
         except OSError as e:
             die(f"cannot read source file '{fpath}': {e}")
         remaining = flag_args[:idx] + flag_args[idx + 2:]
@@ -258,13 +360,20 @@ def read_source(flag_args):
         return text.splitlines(keepends=True), flag_args
 
 
-def make_cell(cell_type, source):
+def make_cell(cell_type, source, with_id):
+    """
+    Build a new cell dict. A cell ``id`` is emitted only when *with_id* is
+    True (the notebook declares nbformat_minor >= 5, where ids are required);
+    pre-4.5 notebooks must not gain ids — and nbformat/nbformat_minor are
+    never bumped.
+    """
     cell = {
-        "id": _cell_id(),
         "cell_type": cell_type,
         "metadata": {},
         "source": source,
     }
+    if with_id:
+        cell["id"] = _cell_id()
     if cell_type == "code":
         cell["outputs"] = []
         cell["execution_count"] = None
@@ -275,6 +384,9 @@ def get_cells(nb):
     if "cells" not in nb:
         die("notebook has no top-level 'cells' key "
             "(nbformat 3 or malformed? nb-write only supports nbformat 4).")
+    if not isinstance(nb["cells"], list):
+        die(f"notebook 'cells' must be a list, got "
+            f"{type(nb['cells']).__name__} (malformed notebook).")
     return nb["cells"]
 
 
@@ -341,25 +453,46 @@ def cmd_create(path):
 
 
 def cmd_patch(nb, index, source):
+    """
+    Replace cell source. Returns True if the notebook was modified, False for
+    a no-op patch (new source identical to current) — in that case nothing is
+    touched: outputs/execution_count are kept and no write should happen.
+    """
     cells = get_cells(nb)
     n = len(cells)
     if not (0 <= index < n):
         die(f"cell index {index} out of range "
             f"(notebook has {n} cell{'s' if n != 1 else ''}, indices 0–{n - 1}).")
     cell = cells[index]
+    old = cell.get("source", [])
+    old_str = "".join(old) if isinstance(old, list) else str(old)
+    if old_str == "".join(source):
+        print(f"cell {index} unchanged — no write", file=sys.stderr)
+        return False
     cell["source"] = source
     if cell.get("cell_type") == "code":
         cell["outputs"] = []
         cell["execution_count"] = None
+    # nbformat 4.5+ requires an id on every cell (JEP-62; writers should
+    # auto-fill). Repair a missing id on the cell we are rewriting anyway.
+    if (isinstance(nb.get("nbformat_minor"), int) and nb["nbformat_minor"] >= 5
+            and "id" not in cell):
+        cell["id"] = _cell_id()
+        print(f"  cell {index} had no id — generated one (nbformat 4.5 "
+              f"requires ids)", file=sys.stderr)
     line_count = len("".join(source).splitlines())
     print(f"  patched cell {index} "
           f"({cell.get('cell_type', 'unknown')}, {line_count} line(s))", file=sys.stderr)
+    return True
 
 
 def cmd_insert(nb, index, cell_type, source):
     cells = get_cells(nb)
     n = len(cells)
-    new_cell = make_cell(cell_type, source)
+    # Cell ids are required from nbformat 4.5 on; emit one only when the
+    # notebook itself declares minor >= 5 (never bump the declared version).
+    with_id = isinstance(nb.get("nbformat_minor"), int) and nb["nbformat_minor"] >= 5
+    new_cell = make_cell(cell_type, source, with_id)
     if index == -1:
         # Explicit append sentinel (only negative value allowed for insert)
         cells.append(new_cell)
@@ -406,14 +539,22 @@ def main():
         cmd_create(path)
         return
 
-    nb, lock_fd = load(path)
-
+    # Read the source (file or stdin) fully BEFORE acquiring the .nblock
+    # exclusive lock in load(), so a slow/hung stdin producer cannot hold
+    # the lock and block other writers.
     if op == "patch":
         if not rest:
             die("patch requires: <index> [-f <source_file>]")
         index = _parse_index(rest[0], "patch index")
         source, _ = read_source(rest[1:])
-        cmd_patch(nb, index, source)
+        # patch can shrink an oversized notebook — allow loading it
+        nb, lock_fd = load(path, allow_oversize=True)
+        if not cmd_patch(nb, index, source):
+            # No-op patch: nothing changed — no write, no reindex.
+            if lock_fd is not None:
+                _unlock_file(lock_fd)
+                lock_fd.close()
+            return
 
     elif op == "insert":
         if len(rest) < 2:
@@ -430,12 +571,15 @@ def main():
         if cell_type not in ("code", "markdown", "raw"):
             die(f"unknown cell type '{cell_type}', must be code | markdown | raw.")
         source, _ = read_source(rest[2:])
+        nb, lock_fd = load(path)
         cmd_insert(nb, index, cell_type, source)
 
     elif op == "delete":
         if not rest:
             die("delete requires: <index>")
         index = _parse_index(rest[0], "delete index")
+        # delete can shrink an oversized notebook — allow loading it
+        nb, lock_fd = load(path, allow_oversize=True)
         cmd_delete(nb, index)
 
     else:
@@ -443,18 +587,25 @@ def main():
 
     save(path, nb, lock_fd=lock_fd)
 
+    # Synchronous indexing: the write already succeeded (that is the
+    # contract), so an indexing failure is surfaced as a warning but never
+    # changes the exit code.
     if _NB_INDEX_SIBLING.exists():
         _script = _NB_INDEX_SIBLING.resolve()   # resolved at call time, not import time
         try:
-            subprocess.Popen(
+            r = subprocess.run(
                 [sys.executable, str(_script), str(Path(path).resolve())],
                 shell=False,          # NEVER shell=True
                 close_fds=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
             )
         except Exception as e:
-            print(f"[warn] failed to spawn nb-index.py: {e}", file=sys.stderr)
+            print(f"[warn] indexing failed: {e}", file=sys.stderr)
+        else:
+            if r.returncode != 0:
+                tail = " | ".join((r.stderr or "").strip().splitlines()[-3:])
+                print(f"[warn] indexing failed: {tail}", file=sys.stderr)
     else:
         print(f"[warn] nb-index.py not found at {_NB_INDEX_SIBLING}; "
               f"skipping auto-index", file=sys.stderr)

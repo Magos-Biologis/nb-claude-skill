@@ -1,19 +1,12 @@
 """
-TDD tests for non-UTF-8 source file handling in nb-write.py.
+Tests for non-UTF-8 source file handling in nb-write.py.
 
-These tests were written BEFORE the fix. Run them first to confirm they fail,
-then implement the fix, then re-run to confirm green.
-
-Desired behaviour (spec):
-  - Source files are read as UTF-8 by default.
-  - If the file contains bytes that are not valid UTF-8, fall back to latin-1
-    (which accepts every possible byte value).
-  - Emit a warning on stderr about the encoding fallback.
-  - Still exit 0 and write the notebook — never crash with a raw traceback.
-  - Content must survive the round-trip: characters decoded from latin-1 must
-    appear verbatim in the patched cell source.
-  - A raw Python traceback (lines starting with "Traceback") must never appear
-    in stderr output.
+Behaviour (spec, 2026-06 concurrency/data-safety batch):
+  - Source files are read as UTF-8 (utf-8-sig: a leading BOM is tolerated).
+  - A file containing bytes that are not valid UTF-8 is a HARD ERROR:
+    clear message on stderr, non-zero exit, notebook left untouched.
+    (The previous latin-1 mojibake fallback was removed.)
+  - A raw Python traceback must never appear in stderr output.
 """
 
 import json
@@ -69,49 +62,49 @@ def run_write(args, stdin=None):
 
 
 # ---------------------------------------------------------------------------
-# Tests: latin-1 source files
+# Tests: non-UTF-8 source files are a hard error (latin-1 fallback removed)
 # ---------------------------------------------------------------------------
 
-class TestLatin1SourceFile:
+class TestNonUtf8SourceFile:
 
-    def test_latin1_file_exits_zero(self, tmp_path):
-        """A latin-1 encoded source file must not cause a non-zero exit."""
+    def test_latin1_file_exits_nonzero(self, tmp_path):
+        """A latin-1 (non-UTF-8) source file must cause a non-zero exit."""
         p = make_notebook([{"cell_type": "code", "source": ["old"]}], tmp_path)
         src = tmp_path / "src.py"
         src.write_bytes("# Réseau d'eau\nprint('café')\n".encode("latin-1"))
 
         r = run_write([p, "patch", "0", "-f", str(src)])
 
-        assert r.returncode == 0, (
-            f"Expected exit 0 for latin-1 source file, got {r.returncode}.\n"
+        assert r.returncode != 0, (
+            f"Expected non-zero exit for non-UTF-8 source file, got 0.\n"
             f"stderr: {r.stderr}"
         )
 
-    def test_latin1_content_preserved_in_notebook(self, tmp_path):
-        """Characters decoded from latin-1 must appear verbatim in the patched cell."""
-        p = make_notebook([{"cell_type": "code", "source": ["old"]}], tmp_path)
-        src = tmp_path / "src.py"
-        src.write_bytes("# naïve\nprint('ñoño')\n".encode("latin-1"))
-
-        run_write([p, "patch", "0", "-f", str(src)])
-
-        nb = read_nb(p)
-        source_str = "".join(nb["cells"][0]["source"])
-        assert "naïve" in source_str, f"'naïve' missing from patched source: {source_str!r}"
-        assert "ñoño" in source_str, f"'ñoño' missing from patched source: {source_str!r}"
-
-    def test_latin1_fallback_emits_warning_on_stderr(self, tmp_path):
-        """When falling back to latin-1, a warning must appear on stderr."""
+    def test_latin1_error_message_mentions_utf8(self, tmp_path):
+        """The error must clearly say the source file is not valid UTF-8."""
         p = make_notebook([{"cell_type": "code", "source": ["old"]}], tmp_path)
         src = tmp_path / "src.py"
         src.write_bytes("# café\n".encode("latin-1"))
 
         r = run_write([p, "patch", "0", "-f", str(src)])
 
-        assert r.returncode == 0
-        stderr_lower = r.stderr.lower()
-        assert any(word in stderr_lower for word in ("encoding", "latin", "utf", "fallback")), (
-            f"Expected an encoding-related warning on stderr, got: {r.stderr!r}"
+        assert r.returncode != 0
+        assert "not valid utf-8" in r.stderr.lower(), (
+            f"Expected 'not valid UTF-8' on stderr, got: {r.stderr!r}"
+        )
+
+    def test_latin1_file_leaves_notebook_untouched(self, tmp_path):
+        """The notebook must be byte-identical after a rejected non-UTF-8 patch."""
+        p = make_notebook([{"cell_type": "code", "source": ["old"]}], tmp_path)
+        before = Path(p).read_bytes()
+        src = tmp_path / "src.py"
+        src.write_bytes("# naïve\nprint('ñoño')\n".encode("latin-1"))
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode != 0
+        assert Path(p).read_bytes() == before, (
+            "Notebook must not be modified when the source file is rejected"
         )
 
     def test_latin1_no_raw_traceback_on_stderr(self, tmp_path):
@@ -125,23 +118,32 @@ class TestLatin1SourceFile:
         assert "Traceback" not in r.stderr, (
             f"Raw Python traceback must not appear in stderr:\n{r.stderr}"
         )
-        assert "UnicodeDecodeError" not in r.stderr, (
-            f"Raw exception class must not appear in stderr:\n{r.stderr}"
-        )
 
-    def test_latin1_insert_works(self, tmp_path):
-        """latin-1 fallback must also work for the insert operation."""
+    def test_latin1_insert_rejected(self, tmp_path):
+        """Non-UTF-8 source must also be rejected for the insert operation."""
         p = make_notebook([{"cell_type": "code", "source": ["a"]}], tmp_path)
         src = tmp_path / "src.py"
         src.write_bytes("# Ümlaute: äöü\npass\n".encode("latin-1"))
 
         r = run_write([p, "insert", "0", "code", "-f", str(src)])
 
-        assert r.returncode == 0
+        assert r.returncode != 0
         nb = read_nb(p)
-        assert len(nb["cells"]) == 2
+        assert len(nb["cells"]) == 1, "No cell must be inserted on rejection"
+
+    def test_utf8_bom_source_file_tolerated(self, tmp_path):
+        """A UTF-8 source file with a leading BOM is accepted; BOM is stripped."""
+        p = make_notebook([{"cell_type": "code", "source": ["old"]}], tmp_path)
+        src = tmp_path / "src.py"
+        src.write_bytes(b"\xef\xbb\xbf" + "x = 'café'\n".encode("utf-8"))
+
+        r = run_write([p, "patch", "0", "-f", str(src)])
+
+        assert r.returncode == 0, f"BOM'd UTF-8 must be accepted: {r.stderr}"
+        nb = read_nb(p)
         source_str = "".join(nb["cells"][0]["source"])
-        assert "äöü" in source_str
+        assert "café" in source_str
+        assert "﻿" not in source_str, "BOM must not leak into cell source"
 
     def test_pure_ascii_file_unaffected(self, tmp_path):
         """Pure ASCII source files (valid UTF-8 subset) must still work as before."""

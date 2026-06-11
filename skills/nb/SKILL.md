@@ -171,7 +171,7 @@ python3 "$NB_SCRIPTS/nb-write.py" <notebook.ipynb> <op> [args]
 | Op | Args | Notes |
 |----|------|-------|
 | `create` | — | New empty nbformat-4.5 notebook; fails if file exists |
-| `patch` | `<index> -f <file>` | Replace cell source; clears outputs + execution_count |
+| `patch` | `<index> -f <file>` | Replace cell source; clears outputs + execution_count. Identical source = no-op (file untouched). Source file must be UTF-8 |
 | `insert` | `<index> <type> -f <file>` | Insert before `<index>`; `-1` appends; type: `code\|markdown\|raw` |
 | `delete` | `<index>` | Remove cell |
 
@@ -193,7 +193,7 @@ python3 "$NB_SCRIPTS/nb-read.py" analysis.ipynb --cells 4          # 4. verify
 ## Failures & concurrency
 
 - **Script exits nonzero:** read its stderr and fix the stated problem (bad index, missing file, malformed notebook…). Do **NOT** fall back to raw `Read`/`cat` of the `.ipynb` — that defeats the plugin.
-- **Lock contention:** `nb-write.py` takes an exclusive lock on a companion `.nblock` file for the whole read-modify-write cycle, so concurrent writes block briefly on POSIX. On **Windows** there is no lock — concurrent sessions must avoid simultaneous writes to the same notebook.
+- **Lock contention:** `nb-write.py` takes an exclusive lock on a companion `.nblock` file for the whole read-modify-write cycle, so concurrent writes block briefly (POSIX `fcntl`, Windows `msvcrt`). Stray `*.nblock` files are normal and gitignored — never delete them manually.
 - **Stale index:** `[STALE]`/`[UNINDEXED]` warnings from `--outline` or `nb-search.py` are not errors — results may be outdated. Re-run `nb-index.py <notebook.ipynb>` and retry.
 
 ---

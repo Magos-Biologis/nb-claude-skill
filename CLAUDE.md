@@ -41,7 +41,7 @@ Five cooperating scripts:
 ```
 User edits notebook
   → nb-write.py patch/insert/delete (atomic write)
-    → spawns nb-index.py (fire-and-forget, non-blocking)
+    → runs nb-index.py synchronously (failures surface as [warn] on stderr)
       → updates .nb_index/<nb>.json + .nb_index/symbols.json
 
 User reads notebook
@@ -110,10 +110,10 @@ notebook.ipynb | 12 cells | python3
 
 - **nbformat 4 only.** Rejects v3 (`worksheets` key) and malformed files.
 - **100 MB file size limit** on all scripts.
-- **UTF-8-sig** used for reading (handles BOM transparently); latin-1 fallback with warning in nb-write.py source input.
-- **`nb-write.py patch` clears outputs and execution_count** — intentional, matches Jupyter convention.
+- **UTF-8-sig** used for reading (handles BOM transparently); non-UTF-8 `-f` source files are a hard error in nb-write.py (no latin-1 fallback).
+- **`nb-write.py patch` clears outputs and execution_count** — intentional, matches Jupyter convention. Exception: a patch whose source is identical to the cell's current source is a no-op (no clear, no write, no reindex).
 - **Atomic writes everywhere:** `tempfile.mkstemp` in the target directory → `fsync` → `os.replace`. No partial writes, no `.bak`.
-- **File locking:** nb-write.py uses `fcntl.LOCK_EX` on a companion `.nblock` file for the full read-modify-write cycle (POSIX only). nb-index.py uses `fcntl.LOCK_EX | LOCK_NB` (non-blocking) on `symbols.nblock`. Both fall back to no-op on Windows where `fcntl` is unavailable.
+- **File locking:** both scripts share a verbatim-copied portable lock helper — `fcntl` on POSIX, `msvcrt.locking` on Windows, no-op only if neither exists. nb-write holds the notebook's `.nblock` exclusively for the read-modify-write cycle (source is read *before* locking). nb-index takes `symbols.nblock` blocking-with-timeout (~10 s, then `[warn]` + skip) and holds the notebook's `.nblock` across the final stat + index write. Lockfiles are never unlinked (unlink-after-release is an inode race); `*.nblock` is gitignored.
 - **`ensure_ascii=False`** in all `json.dump` calls (prevents 6× size inflation on CJK/Unicode output).
 - **stdout is always silent on success** for all scripts; all status messages go to stderr.
 
@@ -124,7 +124,7 @@ Tests are written TDD-first against the spec before implementation. All black-bo
 | File | What it covers |
 |------|----------------|
 | `test_scripts.py` | Core read/write happy paths and flags |
-| `test_encoding.py` | UTF-8 BOM, latin-1 fallback |
+| `test_encoding.py` | UTF-8 BOM, non-UTF-8 hard error |
 | `test_read_independent.py` | Full nb-read.py spec (filtering, truncation, edge cases) |
 | `test_read_safe.py` | ANSI sanitisation, `│ ` prefix, output summary format |
 | `test_read_outline.py` | `--outline` mode: format, fallback, stale index |
@@ -200,20 +200,20 @@ Catalogue of known limitations/faults from an adversarial code review. Severity 
 
 ### High — write/index pipeline reliability
 
-- [ ] **Index failures are invisible** (`nb-write.py:449-457`): nb-index.py spawned fire-and-forget, both stdio → DEVNULL, exit code never collected — symbols.json silently diverges with no retry.
-- [ ] **symbols.json updates silently dropped under contention** (`nb-index.py:601-607`): `LOCK_EX | LOCK_NB` returns silently if the lock is held; rapid consecutive writes routinely lose symbol updates.
-- [ ] **Lock-file unlink race** (`nb-index.py:688-693`): deleting `symbols.nblock` after release lets two processes both hold "the" lock (different inodes) and clobber symbols.json.
-- [ ] **Windows lost-update**: no `fcntl` → read-modify-write unserialised (`nb-write.py:53-54`); the second of two concurrent writes silently discards the first. Atomic rename masks the loss.
-- [ ] **`patch` unconditionally destroys outputs/execution_count** (`nb-write.py:351-353`) even for a no-op patch — with no `.bak`/undo, one mistaken patch on an untracked notebook irreversibly loses computed outputs.
-- [ ] Cell `id` vs nbformat_minor: `make_cell` always emits `id` but insert/patch never bump `nbformat_minor` (`nb-write.py:261-271`) — inserting into a 4.0–4.4 notebook fails strict validation; pre-existing duplicate ids never detected.
-- [ ] Exclusive `.nblock` acquired *before* `read_source()` (`nb-write.py:409,415`): a hung stdin producer holds the lock indefinitely, blocking all other writers.
-- [ ] latin-1 fallback for `-f` source writes mojibake with only a stderr warning and exit 0 (`nb-write.py:243-251`); inconsistent with nb-write rejecting non-UTF-8 notebooks while nb-index accepts them.
-- [ ] Per-notebook index write takes no lock; stat→`os.replace` window (`nb-index.py:917-976`) lets a stale index clobber a fresher one.
-- [ ] symbols.json has no garbage collection — deleted/renamed notebooks pollute symbol search forever.
-- [ ] `.nblock` files never unlinked — litter working trees. (Gitignore entry now added by `_update_gitignore`; unlink cleanup still open.)
+- [x] **Index failures are invisible** (`nb-write.py:449-457`): nb-index.py spawned fire-and-forget, both stdio → DEVNULL, exit code never collected — symbols.json silently diverges with no retry.
+- [x] **symbols.json updates silently dropped under contention** (`nb-index.py:601-607`): `LOCK_EX | LOCK_NB` returns silently if the lock is held; rapid consecutive writes routinely lose symbol updates.
+- [x] **Lock-file unlink race** (`nb-index.py:688-693`): deleting `symbols.nblock` after release lets two processes both hold "the" lock (different inodes) and clobber symbols.json.
+- [x] **Windows lost-update**: no `fcntl` → read-modify-write unserialised (`nb-write.py:53-54`); the second of two concurrent writes silently discards the first. Atomic rename masks the loss.
+- [x] **`patch` unconditionally destroys outputs/execution_count** (`nb-write.py:351-353`) even for a no-op patch — with no `.bak`/undo, one mistaken patch on an untracked notebook irreversibly loses computed outputs.
+- [x] Cell `id` vs nbformat_minor: `make_cell` always emits `id` but insert/patch never bump `nbformat_minor` (`nb-write.py:261-271`) — inserting into a 4.0–4.4 notebook fails strict validation; pre-existing duplicate ids never detected.
+- [x] Exclusive `.nblock` acquired *before* `read_source()` (`nb-write.py:409,415`): a hung stdin producer holds the lock indefinitely, blocking all other writers.
+- [x] latin-1 fallback for `-f` source writes mojibake with only a stderr warning and exit 0 (`nb-write.py:243-251`); inconsistent with nb-write rejecting non-UTF-8 notebooks while nb-index accepts them.
+- [x] Per-notebook index write takes no lock; stat→`os.replace` window (`nb-index.py:917-976`) lets a stale index clobber a fresher one.
+- [x] symbols.json has no garbage collection — deleted/renamed notebooks pollute symbol search forever.
+- [x] `.nblock` files never unlinked — closed as BY DESIGN: unlink-after-release is the inode race (see lock-file unlink item); lockfiles persist and `*.nblock` is gitignored.
 - [x] `except OSError` around `os.link` swallows `FileExistsError`, making the dedicated handler dead code and degrading to a TOCTOU-racy fallback (`nb-write.py:314-326`).
-- [ ] 100 MB limit enforced only on load (`nb-write.py:146-149`): a patch can grow the file past the limit, after which no nb-write/nb-index operation can touch it again.
-- [ ] `nb["cells"]` checked for presence, not type — malformed notebooks produce raw tracebacks (`nb-write.py:274-278`).
+- [x] 100 MB limit enforced only on load (`nb-write.py:146-149`): a patch can grow the file past the limit, after which no nb-write/nb-index operation can touch it again.
+- [x] `nb["cells"]` checked for presence, not type — malformed notebooks produce raw tracebacks (`nb-write.py:274-278`).
 
 ### Medium — rendering correctness (nb-read.py)
 
@@ -270,6 +270,11 @@ Items in this TODO that depend on Claude Code harness behavior were checked agai
 | `allowed-tools` format (skills frontmatter) | **Partially documented** — "space- or comma-separated string, or a YAML list"; in-paren example form is `Bash(git add *)`. Current frontmatter uses that form. |
 | MultiEdit payload = one top-level `file_path` + `edits[]` without per-edit paths (guard fix) | **Not documented** — based on observed tool schema; fails open if wrong. Black-box test against a live session pending. |
 | NotebookEdit payload field is `notebook_path` (guard fix) | **Not documented** — tool existence/matcher verified, field name from observed schema; fails open if wrong. Black-box test pending. |
+
+### Documented-discretionary gaps (vetted 2026-06-11 against nbformat/JEP-62 and Python docs — accepted, not bugs)
+
+- **Duplicate cell ids: warn, never repair.** The nbformat spec requires unique ids in written notebooks, but JEP-62 leaves repair to the tool's discretion; "match the file" (minimal-diff surgical editing) was the chosen policy. Revisit only if a downstream consumer rejects the warned files.
+- **NFS caveat on locking:** where `flock` is emulated via `fcntl()` (some NFS mounts), cross-host exclusion is not guaranteed and closing any fd to the file releases the lock. Each process opens its `.nblock` exactly once and all close-without-unlock paths exit immediately, so the designed degradation (warned skip / process-exit release) covers it.
 
 ### Suggested fix order
 

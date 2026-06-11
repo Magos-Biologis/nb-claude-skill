@@ -15,20 +15,95 @@ stderr: status messages.
 
 from __future__ import annotations
 
-try:
-    import fcntl
-    _have_fcntl = True
-except ImportError:
-    _have_fcntl = False  # Windows: no fcntl; symbol-index locking is skipped
-
 import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Portable lock helper — verbatim copy shared with nb-write.py (no shared
+# import between standalone scripts; keep both copies in sync).
+# Tries fcntl (POSIX), falls back to msvcrt (Windows); no-op only if neither
+# is available.
+# ---------------------------------------------------------------------------
+try:
+    import fcntl
+    _LOCK_BACKEND = "fcntl"
+except ImportError:
+    try:
+        import msvcrt
+        _LOCK_BACKEND = "msvcrt"
+    except ImportError:
+        _LOCK_BACKEND = None  # no locking primitive available
+
+
+def _lock_file(f, blocking=True):
+    """
+    Acquire an exclusive lock on open file object *f*.
+
+    Returns True on success; False if non-blocking and the lock is busy.
+    Blocking acquisition failures raise OSError. With no backend, no-op True.
+    """
+    if _LOCK_BACKEND == "fcntl":
+        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(f, flags)
+            return True
+        except OSError:
+            if blocking:
+                raise
+            return False
+    elif _LOCK_BACKEND == "msvcrt":
+        # msvcrt.locking locks a byte range at the current file position.
+        # LK_LOCK retries for ~10s (blocking-ish); LK_NBLCK fails immediately.
+        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), mode, 1)
+            return True
+        except OSError:
+            if blocking:
+                raise
+            return False
+    return True
+
+
+def _unlock_file(f):
+    """Release a lock taken with _lock_file (best-effort)."""
+    if _LOCK_BACKEND == "fcntl":
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    elif _LOCK_BACKEND == "msvcrt":
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
+
+def _lock_file_timeout(f, timeout=10.0, interval=0.1):
+    """
+    Blocking-with-timeout exclusive lock: poll the non-blocking acquire in a
+    short-sleep loop (alarm-free, portable). Returns True if acquired within
+    *timeout* seconds, False otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if _lock_file(f, blocking=False):
+                return True
+        except OSError:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -590,7 +665,11 @@ def _update_symbols_json(
 ) -> None:
     """
     Update (or create) symbols.json in index_dir.
-    Uses non-blocking flock on symbols.nblock; silently skips if lock unavailable.
+
+    Takes a blocking exclusive lock on symbols.nblock (polling with a ~10s
+    timeout). On timeout a warning is printed and the update is skipped.
+    Location entries whose notebook no longer exists on disk are dropped
+    (garbage collection for deleted/renamed notebooks).
     """
     lock_path = index_dir / "symbols.nblock"
     symbols_path = index_dir / "symbols.json"
@@ -598,15 +677,33 @@ def _update_symbols_json(
     try:
         lock_fd = open(lock_path, "a")
     except OSError:
-        return  # Can't open lock file — skip silently
+        print("[warn] cannot open symbols.nblock — symbol update skipped",
+              file=sys.stderr)
+        return
 
-    if _have_fcntl:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            # Lock unavailable — another indexer is writing, skip silently
-            lock_fd.close()
-            return
+    if not _lock_file_timeout(lock_fd, timeout=10.0):
+        print("[warn] symbols.json lock busy — symbol update skipped",
+              file=sys.stderr)
+        lock_fd.close()
+        return
+
+    # GC helper: resolve a location's notebook key against the index base
+    # (parent of .nb_index) and drop entries whose notebook is gone. The
+    # existence check is cached per distinct notebook key per run.
+    base = index_dir.parent
+    _exists_cache: dict = {}
+
+    def _nb_exists(loc: str) -> bool:
+        key = loc.rsplit(":", 1)[0]
+        if key not in _exists_cache:
+            p = Path(key)
+            if not p.is_absolute():
+                p = base / key
+            try:
+                _exists_cache[key] = p.exists()
+            except OSError:
+                _exists_cache[key] = True  # unverifiable — keep the entry
+        return _exists_cache[key]
 
     try:
         # Load existing symbols.json if it exists and has correct version
@@ -627,12 +724,14 @@ def _update_symbols_json(
         old_max = existing.get("max_indexed_at", "")
 
         for sym_name, locs in existing.get("symbols", {}).items():
-            filtered = [loc for loc in locs if not loc.startswith(nb_key + ":")]
+            filtered = [loc for loc in locs
+                        if not loc.startswith(nb_key + ":") and _nb_exists(loc)]
             if filtered:
                 new_symbols[sym_name] = filtered
 
         for imp_name, locs in existing.get("imports", {}).items():
-            filtered = [loc for loc in locs if not loc.startswith(nb_key + ":")]
+            filtered = [loc for loc in locs
+                        if not loc.startswith(nb_key + ":") and _nb_exists(loc)]
             if filtered:
                 new_imports[imp_name] = filtered
 
@@ -681,18 +780,11 @@ def _update_symbols_json(
             pass  # Non-fatal
 
     finally:
-        if _have_fcntl:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+        # NOTE: the lock file is deliberately NOT unlinked. Deleting it after
+        # release would let two processes lock different inodes of "the same"
+        # lock file and clobber symbols.json. *.nblock is gitignored.
+        _unlock_file(lock_fd)
         lock_fd.close()
-        # Clean up lock file (it will be recreated next time if needed).
-        # This prevents it from appearing as an orphaned non-JSON file.
-        try:
-            lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -934,50 +1026,79 @@ def main() -> None:
     except Exception as e:
         _die(f"Failed to build index: {e}")
 
-    # Optimistic concurrency check before writing
-    try:
-        check_mtime = os.path.getmtime(nb_path)
-        check_size  = os.path.getsize(nb_path)
-    except OSError:
-        check_mtime, check_size = mtime, size
-
-    if not force and (check_mtime != mtime or check_size != size):
-        # Notebook changed during indexing — abort silently
-        sys.exit(0)
-
-    # Ensure parent directory of index_file exists (for git-root nested paths)
-    try:
-        index_file.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        _die(f"Cannot create index subdirectory: {e}")
-
-    # Atomic write of per-notebook index
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=index_file.parent, suffix=".idx_tmp")
+    # Serialise the final stat + index write against concurrent indexers by
+    # holding the notebook's companion .nblock (same convention as nb-write).
+    # This closes the stat→os.replace window where a stale index could
+    # clobber a fresher one. On lock timeout, warn and skip the index write.
+    nb_lock_fd = None
+    if _LOCK_BACKEND is not None:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(index, f, ensure_ascii=False)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception as e:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            _die(f"Failed to write index file: {e}")
-        try:
-            os.replace(tmp_path, index_file)
-        except PermissionError:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            print(f"[warn] index not written (transient file lock): {index_file}",
+            nb_lock_fd = open(str(nb_path) + ".nblock", "a")
+        except OSError:
+            nb_lock_fd = None  # cannot create lock file — proceed unlocked
+        if nb_lock_fd is not None and not _lock_file_timeout(nb_lock_fd, timeout=10.0):
+            print(f"[warn] notebook lock busy — index write skipped: {index_file}",
                   file=sys.stderr)
+            nb_lock_fd.close()
             sys.exit(0)
-    except OSError as e:
-        _die(f"Failed to write index file: {e}")
+
+    def _release_nb_lock():
+        # The lock file is deliberately NOT unlinked (unlink-after-release
+        # is a race; *.nblock is gitignored).
+        if nb_lock_fd is not None:
+            _unlock_file(nb_lock_fd)
+            try:
+                nb_lock_fd.close()
+            except OSError:
+                pass
+
+    try:
+        # Optimistic concurrency check before writing (under the lock)
+        try:
+            check_mtime = os.path.getmtime(nb_path)
+            check_size  = os.path.getsize(nb_path)
+        except OSError:
+            check_mtime, check_size = mtime, size
+
+        if not force and (check_mtime != mtime or check_size != size):
+            # Notebook changed during indexing — abort silently
+            sys.exit(0)
+
+        # Ensure parent directory of index_file exists (for git-root nested paths)
+        try:
+            index_file.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            _die(f"Cannot create index subdirectory: {e}")
+
+        # Atomic write of per-notebook index
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=index_file.parent, suffix=".idx_tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(index, f, ensure_ascii=False)
+                    f.write("\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception as e:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                _die(f"Failed to write index file: {e}")
+            try:
+                os.replace(tmp_path, index_file)
+            except PermissionError:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                print(f"[warn] index not written (transient file lock): {index_file}",
+                      file=sys.stderr)
+                sys.exit(0)
+        except OSError as e:
+            _die(f"Failed to write index file: {e}")
+    finally:
+        _release_nb_lock()
 
     print(f"[index] wrote {index_file}", file=sys.stderr)
 
