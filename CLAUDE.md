@@ -144,7 +144,7 @@ Tests are written TDD-first against the spec before implementation. All black-bo
 The plugin uses the Claude Code native plugin format:
 
 - `.claude-plugin/plugin.json` — manifest (name, description, version, author, license)
-- `hooks/hooks.json` — declarative `PreToolUse` hook using `${CLAUDE_PLUGIN_ROOT}` for the script path
+- `hooks/hooks.json` — declarative `PreToolUse` hook using `${CLAUDE_PLUGIN_ROOT}`; shell-form with a `command -v python3 || command -v python` fallback chain (exec-form cannot solve interpreter naming: `python3` is absent on stock Windows, and shell-form runs under Git Bash there, which Claude Code requires)
 - `skills/nb/SKILL.md` — the skill file, auto-loaded by Claude Code
 
 The hook command uses `${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py`, which Claude Code expands to the plugin's installation directory at runtime. No settings.json patching is required.
@@ -181,7 +181,7 @@ Claude Code behaviors the plugin depends on, and how each was verified:
 | Assumption | Status |
 |---|---|
 | PreToolUse exit 2 blocks + stderr fed to Claude; exit 1 non-blocking (guard) | **Verified** — quoted verbatim in hooks docs |
-| Exec-form hooks (`"command"` + `"args"`) and `${CLAUDE_PLUGIN_ROOT}` expansion | **Verified** — plugins reference, which recommends exec form for plugin paths |
+| Shell-form hooks run under bash (POSIX) / Git Bash (Windows); `${CLAUDE_PLUGIN_ROOT}` expands in commands | **Verified** — hooks/plugins references. Exec form is documented too, but cannot express interpreter fallback; `python3`-on-Windows hook failure is a known ecosystem issue (claude-plugins-official #85), hence shell-form with `command -v` chain |
 | Env vars do not persist across Bash tool calls (SKILL.md `NB_SCRIPTS` guidance) | **Verified** — tools reference: "An export in one command will not be available in the next" |
 | Pipe-separated hook matchers incl. `NotebookEdit`; `"if"` filter field | **Verified** — plugins/hooks references |
 | `allowed-tools` format (skills frontmatter) | **Partially documented** — "space- or comma-separated string, or a YAML list"; in-paren example form is `Bash(git add *)`. Current frontmatter uses that form. |

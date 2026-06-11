@@ -98,65 +98,47 @@ class TestHooksManifest:
             assert tool in matchers, f"hooks.json matcher must cover {tool!r}"
 
     def test_hook_uses_plugin_root_env_var(self):
-        data = self._load()
-        entries = data["hooks"]["PreToolUse"]
-        for entry in entries:
-            for h in entry.get("hooks", []):
-                if "nb-guard" in h.get("command", ""):
-                    args = h.get("args", [])
-                    assert any("${CLAUDE_PLUGIN_ROOT}" in arg for arg in args), (
-                        "hook args must use ${CLAUDE_PLUGIN_ROOT}, not hardcoded path"
-                    )
+        for h in self._nb_guard_hooks():
+            assert "${CLAUDE_PLUGIN_ROOT}" in h.get("command", ""), (
+                "hook command must use ${CLAUDE_PLUGIN_ROOT}, not hardcoded path"
+            )
 
-    def test_no_absolute_paths_in_hook_args(self):
-        data = self._load()
-        entries = data["hooks"]["PreToolUse"]
-        for entry in entries:
-            for h in entry.get("hooks", []):
-                if "nb-guard" in h.get("command", ""):
-                    args = h.get("args", [])
-                    for arg in args:
-                        stripped = arg.replace("${CLAUDE_PLUGIN_ROOT}", "")
-                        assert not re.search(r"(/home/|/Users/|[A-Z]:\\\\)", stripped), (
-                            f"Hardcoded absolute path in hook args: {arg!r}"
-                        )
+    def test_no_absolute_paths_in_hook_command(self):
+        for h in self._nb_guard_hooks():
+            stripped = h.get("command", "").replace("${CLAUDE_PLUGIN_ROOT}", "")
+            assert not re.search(r"(/home/|/Users/|[A-Z]:\\\\)", stripped), (
+                f"Hardcoded absolute path in hook command: {h!r}"
+            )
 
-    def test_hook_uses_python3(self):
-        data = self._load()
-        entries = data["hooks"]["PreToolUse"]
-        for entry in entries:
-            for h in entry.get("hooks", []):
-                if "nb-guard" in h.get("command", ""):
-                    assert h.get("command") == "python3", (
-                        f"hook command must be 'python3': {h}"
-                    )
+    def test_hook_resolves_interpreter_portably(self):
+        """The hook must not hardcode a single interpreter name: python3 is
+        absent on stock Windows, python may be absent on Debian. Shell-form
+        with a command -v fallback chain runs under bash on POSIX and Git
+        Bash on Windows (which Claude Code requires there)."""
+        for h in self._nb_guard_hooks():
+            cmd = h.get("command", "")
+            assert "command -v python3" in cmd and "command -v python" in cmd, (
+                f"hook must resolve the interpreter with a fallback chain: {cmd!r}"
+            )
 
-    def test_hook_references_nb_guard_py_in_args(self):
-        data = self._load()
-        entries = data["hooks"]["PreToolUse"]
-        found = False
-        for entry in entries:
-            for h in entry.get("hooks", []):
-                if "nb-guard" in h.get("command", "") or any("nb-guard" in a for a in h.get("args", [])):
-                    assert any("nb-guard.py" in a for a in h.get("args", [])), (
-                        f"hook args must reference nb-guard.py: {h}"
-                    )
-                    found = True
-        assert found, "No nb-guard hook found in hooks.json"
+    def test_hook_references_nb_guard_py(self):
+        hooks = self._nb_guard_hooks()
+        assert hooks, "No nb-guard hook found in hooks.json"
+        for h in hooks:
+            assert "nb-guard.py" in h.get("command", ""), (
+                f"hook command must reference nb-guard.py: {h}"
+            )
 
-    def test_hook_uses_exec_form(self):
-        """Hook must use exec-form (command + args), not shell-form string."""
-        data = self._load()
-        entries = data["hooks"]["PreToolUse"]
-        for entry in entries:
-            for h in entry.get("hooks", []):
-                if "nb-guard" in h.get("command", ""):
-                    assert isinstance(h.get("args"), list), (
-                        f"hook must use exec-form with 'args' list: {h}"
-                    )
-                    assert len(h.get("args", [])) > 0, (
-                        f"hook args must not be empty: {h}"
-                    )
+    def test_hook_quotes_plugin_root_expansion(self):
+        """Shell-form: the ${CLAUDE_PLUGIN_ROOT} expansion must be inside
+        double quotes (the cache path can contain spaces), and the resolved
+        interpreter variable must be quoted too."""
+        for h in self._nb_guard_hooks():
+            cmd = h.get("command", "")
+            assert '"${CLAUDE_PLUGIN_ROOT}' in cmd, (
+                f"plugin-root expansion must be double-quoted: {cmd!r}"
+            )
+            assert '"$PYBIN"' in cmd, f"interpreter var must be quoted: {cmd!r}"
 
     def test_hook_type_is_command(self):
         data = self._load()

@@ -6,8 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py"]
+            "command": "PYBIN=$(command -v python3 || command -v python) && exec \"$PYBIN\" \"${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py\""
           }
         ]
       }

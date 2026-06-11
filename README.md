@@ -6,7 +6,7 @@ A Claude Code plugin that lets Claude read and edit Jupyter notebooks **token-ef
 
 A typical notebook with 20 cells can be 50 000+ tokens as raw JSON. `nb-read.py` renders the same notebook as ~400 tokens of indexed cell source. `nb-write.py` makes surgical edits — patch, insert, or delete one cell at a time — without ever loading the whole file into Claude's context as editable text.
 
-A `PreToolUse` hook enforces this: if Claude tries to `Read` or `Edit` a `.ipynb` file directly, the operation is blocked at the harness level and Claude is redirected to the scripts instead.
+A `PreToolUse` hook enforces this: if Claude tries to `Read`, `Edit`, or `NotebookEdit` a `.ipynb` file directly, the operation is blocked at the harness level (exit 2, redirect on stderr) and Claude is pointed at the scripts instead.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ claude plugin install <repo-url>
     └── nb-search.py          ← cross-notebook keyword / symbol / import search
 ```
 
-The `hooks/hooks.json` registers `nb-guard.py` as a `PreToolUse` hook on `Read|Edit|Write|MultiEdit` using `${CLAUDE_PLUGIN_ROOT}` — no `settings.json` patching required.
+The `hooks/hooks.json` registers `nb-guard.py` as a `PreToolUse` hook on `Read|Edit|Write|MultiEdit|NotebookEdit` using `${CLAUDE_PLUGIN_ROOT}`, with a shell-form interpreter fallback (`python3` → `python`) so it works on Windows where `python3` is absent — no `settings.json` patching required.
 
 ## Repository layout
 
