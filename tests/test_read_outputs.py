@@ -579,3 +579,132 @@ class TestReviewFixes:
         assert r.returncode == 0
         out = r.stdout
         assert out.index("│ before") < out.index("[image/png output — not shown]") < out.index("│ after")
+
+
+# ---------------------------------------------------------------------------
+# § Summary derived from the renderer (single source of truth)
+# ---------------------------------------------------------------------------
+
+class TestSummaryMatchesRenderer:
+    """The normal-mode '(N outputs, M lines)' summary must report exactly the
+    number of lines that --outputs renders, for every output shape."""
+
+    @staticmethod
+    def _summary_lines(stdout):
+        """Extract M from the '│ ── (N output(s), M lines) ──' summary."""
+        import re
+        m = re.search(r"│ ── \(\d+ outputs?, (\d+) lines\) ──", stdout)
+        assert m, f"No summary line found in:\n{stdout}"
+        return int(m.group(1))
+
+    @staticmethod
+    def _rendered_lines(stdout):
+        """Count body lines of the [output] block (the '│ '-prefixed lines
+        after the '[output]' header)."""
+        lines = stdout.splitlines()
+        start = next(i for i, l in enumerate(lines) if l.startswith("[output]"))
+        n = 0
+        for l in lines[start + 1:]:
+            if l.startswith("│ "):
+                n += 1
+            else:
+                break
+        return n
+
+    def _assert_agreement(self, p):
+        r_normal = run_read([p])
+        assert r_normal.returncode == 0
+        r_out = run_read([p, "--outputs", "--truncate", "0"])
+        assert r_out.returncode == 0
+        summary = self._summary_lines(r_normal.stdout)
+        rendered = self._rendered_lines(r_out.stdout)
+        assert summary == rendered, (
+            f"Summary says {summary} lines but --outputs renders {rendered}:\n"
+            f"--- normal ---\n{r_normal.stdout}\n--- outputs ---\n{r_out.stdout}"
+        )
+
+    def test_execute_result_lines_counted(self, tmp_path):
+        """execute_result text/plain must be counted (was '0 lines' before)."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["df"],
+            "outputs": [{
+                "output_type": "execute_result",
+                "data": {"text/plain": "   a  b\n0  1  2\n1  3  4"},
+                "metadata": {}, "execution_count": 1,
+            }],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "│ ── (1 output, 3 lines) ──" in r.stdout, (
+            f"execute_result must count its text/plain lines, got:\n{r.stdout}"
+        )
+        self._assert_agreement(p)
+
+    def test_stream_partial_chunks_counted_as_one_line(self, tmp_path):
+        """Two chunks forming one logical line count as 1 line, matching
+        --outputs (which joins them)."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["print('x', end=''); print('y')"],
+            "outputs": [
+                {"output_type": "stream", "name": "stdout", "text": ["foo"]},
+                {"output_type": "stream", "name": "stdout", "text": ["bar\n"]},
+            ],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "│ ── (2 outputs, 1 lines) ──" in r.stdout, (
+            f"Joined stream chunks must count as 1 line, got:\n{r.stdout}"
+        )
+        self._assert_agreement(p)
+
+    def test_error_traceback_embedded_newlines_counted(self, tmp_path):
+        """Traceback line count uses rendered lines, not list length."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["boom()"],
+            "outputs": [{
+                "output_type": "error", "ename": "E", "evalue": "v",
+                "traceback": ["first\nsecond", "third"],
+            }],
+            "execution_count": 1,
+        }], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "│ ── (1 output, 3 lines) ──" in r.stdout, (
+            f"Traceback with embedded newlines is 3 rendered lines, got:\n{r.stdout}"
+        )
+        self._assert_agreement(p)
+
+    def test_placeholder_agreement(self, tmp_path):
+        """Binary-only outputs: summary counts the placeholder line, same as
+        --outputs renders."""
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["plt.show()"],
+            "outputs": [{
+                "output_type": "display_data",
+                "data": {"image/png": "aGVsbG8="}, "metadata": {},
+            }],
+            "execution_count": 1,
+        }], tmp_path)
+        self._assert_agreement(p)
+
+    def test_mixed_outputs_agreement(self, tmp_path):
+        p = _make_nb([{
+            "cell_type": "code",
+            "source": ["mix()"],
+            "outputs": [
+                {"output_type": "stream", "name": "stdout", "text": ["a\nb\n"]},
+                {"output_type": "display_data",
+                 "data": {"image/png": "aGVsbG8="}, "metadata": {}},
+                {"output_type": "execute_result",
+                 "data": {"text/plain": "result"}, "metadata": {},
+                 "execution_count": 1},
+            ],
+            "execution_count": 1,
+        }], tmp_path)
+        self._assert_agreement(p)

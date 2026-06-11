@@ -37,7 +37,11 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
-MAX_RANGE_SIZE = 10_000             # guard against billion-element set allocation
+# Parse-time sanity cap on --cells N-M spans.  Parsing happens before the
+# notebook is loaded (and --outline may never load it), so an absurd span is
+# rejected up front; anything below the cap is implicitly clamped to the
+# notebook's real cell count because cells are matched by membership test.
+MAX_RANGE_SIZE = 1_000_000
 
 # ---------------------------------------------------------------------------
 # ANSI sanitisation
@@ -68,6 +72,9 @@ _CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')  # C0 controls + DEL
 # Variant that keeps \n: used on multi-line output text BEFORE splitting, so
 # \r/\v/\f are removed rather than becoming line boundaries via splitlines().
 _CTRL_NO_NL_RE = re.compile(r'[\x00-\x09\x0b-\x1f\x7f]')
+# Variant for cell *source*: keeps \n (line structure) and \t (tabs are
+# legitimate in source code); strips every other C0 control + DEL.
+_CTRL_SOURCE_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 
 
 def _sanitise(s: str) -> str:
@@ -79,14 +86,34 @@ def _sanitise(s: str) -> str:
 # Index discovery (§15)
 # ---------------------------------------------------------------------------
 
+def _is_git_root_entry(git_candidate: Path) -> bool:
+    """True if .git marks a repo root: a real (non-symlink) directory, or a
+    regular (non-symlink) file starting with 'gitdir:' (worktrees/submodules).
+    Verbatim-shared detection — canonical copy lives in nb-index.py."""
+    try:
+        if git_candidate.is_symlink():
+            return False  # never accept a symlinked .git (security stance)
+        if git_candidate.is_dir():
+            return True
+        if git_candidate.is_file():
+            try:
+                with open(git_candidate, "rb") as gf:
+                    head = gf.read(4096)
+            except OSError:
+                return False
+            return head.startswith(b"gitdir:")
+    except OSError:
+        pass
+    return False
+
+
 def _find_index_dir(nb_path: Path) -> Path:
     """Walk upward from nb_path to find git root; fall back to nb_path.parent."""
     nb_path = nb_path.resolve()
     current = nb_path.parent
     current_dev = os.stat(current).st_dev
     for _ in range(20):
-        git_dir = current / ".git"
-        if git_dir.is_dir() and not git_dir.is_symlink():
+        if _is_git_root_entry(current / ".git"):
             return current / ".nb_index"
         parent = current.parent
         if parent == current:
@@ -147,7 +174,13 @@ def _load_fresh_index(nb_path: Path):
 # ---------------------------------------------------------------------------
 
 def parse_cell_filter(spec):
-    """Return a set of indices, or None to mean 'all'."""
+    """Return a container of indices (supports `in`), or None to mean 'all'.
+
+    Ranges return a `range` object (O(1) membership, no allocation), so an
+    end beyond the notebook's last cell is harmless — it is effectively
+    clamped to the real cell count when cells are matched.  A range starting
+    beyond the last cell simply matches nothing, as before.
+    """
     if not spec:
         return None
     try:
@@ -162,7 +195,7 @@ def parse_cell_filter(spec):
             if hi - lo >= MAX_RANGE_SIZE:
                 sys.exit(f"Error: range '{spec}' spans {hi - lo + 1} cells; "
                          f"max is {MAX_RANGE_SIZE}.")
-            return set(range(lo, hi + 1))
+            return range(lo, hi + 1)
         if "," in spec:
             indices = set()
             for part in spec.split(","):
@@ -184,17 +217,32 @@ def parse_cell_filter(spec):
                  f"(non-negative integers only).")
 
 
-def _coerce_source(lines) -> str:
+def _coerce_text(value) -> str:
     """
-    Convert cell source to a plain string, defensively handling non-standard
-    values (int, float, None, list-with-non-strings) found in corrupted or
-    unusual notebooks.
+    Convert a notebook text field (cell source or output text — list-of-str
+    or str) to one plain string, defensively handling non-standard values
+    (int, float, None, list-with-non-strings) found in corrupted or unusual
+    notebooks.
     """
-    if lines is None:
+    if value is None:
         return ""
-    if isinstance(lines, list):
-        return "".join(str(s) for s in lines)
-    return str(lines)
+    if isinstance(value, list):
+        return "".join(str(s) for s in value)
+    return str(value)
+
+
+def _reread_hint(cell_index, outputs=False) -> str:
+    """
+    Build the canonical re-read flag string used by truncation notices,
+    e.g. '--cells 3 --truncate 0' or '--outputs --cells 3 --truncate 0'.
+    """
+    parts = []
+    if outputs:
+        parts.append("--outputs")
+    if cell_index is not None:
+        parts.append(f"--cells {cell_index}")
+    parts.append("--truncate 0")
+    return " ".join(parts)
 
 
 def render_source(lines, truncate, safe=True, cell_index=None):
@@ -212,9 +260,12 @@ def render_source(lines, truncate, safe=True, cell_index=None):
 
     Returns the rendered string, or '│ (empty)' / '(empty)' for empty cells.
     """
-    source = _coerce_source(lines)
+    source = _coerce_text(lines)
     if safe:
+        # Strip ANSI sequences, then remaining C0 controls (keeping \n for
+        # line structure and \t — tabs are legitimate in source).
         source = _ANSI_RE.sub('', source)
+        source = _CTRL_SOURCE_RE.sub('', source)
 
     if not source.strip():
         return "│ (empty)" if safe else "(empty)"
@@ -223,12 +274,11 @@ def render_source(lines, truncate, safe=True, cell_index=None):
     if truncate and len(all_lines) > truncate:
         hidden = len(all_lines) - truncate
         # stderr: never mixed into captured stdout output that Claude might treat as source
-        cell_info = f"[cell {cell_index}] " if cell_index is not None else ""
-        print(f"  *** {cell_info}source truncated to {truncate} lines ({hidden} more not shown). "
-              f"Re-read with --cells {cell_index} --truncate 0 for full source. ***"
+        print(f"  *** [cell {cell_index}] source truncated to {truncate} lines ({hidden} more not shown). "
+              f"Re-read with {_reread_hint(cell_index)} for full source. ***"
               if cell_index is not None
               else f"  *** TRUNCATED: {hidden} more line(s) not shown. "
-                   f"Re-read with --truncate 0 before patching this cell. ***",
+                   f"Re-read with {_reread_hint(cell_index)} before patching this cell. ***",
               file=sys.stderr)
         all_lines = all_lines[:truncate]
 
@@ -237,32 +287,20 @@ def render_source(lines, truncate, safe=True, cell_index=None):
     return "\n".join(all_lines)
 
 
-def _output_summary(cell) -> str | None:
+def _output_summary(cell, safe=True) -> str | None:
     """
     Return a one-line summary of cell outputs, or None if there are no outputs.
     Format: '│ ── (N outputs, M lines) ──'  (§2.6 canonical)
+
+    The line count is derived from the same renderer that --outputs uses
+    (_output_lines), so the summary and --outputs always agree for every
+    output shape (stream, execute_result, error, rich placeholders).
     """
     outputs = cell.get("outputs", [])
     if not outputs:
         return None
     n_entries = len(outputs)
-    n_lines = 0
-    for out in outputs:
-        # stream / display_data / execute_result use 'text'
-        text = out.get("text", [])
-        if isinstance(text, list):
-            n_lines += sum(len(str(t).splitlines()) for t in text)
-        elif isinstance(text, str):
-            n_lines += len(text.splitlines())
-        # error outputs use 'traceback'
-        tb = out.get("traceback", [])
-        if isinstance(tb, list):
-            n_lines += len(tb)
-        # non-text rich outputs (image/html/json only): count the one-line
-        # placeholder that --outputs renders, so summary and --outputs agree
-        # that an output exists.
-        if _placeholder_mimes(out):
-            n_lines += 1
+    n_lines = len(_output_lines(cell, safe=safe))
     plural = "output" if n_entries == 1 else "outputs"
     return f"│ ── ({n_entries} {plural}, {n_lines} lines) ──"
 
@@ -292,12 +330,28 @@ def _rank_mimes(mimes) -> list:
     return sorted(mimes, key=key)
 
 
+def _rich_text(out) -> str:
+    """
+    Return the renderable text of a rich output (execute_result /
+    display_data): data['text/plain'] when non-empty, else the legacy
+    top-level 'text' field some old notebooks carry.  '' means the output
+    has no renderable text (→ placeholder).  Single source of truth for the
+    text/plain-vs-legacy-text rule, shared by _placeholder_mimes and the
+    render path.
+    """
+    data = out.get("data", {})
+    if isinstance(data, dict):
+        text = _coerce_text(data.get("text/plain", ""))
+        if text:
+            return text
+    return _coerce_text(out.get("text", ""))
+
+
 def _placeholder_mimes(out) -> list:
     """
     For a rich output (execute_result / display_data) that carries no
-    text/plain representation, return the list of mime types present
-    (richest first).  Returns [] when the output has renderable text or
-    is not a rich output.
+    renderable text, return the list of mime types present (richest first).
+    Returns [] when the output has renderable text or is not a rich output.
     """
     if out.get("output_type", "") not in ("execute_result", "display_data"):
         return []
@@ -306,44 +360,37 @@ def _placeholder_mimes(out) -> list:
         return []
     # Key presence is not enough: data = {"text/plain": "", "image/png": ...}
     # has no renderable text — the placeholder must still appear.
-    if _join_text(data.get("text/plain", "")):
-        return []
-    # legacy notebooks sometimes carry top-level 'text' on rich outputs
-    if _join_text(out.get("text", "")):
+    if _rich_text(out):
         return []
     return _rank_mimes(str(m) for m in data.keys() if m != "text/plain")
 
 
-def _join_text(text_val) -> str:
-    """Coerce a notebook text field (list-of-str or str) to one string."""
-    if isinstance(text_val, list):
-        return "".join(str(t) for t in text_val)
-    if isinstance(text_val, str):
-        return text_val
-    return str(text_val) if text_val is not None else ""
-
-
-def _render_output_block(cell, safe=True, truncate=0, cell_index=None) -> str | None:
+def _output_lines(cell, safe=True, limit=0) -> list:
     """
-    Render the [output] block for a cell.  Returns None if the cell has no
-    renderable outputs (neither text nor rich/binary data).
+    Render a cell's outputs to a list of lines.  Shared by --outputs
+    (_render_output_block) and the normal-mode summary (_output_summary),
+    so both always agree on what counts as an output line.
 
-    - Text outputs (stream / text/plain / error tracebacks) are rendered as-is
-      (ANSI/C0-sanitised in safe mode).
+    - Text outputs (stream / text/plain / error tracebacks) are rendered
+      as-is (ANSI/C0-sanitised in safe mode).
     - Non-text rich outputs (image/html/json only) render a one-line
       placeholder listing the mime types present, so 'no output' is
       distinguishable from 'plot exists'.
-    - `truncate` caps the block at N lines (0 = unlimited); a marker line is
-      appended explaining how to retrieve the full output.
-    - Every line is hard-capped at MAX_OUTPUT_LINE_WIDTH characters.
+    - When `limit` > 0, accumulation stops at limit + 1 lines (just enough
+      to detect that truncation is needed) instead of materialising huge
+      output blocks.
     """
     outputs = cell.get("outputs", [])
     if not outputs:
-        return None
+        return []
 
+    cap = limit + 1 if limit else 0
     lines = []
     buf = []  # contiguous text chunks, joined with "" — preserves Jupyter
               # stream semantics where partial writes form one logical line
+
+    def _full():
+        return bool(cap) and len(lines) >= cap
 
     def _flush():
         if not buf:
@@ -355,26 +402,29 @@ def _render_output_block(cell, safe=True, truncate=0, cell_index=None) -> str | 
             # becoming line boundaries (e.g. \r-overwritten progress bars).
             text = _ANSI_RE.sub('', text)
             text = _CTRL_NO_NL_RE.sub('', text)
-        lines.extend(text.splitlines())
+        new = text.splitlines()
+        if cap:
+            new = new[:max(0, cap - len(lines))]
+        lines.extend(new)
 
     for out in outputs:
+        if _full():
+            break
         otype = out.get("output_type", "")
         text = None
         if otype == "stream":
-            text = _join_text(out.get("text", []))
+            text = _coerce_text(out.get("text", []))
         elif otype in ("execute_result", "display_data"):
             mimes = _placeholder_mimes(out)
             if mimes:
                 _flush()
+                if _full():
+                    break
                 if safe:
                     mimes = [_sanitise(m) for m in mimes]
                 lines.append(f"[{', '.join(mimes)} output — not shown]")
                 continue
-            data = out.get("data", {})
-            if isinstance(data, dict) and "text/plain" in data:
-                text = _join_text(data["text/plain"])
-            else:
-                text = _join_text(out.get("text", []))
+            text = _rich_text(out)
         elif otype == "error":
             tb = out.get("traceback", [])
             if isinstance(tb, list):
@@ -384,9 +434,26 @@ def _render_output_block(cell, safe=True, truncate=0, cell_index=None) -> str | 
         if text:
             buf.append(text)
     _flush()
+    return lines
 
+
+def _render_output_block(cell, safe=True, truncate=0, cell_index=None) -> str | None:
+    """
+    Render the [output] block for a cell.  Returns None if the cell has no
+    renderable outputs (neither text nor rich/binary data).
+
+    - Line content comes from _output_lines (shared with _output_summary).
+    - `truncate` caps the block at N lines (0 = unlimited); a marker line is
+      appended explaining how to retrieve the full output.
+    - Every kept line is hard-capped at MAX_OUTPUT_LINE_WIDTH characters.
+    """
+    lines = _output_lines(cell, safe=safe, limit=truncate)
     if not lines:
         return None
+
+    truncated = bool(truncate) and len(lines) > truncate
+    if truncated:
+        lines = lines[:truncate]
 
     # Hard cap on single-line width (output blocks only; source untouched).
     lines = [
@@ -395,11 +462,10 @@ def _render_output_block(cell, safe=True, truncate=0, cell_index=None) -> str | 
         for l in lines
     ]
 
-    if truncate and len(lines) > truncate:
-        lines = lines[:truncate]
+    if truncated:
         idx = cell_index if cell_index is not None else "N"
         lines.append(f"… output truncated to {truncate} lines "
-                     f"(use --outputs --cells {idx} --truncate 0 for full output)")
+                     f"(use {_reread_hint(idx, outputs=True)} for full output)")
 
     header = "[output] " + "─" * 40
     if safe:
@@ -409,13 +475,45 @@ def _render_output_block(cell, safe=True, truncate=0, cell_index=None) -> str | 
     return header + "\n" + body
 
 
+def _attachment_notes(cell, safe=True) -> list:
+    """
+    One-line notes for markdown-cell attachments (embedded images etc.),
+    e.g. '│ [attachment "plot.png": image/png — not shown]'.
+    Returns [] when the cell has no attachments.
+    """
+    atts = cell.get("attachments", {})
+    if not isinstance(atts, dict):
+        return []
+    notes = []
+    for name, payload in atts.items():
+        if isinstance(payload, dict) and payload:
+            mimes = ", ".join(_rank_mimes(str(m) for m in payload.keys()))
+        else:
+            mimes = "unknown"
+        note = f'[attachment "{name}": {mimes} — not shown]'
+        if safe:
+            note = "│ " + _sanitise(note)
+        notes.append(note)
+    return notes
+
+
+def _raw_mimetype(cell) -> str | None:
+    """Mimetype of a raw cell from its metadata ('format' per nbformat 4,
+    legacy 'raw_mimetype'), or None."""
+    meta = cell.get("metadata", {})
+    if not isinstance(meta, dict):
+        return None
+    mime = meta.get("format") or meta.get("raw_mimetype")
+    return str(mime) if mime else None
+
+
 # ---------------------------------------------------------------------------
 # Outline helpers (for --outline mode)
 # ---------------------------------------------------------------------------
 
 def _first_line_from_source(source_raw, safe=True) -> str:
     """Extract the first non-empty line from raw cell source."""
-    text = _coerce_source(source_raw)
+    text = _coerce_text(source_raw)
     for line in text.splitlines():
         stripped = line.strip()
         if stripped:
@@ -464,6 +562,53 @@ def _format_outline_line(i: int, ctype: str, exec_count, first_line: str,
     return f"{bracket} {first_line}"
 
 
+def _valid_index_cells(index_data):
+    """
+    Return the index's cell list if it is structurally usable for outline
+    rendering (a list of dicts, each with an int 'i'); otherwise None so the
+    caller can fall back to the notebook (a malformed index is treated the
+    same as a corrupt one).
+    """
+    cells = index_data.get("cells") if isinstance(index_data, dict) else None
+    if not isinstance(cells, list):
+        return None
+    for c in cells:
+        if not isinstance(c, dict) or not isinstance(c.get("i"), int):
+            return None
+    return cells
+
+
+def _render_outline_from_index(path, index_data, index_cells, cell_filter,
+                               type_filter, safe):
+    """
+    Render --outline entirely from a fresh index — the notebook itself is
+    never opened (§15 / documented index-backed fast path).
+    """
+    total = index_data.get("cell_count")
+    if not isinstance(total, int):
+        total = len(index_cells)
+    kernel = _sanitise(str(index_data.get("kernel_language") or "unknown"))
+    print(f"{path} | {total} cell{'s' if total != 1 else ''} | {kernel}\n")
+
+    for c in sorted(index_cells, key=lambda c: c["i"]):
+        i = c["i"]
+        if cell_filter is not None and i not in cell_filter:
+            continue
+        ctype = _sanitise(str(c.get("type", "unknown")))
+        if type_filter and ctype != type_filter:
+            continue
+        first_line = str(c.get("first_line") or "(empty)")
+        if safe:
+            first_line = _sanitise(first_line)
+        section = c.get("section")
+        if section is not None:
+            section = str(section)
+            if safe:
+                section = _sanitise(section)
+        print(_format_outline_line(i, ctype, c.get("exec"), first_line,
+                                   section=section))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -503,6 +648,28 @@ def main():
     if size > MAX_FILE_SIZE:
         sys.exit(f"Error: file too large ({size:,} bytes). Max is {MAX_FILE_SIZE:,} bytes.")
 
+    cell_filter = parse_cell_filter(args.cells)
+
+    # Try to load a fresh index (used by the --outline fast path)
+    nb_path = Path(path)
+    index_data, index_reason = _load_fresh_index(nb_path)
+    if index_reason == "stale":
+        print(f"[STALE INDEX] {path}", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # --outline fast path: render entirely from a fresh index without
+    # ever json.load-ing the notebook.  A structurally invalid index is
+    # treated like a corrupt one: warn and fall back to the notebook.
+    # ------------------------------------------------------------------
+    if args.outline and index_data is not None:
+        index_cells = _valid_index_cells(index_data)
+        if index_cells is not None:
+            _render_outline_from_index(path, index_data, index_cells,
+                                       cell_filter, args.cell_type, safe)
+            return
+        print(f"[MALFORMED INDEX] {path} — falling back to the notebook",
+              file=sys.stderr)
+
     try:
         # utf-8-sig handles UTF-8 BOM transparently
         with open(path, encoding="utf-8-sig") as f:
@@ -522,53 +689,23 @@ def main():
     lang   = _sanitise(nb.get("metadata", {}).get("kernelspec", {}).get("language", ""))
     lang_str = f" ({lang})" if lang and lang != kernel else ""
 
-    cell_filter = parse_cell_filter(args.cells)
-
-    # Try to load a fresh index (used by --outline, --outputs, and §11 headers)
-    nb_path = Path(path)
-    index_data, index_reason = _load_fresh_index(nb_path)
-    if index_reason == "stale":
-        print(f"[STALE INDEX] {path}", file=sys.stderr)
-
     # Header
     print(f"{path} | {total} cell{'s' if total != 1 else ''} | {kernel}{lang_str}\n")
 
     # ------------------------------------------------------------------
-    # --outline mode
+    # --outline mode (notebook-backed fallback: index absent/stale/corrupt
+    # /malformed — the fresh-index case returned above)
     # ------------------------------------------------------------------
     if args.outline:
-        # Build a lookup from cell index to index data when fresh
-        index_cell_map = {}
-        if index_data is not None:
-            for c in index_data.get("cells", []):
-                index_cell_map[c["i"]] = c
-
         for i, cell in enumerate(cells):
             if cell_filter is not None and i not in cell_filter:
                 continue
             ctype = _sanitise(cell.get("cell_type", "unknown"))
             if args.cell_type and ctype != args.cell_type:
                 continue
-
             exec_count = cell.get("execution_count", None)
-
-            section = None
-            if index_cell_map and i in index_cell_map:
-                first_line = index_cell_map[i].get("first_line", "(empty)")
-                if safe:
-                    first_line = _sanitise(first_line)
-                idx_exec = index_cell_map[i].get("exec")
-                if exec_count is None and idx_exec is not None:
-                    exec_count = idx_exec
-                # §11.3: show section name from index
-                section = index_cell_map[i].get("section")
-                if section is not None and safe:
-                    section = _sanitise(section)
-            else:
-                first_line = _first_line_from_source(cell.get("source", []), safe=safe)
-
-            print(_format_outline_line(i, ctype, exec_count, first_line, section=section))
-
+            first_line = _first_line_from_source(cell.get("source", []), safe=safe)
+            print(_format_outline_line(i, ctype, exec_count, first_line))
         return
 
     # ------------------------------------------------------------------
@@ -587,6 +724,11 @@ def main():
             exec_count = cell.get("execution_count", None)
             run_str = str(exec_count) if exec_count is not None else "——"
             meta = f"[{i}:{ctype}:run={run_str}]"
+        elif ctype == "raw":
+            # Raw cells with a metadata mimetype show it in the bracket,
+            # e.g. [3:raw:text/latex]
+            mime = _raw_mimetype(cell)
+            meta = f"[{i}:{ctype}:{_sanitise(mime)}]" if mime else f"[{i}:{ctype}]"
         else:
             meta = f"[{i}:{ctype}]"
 
@@ -596,6 +738,11 @@ def main():
 
         source_text = render_source(cell.get("source", []), args.truncate, safe=safe, cell_index=i)
         print(source_text)
+
+        if ctype == "markdown":
+            # One-line note per attachment (embedded images etc.)
+            for note in _attachment_notes(cell, safe=safe):
+                print(note)
 
         if ctype == "code":
             if args.outputs:
@@ -607,7 +754,7 @@ def main():
                     print(output_block)
             else:
                 # Normal mode: show summary line (§2.6)
-                summary = _output_summary(cell)
+                summary = _output_summary(cell, safe=safe)
                 if summary:
                     print(summary)
 

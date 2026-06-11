@@ -146,10 +146,21 @@ def _sanitise(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Python
-DEF_RE    = re.compile(r'^def\s+(\w+)\s*\(', re.MULTILINE)
+# DEF_RE: 'def' and 'async def' at column 0.
+DEF_RE    = re.compile(r'^(?:async\s+)?def\s+(\w+)\s*\(', re.MULTILINE)
 CLASS_RE  = re.compile(r'^class\s+(\w+)\s*[:\(]', re.MULTILINE)
-ASSIGN_RE = re.compile(r'^(\w+)\s*(?::[\w\[\], ]{0,200})?\s*=(?!=)', re.MULTILINE)
-IMPORT_RE = re.compile(r'^import\s+([\w.]+)', re.MULTILINE)
+# ASSIGN_RE: optional annotation tolerates dots, brackets, quotes, pipes and
+# spaces (e.g. 'x: np.ndarray = ...', 'y: "Foo|None" = ...'); the {0,200}
+# bound on a single character class keeps it ReDoS-safe.
+ASSIGN_RE = re.compile(r'^(\w+)\s*(?::\s*[\w\[\]., \'"|]{0,200})?\s*=(?!=)', re.MULTILINE)
+# TUPLE_ASSIGN_RE: conservative tuple assignment at column 0 — a comma-
+# separated list of two or more simple \w+ names followed by '='. Starred,
+# attribute and subscript targets deliberately do not match.
+TUPLE_ASSIGN_RE = re.compile(r'^(\w+(?:\s*,\s*\w+)+)\s*=(?!=)', re.MULTILINE)
+# IMPORT_RE: captures the full comma-separated module list of an 'import'
+# statement, including 'as alias' parts; split/stripped in _extract_symbols
+# (the imports index is by MODULE name, so 'import x as y' records 'x').
+IMPORT_RE = re.compile(r'^import\s+([\w.]+(?:\s+as\s+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:\s+as\s+\w+)?)*)', re.MULTILINE)
 FROM_RE   = re.compile(r'^from\s+([\w.]+)\s+import', re.MULTILINE)
 
 # Julia
@@ -182,12 +193,14 @@ def _now_utc() -> str:
 
 
 def _filter_long_lines(src: str) -> str:
-    """Return src with lines > MAX_LINE_LEN replaced by empty strings."""
+    """Return src with lines > MAX_LINE_LEN truncated to their first
+    MAX_LINE_LEN characters (symbols appear at the start of a definition
+    line; the bounded slice keeps ReDoS safety). Line structure preserved."""
     parts = []
     for line in src.splitlines(keepends=True):
         if len(line) > MAX_LINE_LEN:
-            # Keep the newline so line structure is preserved
-            parts.append('\n' if line.endswith('\n') else '')
+            nl = '\n' if line.endswith('\n') else ''
+            parts.append(line[:MAX_LINE_LEN].rstrip('\r\n') + nl)
         else:
             parts.append(line)
     return ''.join(parts)
@@ -205,8 +218,18 @@ def _find_index_dir(nb_path: Path) -> tuple[Path, Path | None]:
     """
     Return (index_dir, git_root_or_None).
 
-    Walk upward from the notebook's directory looking for a real .git/ directory.
-    Stops after 20 levels or if st_dev changes.
+    CANONICAL COPY — nb-read.py and nb-search.py carry verbatim copies of this
+    function (no shared import between standalone scripts); when changing it
+    here, sync the copies. Keep it self-contained.
+
+    Walk upward from the notebook's directory looking for a .git entry that is
+    either a real (non-symlink) directory, or a regular (non-symlink) file
+    whose first bytes start with 'gitdir:' (git worktrees and submodules).
+    The git root for index purposes is the directory CONTAINING that .git
+    entry — the 'gitdir:' pointer is never followed; the index belongs with
+    the working tree. A symlinked .git is always rejected (security stance).
+    Stops after 20 levels or if st_dev changes (filesystem boundary); when
+    that forces the per-directory fallback, a one-line [note] goes to stderr.
     """
     nb_abs = nb_path  # already resolved by caller
     cur = nb_abs.parent
@@ -215,26 +238,59 @@ def _find_index_dir(nb_path: Path) -> tuple[Path, Path | None]:
     except OSError:
         return (cur / ".nb_index", None)
 
-    for _ in range(20):
+    stop_reason = None       # "depth" | "boundary" | None (root / stat error)
+    saw_symlink_git = False  # a symlinked .git was rejected during the walk
+
+    for level in range(20):
         git_candidate = cur / ".git"
-        # Only accept real directory, not a symlink
-        if git_candidate.is_dir() and not git_candidate.is_symlink():
-            return (cur / ".nb_index", cur)
+        try:
+            if git_candidate.is_symlink():
+                # Never accept a symlinked .git (dir or file).
+                saw_symlink_git = True
+            elif git_candidate.is_dir():
+                return (cur / ".nb_index", cur)
+            elif git_candidate.is_file():
+                # Worktree / submodule: .git is a regular file containing
+                # 'gitdir: <path>'. Read at most 4096 bytes; tolerate read
+                # errors by ignoring the candidate.
+                try:
+                    with open(git_candidate, "rb") as gf:
+                        head = gf.read(4096)
+                except OSError:
+                    head = b""
+                if head.startswith(b"gitdir:"):
+                    return (cur / ".nb_index", cur)
+        except OSError:
+            pass  # unreadable candidate — ignore and keep walking
 
         parent = cur.parent
         if parent == cur:
-            break  # reached filesystem root
+            break  # reached filesystem root — normal no-git case, no note
         try:
             parent_dev = os.stat(parent).st_dev
         except OSError:
             break
         if parent_dev != cur_dev:
-            break  # filesystem boundary
+            stop_reason = "boundary"  # filesystem boundary
+            break
         cur_dev = parent_dev
         cur = parent
+    else:
+        stop_reason = "depth"  # 20-level cap exhausted
 
     # Fallback: use notebook's own directory
-    return (nb_abs.parent / ".nb_index", None)
+    index_dir = nb_abs.parent / ".nb_index"
+    suffix = " (a symlinked .git was rejected during the walk)" if saw_symlink_git else ""
+    if stop_reason == "depth":
+        print(f"[note] no git root found within 20 levels — "
+              f"using per-directory index at {index_dir}{suffix}", file=sys.stderr)
+    elif stop_reason == "boundary":
+        print(f"[note] no git root found before filesystem boundary — "
+              f"using per-directory index at {index_dir}{suffix}", file=sys.stderr)
+    elif saw_symlink_git:
+        print(f"[note] symlinked .git rejected — "
+              f"using per-directory index at {index_dir}", file=sys.stderr)
+    return (index_dir, None)
 
 
 def _index_file_path(nb_path: Path) -> tuple[Path, Path, Path | None]:
@@ -275,7 +331,14 @@ def _index_file_path(nb_path: Path) -> tuple[Path, Path, Path | None]:
 # ---------------------------------------------------------------------------
 
 def _update_gitignore(index_dir: Path) -> None:
-    """Append '.nb_index/' and '*.nblock' to .gitignore at the same level as index_dir."""
+    """Append '.nb_index/' and '*.nblock' to .gitignore at the same level as index_dir.
+
+    The read-modify-write is serialised against concurrent indexers via a
+    blocking-with-timeout (~5 s) exclusive lock on .nb_index/gitignore.nblock
+    (same portable helper as symbols.nblock; never unlinked). On timeout the
+    update is skipped with a [warn] — the operation is idempotent, so a later
+    run adds any missing entries.
+    """
     gitignore = index_dir.parent / ".gitignore"
     entries = [".nb_index/", "*.nblock"]
 
@@ -283,6 +346,18 @@ def _update_gitignore(index_dir: Path) -> None:
         print(f"[warn] .gitignore is a symlink — skipping gitignore update",
               file=sys.stderr)
         return
+
+    lock_fd = None
+    if _LOCK_BACKEND is not None:
+        try:
+            lock_fd = open(index_dir / "gitignore.nblock", "a")
+        except OSError:
+            lock_fd = None  # cannot create lock file — proceed unlocked (best effort)
+        if lock_fd is not None and not _lock_file_timeout(lock_fd, timeout=5.0):
+            print("[warn] gitignore lock busy — skipping gitignore update",
+                  file=sys.stderr)
+            lock_fd.close()
+            return
 
     try:
         if gitignore.exists():
@@ -302,6 +377,12 @@ def _update_gitignore(index_dir: Path) -> None:
         gitignore.write_text(content, encoding="utf-8")
     except OSError as e:
         print(f"[warn] could not update .gitignore: {e}", file=sys.stderr)
+    finally:
+        if lock_fd is not None:
+            # The lock file is deliberately NOT unlinked (unlink-after-release
+            # is an inode race; *.nblock is gitignored).
+            _unlock_file(lock_fd)
+            lock_fd.close()
 
 
 # ---------------------------------------------------------------------------
@@ -480,10 +561,22 @@ def _extract_symbols(source_str: str, lang: str) -> tuple[list, list, bool]:
         defined += DEF_RE.findall(filtered)
         defined += CLASS_RE.findall(filtered)
         defined += ASSIGN_RE.findall(filtered)
+        # Tuple assignment 'a, b = ...': capture each simple name
+        for match in TUPLE_ASSIGN_RE.findall(filtered):
+            for name in match.split(','):
+                name = name.strip()
+                if name:
+                    defined.append(name)
         # Post-filter: remove "type" soft-keyword
         defined = [n for n in defined if n != "type"]
 
-        imported += IMPORT_RE.findall(filtered)
+        # 'import a, b as c, d': record each MODULE name (aliases dropped —
+        # the imports index is by module).
+        for match in IMPORT_RE.findall(filtered):
+            for part in match.split(','):
+                words = part.split()
+                if words:
+                    imported.append(words[0])
         imported += FROM_RE.findall(filtered)
 
         return (_cap_symbols(defined), _cap_symbols(imported), True)
@@ -694,6 +787,14 @@ def _update_symbols_json(
     _exists_cache: dict = {}
 
     def _nb_exists(loc: str) -> bool:
+        # Colon-separator safety: locations are "<key>:<index>" where <key>
+        # always ends in ".ipynb" (extension enforced at entry) and <index>
+        # is appended LAST. rsplit(":", 1) therefore always splits at the
+        # appended separator: any colon inside the path (e.g. "C:/x.ipynb",
+        # "dir:3/nb.ipynb", "evil:7.ipynb") stays in the key part, and a key
+        # can never end in ":<digits>" because it ends in "ipynb". Readers
+        # that additionally int-validate the suffix cannot mis-parse a path
+        # segment as a cell index. No schema change needed.
         key = loc.rsplit(":", 1)[0]
         if key not in _exists_cache:
             p = Path(key)
@@ -738,6 +839,10 @@ def _update_symbols_json(
         # Add new entries from current cells
         for cell in cells_data:
             i = cell["i"]
+            # "<key>:<index>" is unambiguous even for paths containing colons:
+            # the key always ends in ".ipynb" and the integer index is appended
+            # last, so rsplit(":", 1) + int-validation recovers it exactly
+            # (see _nb_exists above for the full argument).
             location = f"{nb_key}:{i}"
             for sym in cell.get("symbols_defined", []):
                 new_symbols.setdefault(sym, [])

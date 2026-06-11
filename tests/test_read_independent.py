@@ -853,3 +853,110 @@ class TestExitCodesAndStreams:
         assert result.returncode != 0
         combined = result.stdout + result.stderr
         assert combined.strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# Class 11 – Markdown attachments and raw-cell mimetypes
+# ---------------------------------------------------------------------------
+
+class TestAttachmentsAndRawMimetype:
+    """Markdown attachments render a one-line note; raw cells show their
+    metadata mimetype in the header bracket."""
+
+    def _write_nb(self, cells, tmp_path):
+        nb = {
+            "nbformat": 4, "nbformat_minor": 5,
+            "metadata": {"kernelspec": {"name": "python3", "language": "python",
+                                        "display_name": "Python 3"}},
+            "cells": cells,
+        }
+        p = tmp_path / "notebook.ipynb"
+        p.write_text(json.dumps(nb), encoding="utf-8")
+        return p
+
+    def test_markdown_attachment_note_rendered(self, tmp_path):
+        nb = self._write_nb([{
+            "id": "c0", "cell_type": "markdown",
+            "metadata": {},
+            "source": "![plot](attachment:plot.png)",
+            "attachments": {"plot.png": {"image/png": "iVBORw0KGgoAAAANSUhEUg=="}},
+        }], tmp_path)
+        result = run([str(nb)])
+        assert result.returncode == 0
+        assert '│ [attachment "plot.png": image/png — not shown]' in result.stdout, (
+            f"Expected attachment note, got:\n{result.stdout}"
+        )
+        # The base64 payload must never be printed
+        assert "iVBORw0KGgo" not in result.stdout
+
+    def test_markdown_attachment_note_sanitised(self, tmp_path):
+        nb = self._write_nb([{
+            "id": "c0", "cell_type": "markdown",
+            "metadata": {},
+            "source": "text",
+            "attachments": {"\x1b[31mevil\x07.png": {"image/png": "aGVsbG8="}},
+        }], tmp_path)
+        result = run([str(nb)])
+        assert result.returncode == 0
+        assert "\x1b" not in result.stdout
+        assert "\x07" not in result.stdout
+        assert "evil" in result.stdout
+
+    def test_markdown_without_attachments_no_note(self, tmp_path):
+        nb = self._write_nb([{
+            "id": "c0", "cell_type": "markdown",
+            "metadata": {}, "source": "## plain",
+        }], tmp_path)
+        result = run([str(nb)])
+        assert result.returncode == 0
+        assert "[attachment" not in result.stdout
+
+    def test_raw_cell_mimetype_in_header(self, tmp_path):
+        nb = self._write_nb([{
+            "id": "c0", "cell_type": "raw",
+            "metadata": {"format": "text/latex"},
+            "source": "\\begin{equation}",
+        }], tmp_path)
+        result = run([str(nb)])
+        assert result.returncode == 0
+        assert "[0:raw:text/latex]" in result.stdout, (
+            f"Expected raw mimetype in header bracket, got:\n{result.stdout}"
+        )
+
+    def test_raw_cell_without_mimetype_plain_header(self, tmp_path):
+        nb = self._write_nb([{
+            "id": "c0", "cell_type": "raw",
+            "metadata": {}, "source": "raw text",
+        }], tmp_path)
+        result = run([str(nb)])
+        assert result.returncode == 0
+        assert "[0:raw]" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Class 12 – Re-read hint consistency (shared hint builder)
+# ---------------------------------------------------------------------------
+
+class TestRereadHintConsistency:
+    """Source-truncation and output-truncation notices share one hint builder:
+    both must contain the same '--cells N --truncate 0' core."""
+
+    def test_source_and_output_hints_share_core(self, tmp_path):
+        long_src = "".join(f"s{i}\n" for i in range(50))
+        long_out = "".join(f"o{i}\n" for i in range(50))
+        nb = make_notebook([{
+            "cell_type": "code",
+            "source": long_src,
+            "outputs": [{"output_type": "stream", "name": "stdout",
+                         "text": [long_out]}],
+        }], tmp_path)
+        result = run([str(nb), "--outputs", "--truncate", "5"])
+        assert result.returncode == 0
+        # Source hint (stderr)
+        assert "--cells 0 --truncate 0" in result.stderr, (
+            f"Source truncation hint missing, stderr:\n{result.stderr}"
+        )
+        # Output hint (stdout marker) — same core plus --outputs
+        assert "--outputs --cells 0 --truncate 0" in result.stdout, (
+            f"Output truncation hint missing, stdout:\n{result.stdout}"
+        )

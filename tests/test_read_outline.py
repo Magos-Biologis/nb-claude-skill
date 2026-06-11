@@ -352,3 +352,143 @@ class TestOutlineCompatibility:
             f"Expected header + at least 1 cell line with --outline --no-safe, "
             f"got:\n{r.stdout}"
         )
+
+
+# ---------------------------------------------------------------------------
+# § Index-backed fast path (fresh index → notebook never opened)
+# ---------------------------------------------------------------------------
+
+import os
+
+
+def _index_file_for(nb_path):
+    """No-git case: the index lives at <nb-dir>/.nb_index/<name>.json."""
+    p = Path(nb_path)
+    return p.parent / ".nb_index" / (p.name + ".json")
+
+
+@pytest.mark.skipif(
+    not INDEX_SCRIPT.exists(),
+    reason="nb-index.py required for index-backed outline tests",
+)
+class TestOutlineIndexBacked:
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or getattr(os, "geteuid", lambda: -1)() == 0,
+        reason="chmod 000 is not enforceable on Windows or as root",
+    )
+    def test_outline_from_fresh_index_never_opens_notebook(self, tmp_path):
+        """With a fresh index, --outline must render entirely from the index:
+        it must succeed even when the notebook file itself is unreadable."""
+        p = _make_nb([
+            {"cell_type": "code", "source": ["fastpath_marker = 1\n"],
+             "execution_count": 3},
+            {"cell_type": "markdown", "source": ["## Section A\n"]},
+        ], tmp_path)
+        r_idx = _run_index(p)
+        assert r_idx.returncode == 0, f"nb-index.py failed: {r_idx.stderr!r}"
+        assert _index_file_for(p).exists(), "test setup: index file missing"
+
+        os.chmod(p, 0o000)
+        try:
+            r = run_read([p, "--outline"])
+        finally:
+            os.chmod(p, 0o644)
+
+        assert r.returncode == 0, (
+            f"--outline with a fresh index must not open the notebook; "
+            f"stderr={r.stderr!r}"
+        )
+        assert "fastpath_marker" in r.stdout
+        assert "run=3" in r.stdout
+        assert "[STALE INDEX]" not in r.stderr
+
+    def test_outline_fast_path_respects_filters(self, tmp_path):
+        """--cells / --type filters must also apply on the index fast path."""
+        p = _make_nb([
+            {"cell_type": "code", "source": ["aaa = 1\n"], "execution_count": 1},
+            {"cell_type": "markdown", "source": ["## bbb\n"]},
+            {"cell_type": "code", "source": ["ccc = 3\n"], "execution_count": 2},
+        ], tmp_path)
+        r_idx = _run_index(p)
+        assert r_idx.returncode == 0, f"nb-index.py failed: {r_idx.stderr!r}"
+
+        r = run_read([p, "--outline", "--cells", "0-1", "--type", "code"])
+        assert r.returncode == 0
+        cell_lines = [l for l in r.stdout.splitlines() if l.startswith("[")]
+        assert len(cell_lines) == 1, f"Expected 1 line, got:\n{r.stdout}"
+        assert "aaa" in cell_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# § Malformed index → warned fallback to the notebook
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not INDEX_SCRIPT.exists(),
+    reason="nb-index.py required for malformed-index tests",
+)
+class TestOutlineMalformedIndex:
+
+    def _fresh_then_corrupt(self, tmp_path, corrupt):
+        """Index a notebook, then mutate the index cells via corrupt(cells)
+        (freshness metadata — notebook mtime/size — is preserved)."""
+        p = _make_nb([
+            {"cell_type": "code", "source": ["fallback_marker = 1\n"],
+             "execution_count": 1},
+        ], tmp_path)
+        r_idx = _run_index(p)
+        assert r_idx.returncode == 0, f"nb-index.py failed: {r_idx.stderr!r}"
+        idx_file = _index_file_for(p)
+        data = json.loads(idx_file.read_text(encoding="utf-8"))
+        data["cells"] = corrupt(data["cells"])
+        idx_file.write_text(json.dumps(data), encoding="utf-8")
+        return p
+
+    def test_index_cell_missing_i_falls_back(self, tmp_path):
+        p = self._fresh_then_corrupt(
+            tmp_path,
+            lambda cells: [{k: v for k, v in c.items() if k != "i"} for c in cells],
+        )
+        r = run_read([p, "--outline"])
+        assert r.returncode == 0, (
+            f"Malformed index must fall back, not crash: stderr={r.stderr!r}"
+        )
+        assert "fallback_marker" in r.stdout
+        assert "Traceback" not in r.stderr
+        assert "MALFORMED INDEX" in r.stderr, (
+            f"Expected a malformed-index warning on stderr, got: {r.stderr!r}"
+        )
+
+    def test_index_cells_not_dicts_falls_back(self, tmp_path):
+        p = self._fresh_then_corrupt(tmp_path, lambda cells: ["bogus", 42])
+        r = run_read([p, "--outline"])
+        assert r.returncode == 0
+        assert "fallback_marker" in r.stdout
+        assert "MALFORMED INDEX" in r.stderr
+
+    def test_index_cells_not_a_list_falls_back(self, tmp_path):
+        p = self._fresh_then_corrupt(tmp_path, lambda cells: {"oops": 1})
+        r = run_read([p, "--outline"])
+        assert r.returncode == 0
+        assert "fallback_marker" in r.stdout
+        assert "MALFORMED INDEX" in r.stderr
+
+
+class TestWorktreeGitFile:
+
+    def test_outline_finds_index_when_git_is_a_file(self, tmp_path):
+        """nb-read's index lookup must recognise a 'gitdir:' .git file as a
+        repo root (synced from the canonical nb-index.py detection)."""
+        import subprocess, sys as _sys
+        repo = tmp_path / "wt"
+        (repo / "sub").mkdir(parents=True)
+        (repo / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        nb_path = _make_nb([{"source": ["wt_first_line = 1\n"]}], repo / "sub")
+        r = subprocess.run([_sys.executable, str(INDEX_SCRIPT), str(nb_path)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert (repo / ".nb_index" / "sub").is_dir()
+        out = run_read([str(nb_path), "--outline"])
+        assert out.returncode == 0, out.stderr
+        assert "wt_first_line" in out.stdout

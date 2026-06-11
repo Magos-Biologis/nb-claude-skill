@@ -106,7 +106,8 @@ demo.ipynb | 3 cells | python3 (python)
 [1:markdown] ## Analysis
 [2:code:run=——] (empty)
 ```
-Cells under a markdown heading may show a `§Section` tag in the bracket.
+Cells under a markdown heading may show a `§Section` tag in the bracket. When the
+index is fresh, `--outline` never opens the notebook at all (cheapest possible read).
 
 **`--outputs` mode** — the sanctioned way to inspect stdout/results/tracebacks:
 ```
@@ -117,7 +118,7 @@ Cells under a markdown heading may show a `§Section` tag in the bracket.
 │ (100, 4)
 │ <DataFrame>
 ```
-Text outputs render in full (stream, text/plain, tracebacks); outputs with no text form show a placeholder like `│ [image/png output — not shown]`. Long outputs are cut at `--truncate` lines (default 80; `--truncate 0` = unlimited) with a marker giving the exact command for the full output.
+Text outputs render in full (stream, text/plain, tracebacks); outputs with no text form show a placeholder like `│ [image/png output — not shown]`. Markdown attachments show `│ [attachment "name": mime — not shown]`; raw cells show their mimetype in the header. Long outputs are cut at `--truncate` lines (default 80; `--truncate 0` = unlimited) with a marker giving the exact command for the full output.
 
 ---
 

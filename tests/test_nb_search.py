@@ -1140,7 +1140,14 @@ class TestGitRepoResolution:
         assert "imports.ipynb:0:" in r.stdout
 
     def test_search_from_subdirectory_symbols_json_fast_path(self, tmp_path):
-        """The symbols.json fast path must also resolve against the git root."""
+        """The symbols.json fast path must also resolve against the git root.
+
+        The fast path is FORCED: the per-notebook index file is deleted, so
+        the serial scan cannot produce the hit — only the symbols.json fast
+        path can. With the per-notebook index unreadable and no
+        --type/--section filters requested, the fast-path result must still
+        print (with a placeholder first line, since cell metadata is gone).
+        """
         repo = tmp_path / "repo"
         make_git_repo(repo, [
             ("sub/fast.ipynb", [code_cell("def fast_path_func():\n    pass\n")]),
@@ -1148,12 +1155,16 @@ class TestGitRepoResolution:
         symbols_path = repo / ".nb_index" / "symbols.json"
         if not symbols_path.exists():
             pytest.skip("Implementation does not produce symbols.json")
-        # Ensure the fast path is taken: bump generated_at far into the future
-        # is unnecessary — freshness is checked against per-notebook mtimes;
-        # just verify the search works with symbols.json present.
+        # Force the fast path to be the only route to the result. Deleting
+        # the file does not invalidate symbols.json freshness (no remaining
+        # per-notebook .json is newer than generated_at).
+        (repo / ".nb_index" / "sub" / "fast.ipynb.json").unlink()
         r = run_search(["--symbol", "fast_path_func", str(repo / "sub")])
         assert r.returncode == 0, f"stderr: {r.stderr!r}"
         assert "fast.ipynb:0:" in r.stdout
+        # No filters were requested, so the unreadable per-notebook index
+        # must not cause a filter-skip warning.
+        assert "cannot apply --type/--section filter" not in r.stderr
 
     def test_parent_of_two_repos_resolves_each_correctly(self, tmp_path):
         """Searching from a parent dir of two git repos must resolve each repo's
@@ -1667,3 +1678,24 @@ class TestInOutputs:
         r = run_search(["--import", "--in-outputs", "x", str(tmp_path)])
         assert r.returncode == 2
         assert "in-outputs" in r.stderr
+
+
+class TestWorktreeGitFile:
+
+    def test_search_finds_index_when_git_is_a_file(self, tmp_path):
+        """Worktrees/submodules have .git as a 'gitdir:' file — the upward
+        walk must treat the containing dir as the git root (synced from the
+        canonical nb-index.py detection)."""
+        repo = tmp_path / "wt"
+        (repo / "sub").mkdir(parents=True)
+        (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/wt\n",
+                                   encoding="utf-8")
+        nb = make_notebook([code_cell("worktree_needle = 1\n")],
+                           name="w.ipynb", tmp_path=repo / "sub")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        assert (repo / ".nb_index" / "sub" / "w.ipynb.json").exists()
+        # search from the subdirectory — exercises _find_git_root on the file
+        r = run_search(["worktree_needle", str(repo / "sub")])
+        assert r.returncode == 0, f"{r.stdout!r} {r.stderr!r}"
+        assert "w.ipynb" in r.stdout

@@ -2587,3 +2587,328 @@ class TestOutlineHeaderLimits:
                 assert min_bar in line, (
                     f"Header bar must be at least 4 '─' chars (§11.9): {line!r}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Indexing-quality fixes (2026-06 batch): worktree/submodule .git files,
+# symbol-extraction gaps, gitignore locking, walk-boundary notes
+# ---------------------------------------------------------------------------
+
+class TestGitFileRoots:
+    """Worktrees and submodules: .git is a regular FILE containing
+    'gitdir: <path>'. The directory containing that .git entry is the git
+    root for index purposes; the gitdir: pointer is never followed."""
+
+    def test_worktree_git_file_treated_as_root(self, tmp_path):
+        root = tmp_path / "wt"
+        sub = root / "notebooks"
+        sub.mkdir(parents=True)
+        (root / ".git").write_text(
+            "gitdir: /elsewhere/repo/.git/worktrees/wt\n", encoding="utf-8"
+        )
+        nb = make_notebook([code_cell("x = 1")], tmp_path=sub, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        idx = index_path_for_git(root, nb)
+        assert idx.exists(), (
+            f"Worktree .git file must be treated as git root; expected {idx}"
+        )
+        assert not (sub / ".nb_index").exists(), (
+            "Index must not fall back to per-directory .nb_index for a worktree"
+        )
+
+    def test_gitdir_pointer_not_followed(self, tmp_path):
+        """The gitdir: target does not exist — the index must still land at
+        the directory containing the .git file (the working tree)."""
+        root = tmp_path / "wt2"
+        root.mkdir()
+        (root / ".git").write_text(
+            "gitdir: /nonexistent/path/.git/worktrees/wt2\n", encoding="utf-8"
+        )
+        nb = make_notebook([code_cell("x = 1")], tmp_path=root, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        assert (root / ".nb_index").is_dir(), (
+            "Index must live with the working tree, not at the gitdir: target"
+        )
+        assert index_path_for_git(root, nb).exists()
+
+    def test_submodule_indexes_under_submodule_root(self, tmp_path):
+        """Submodule simulation: superproject has a .git DIR, submodule has a
+        .git FILE — a notebook inside the submodule must index under the
+        submodule root, not the superproject."""
+        superproject = tmp_path / "super"
+        superproject.mkdir()
+        (superproject / ".git").mkdir()
+        submodule = superproject / "libs" / "subrepo"
+        submodule.mkdir(parents=True)
+        (submodule / ".git").write_text(
+            "gitdir: ../../.git/modules/subrepo\n", encoding="utf-8"
+        )
+        data_dir = submodule / "data"
+        data_dir.mkdir()
+        nb = make_notebook([code_cell("x = 1")], tmp_path=data_dir, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        idx = index_path_for_git(submodule, nb)
+        assert idx.exists(), (
+            f"Submodule notebook must index under the submodule root; expected {idx}"
+        )
+        assert not (superproject / ".nb_index").exists(), (
+            "Submodule notebook must NOT index under the superproject"
+        )
+
+    def test_git_file_without_gitdir_prefix_ignored(self, tmp_path):
+        """A .git regular file NOT starting with 'gitdir:' is not a git root."""
+        root = tmp_path / "fake"
+        root.mkdir()
+        (root / ".git").write_text("this is not a git pointer\n", encoding="utf-8")
+        nb = make_notebook([code_cell("x = 1")], tmp_path=root, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        # Falls through to the per-directory fallback (no real git root above tmp_path)
+        assert index_path_for(nb).exists(), (
+            "Non-gitdir .git file must be ignored; per-directory fallback expected"
+        )
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
+    def test_symlinked_git_file_rejected(self, tmp_path):
+        """A .git that is a SYMLINK to a gitdir: file is still rejected
+        (security stance), and the fallback note mentions the symlink."""
+        real = tmp_path / "real_git_file"
+        real.write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / ".git").symlink_to(real)
+        nb = make_notebook([code_cell("x = 1")], tmp_path=root, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        assert (root / ".nb_index").exists(), (
+            "Symlinked .git file must not be treated as git root"
+        )
+        assert "symlink" in r.stderr.lower(), (
+            f"Fallback caused by a symlinked .git must be noted on stderr: {r.stderr!r}"
+        )
+
+
+class TestSymbolExtractionFixes:
+    """Python symbol-extraction gaps: async def, multi-module import,
+    import aliases, tuple assignment, widened annotations, long-line prefix."""
+
+    def _index(self, source, tmp_path, kernel="python"):
+        nb = make_notebook([code_cell(source)], kernel_language=kernel, tmp_path=tmp_path)
+        run_indexer(nb)
+        return load_index(index_path_for(nb))["cells"][0]
+
+    def test_async_def_detected(self, tmp_path):
+        cell = self._index("async def fetch_data(url):\n    pass\n", tmp_path)
+        assert "fetch_data" in cell["symbols_defined"]
+
+    def test_import_multiple_modules(self, tmp_path):
+        cell = self._index("import os, sys, json\n", tmp_path)
+        for mod in ("os", "sys", "json"):
+            assert mod in cell["symbols_imported"], (
+                f"'{mod}' missing from {cell['symbols_imported']}"
+            )
+
+    def test_import_alias_records_module_name(self, tmp_path):
+        cell = self._index("import numpy as np\n", tmp_path)
+        assert "numpy" in cell["symbols_imported"]
+        assert "np" not in cell["symbols_imported"], (
+            "Imports index is by MODULE name — the alias must not be recorded"
+        )
+
+    def test_import_multiple_with_aliases(self, tmp_path):
+        cell = self._index("import numpy as np, pandas as pd, re\n", tmp_path)
+        for mod in ("numpy", "pandas", "re"):
+            assert mod in cell["symbols_imported"]
+        assert "np" not in cell["symbols_imported"]
+        assert "pd" not in cell["symbols_imported"]
+
+    def test_from_import_unchanged(self, tmp_path):
+        cell = self._index("from sklearn.linear_model import Ridge\n", tmp_path)
+        assert "sklearn.linear_model" in cell["symbols_imported"]
+
+    def test_tuple_assignment_two_names(self, tmp_path):
+        cell = self._index("a, b = 1, 2\n", tmp_path)
+        assert "a" in cell["symbols_defined"]
+        assert "b" in cell["symbols_defined"]
+
+    def test_tuple_assignment_three_names(self, tmp_path):
+        cell = self._index("x, y, z = compute()\n", tmp_path)
+        for name in ("x", "y", "z"):
+            assert name in cell["symbols_defined"]
+
+    def test_starred_tuple_target_skipped(self, tmp_path):
+        """Conservative regex: starred targets do not match at all."""
+        cell = self._index("*rest, last = items\n", tmp_path)
+        assert "rest" not in cell["symbols_defined"]
+        assert "last" not in cell["symbols_defined"]
+
+    def test_attribute_tuple_target_skipped(self, tmp_path):
+        cell = self._index("self.x, y = 1, 2\n", tmp_path)
+        assert "self" not in cell["symbols_defined"]
+        assert "y" not in cell["symbols_defined"]
+
+    def test_annotation_with_dotted_type(self, tmp_path):
+        cell = self._index("arr: np.ndarray = np.zeros(3)\n", tmp_path)
+        assert "arr" in cell["symbols_defined"]
+
+    def test_annotation_with_quoted_union(self, tmp_path):
+        cell = self._index('val: "Foo|None" = None\n', tmp_path)
+        assert "val" in cell["symbols_defined"]
+
+    def test_annotation_with_brackets_and_pipe(self, tmp_path):
+        cell = self._index("table: dict[str, int | None] = {}\n", tmp_path)
+        assert "table" in cell["symbols_defined"]
+
+    def test_augmented_assignment_still_excluded(self, tmp_path):
+        cell = self._index("counter += 1\n", tmp_path)
+        assert "counter" not in cell["symbols_defined"]
+
+    def test_long_line_prefix_extraction(self, tmp_path):
+        """Lines > MAX_LINE_LEN are truncated, not dropped — a symbol at the
+        start of a long definition line must still be captured."""
+        long_def = "def my_long_fn(" + ", ".join(f"arg{i}=None" for i in range(100)) + "):\n    pass\n"
+        assert len(long_def.splitlines()[0]) > 500, "Precondition: line must exceed 500 chars"
+        cell = self._index(long_def, tmp_path)
+        assert "my_long_fn" in cell["symbols_defined"], (
+            "Symbol at the start of a >500-char line must be extracted from the prefix"
+        )
+
+    def test_long_assignment_line_prefix_extraction(self, tmp_path):
+        long_assign = "long_value = '" + "a" * 600 + "'\n"
+        cell = self._index(long_assign, tmp_path)
+        assert "long_value" in cell["symbols_defined"]
+
+
+class TestGitignoreLocking:
+    """_update_gitignore is serialised on .nb_index/gitignore.nblock."""
+
+    def test_concurrent_indexers_no_lost_gitignore_entries(self, tmp_path):
+        """Two concurrent indexers updating the same .gitignore must preserve
+        pre-existing entries and not duplicate the managed ones."""
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text("custom_user_entry/\n", encoding="utf-8")
+        nb1 = make_notebook([code_cell("x = 1")], tmp_path=tmp_path, name="a.ipynb")
+        nb2 = make_notebook([code_cell("y = 2")], tmp_path=tmp_path, name="b.ipynb")
+        p1 = subprocess.Popen(
+            [PYTHON, str(SCRIPT), str(nb1)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        p2 = subprocess.Popen(
+            [PYTHON, str(SCRIPT), str(nb2)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        assert p1.wait(timeout=30) == 0
+        assert p2.wait(timeout=30) == 0
+        content = gitignore.read_text(encoding="utf-8")
+        assert "custom_user_entry/" in content, (
+            "Pre-existing .gitignore entries must survive concurrent updates"
+        )
+        assert content.count(".nb_index/") == 1, (
+            f".nb_index/ must appear exactly once, got:\n{content}"
+        )
+        assert content.count("*.nblock") == 1, (
+            f"*.nblock must appear exactly once, got:\n{content}"
+        )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="uses fcntl to hold the lock")
+    def test_gitignore_lock_busy_skips_with_warning(self, tmp_path):
+        """While gitignore.nblock is held by another process, the indexer must
+        skip the gitignore update with a [warn] (after ~5 s) but still write
+        the index and exit 0."""
+        import fcntl as _fcntl
+        nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
+        index_dir = tmp_path / ".nb_index"
+        index_dir.mkdir()
+        lock_path = index_dir / "gitignore.nblock"
+        with open(lock_path, "a") as lock_fd:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            r = run_indexer(nb)
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        assert r.returncode == 0, r.stderr
+        assert "gitignore lock busy" in r.stderr, (
+            f"Expected a 'gitignore lock busy' [warn] on stderr: {r.stderr!r}"
+        )
+        assert index_path_for(nb).exists(), (
+            "Index must still be written when the gitignore update is skipped"
+        )
+        # The skipped update must not have touched .gitignore
+        assert not (tmp_path / ".gitignore").exists() or \
+            ".nb_index/" not in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+
+    def test_gitignore_idempotent_after_lock_fix(self, tmp_path):
+        """Locked path keeps idempotency: repeat runs never duplicate entries."""
+        nb = make_notebook([code_cell("x = 1")], tmp_path=tmp_path)
+        run_indexer(nb)
+        run_indexer(nb, extra_args=["--force"])
+        run_indexer(nb, extra_args=["--force"])
+        content = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+        assert content.count(".nb_index/") == 1
+        assert content.count("*.nblock") == 1
+
+
+class TestWalkBoundaryNotes:
+    """When the upward walk gives up (20-level cap / st_dev boundary) without
+    finding .git, a one-line [note] explains the per-directory fallback."""
+
+    def test_20_level_cap_prints_note(self, tmp_path):
+        deep = tmp_path
+        for i in range(25):
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        nb = make_notebook([code_cell("x = 1")], tmp_path=deep, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        assert "[note] no git root found within 20 levels" in r.stderr, (
+            f"Expected a 20-level-cap note on stderr: {r.stderr!r}"
+        )
+        assert str(deep / ".nb_index") in r.stderr, (
+            "The note must name the per-directory index path"
+        )
+        assert index_path_for(nb).exists()
+
+    def test_20_level_cap_with_git_above_cap_still_falls_back(self, tmp_path):
+        """A .git ABOVE the 20-level cap is out of reach; the fallback note
+        must fire and the index must land next to the notebook."""
+        (tmp_path / ".git").mkdir()
+        deep = tmp_path
+        for i in range(25):
+            deep = deep / f"e{i}"
+        deep.mkdir(parents=True)
+        nb = make_notebook([code_cell("x = 1")], tmp_path=deep, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        assert "[note] no git root found within 20 levels" in r.stderr
+        assert (deep / ".nb_index").exists()
+        assert not (tmp_path / ".nb_index").exists()
+
+    def test_git_within_20_levels_no_note(self, tmp_path):
+        """A reachable .git produces no fallback note."""
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / ".git").mkdir()
+        nb = make_notebook([code_cell("x = 1")], tmp_path=root, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        assert "[note]" not in r.stderr, (
+            f"No fallback note expected when a git root is found: {r.stderr!r}"
+        )
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='symlink creation requires admin/Developer Mode on Windows')
+    def test_symlinked_git_dir_fallback_notes_symlink(self, tmp_path):
+        """A rejected symlinked .git directory that causes the fallback is
+        mentioned on stderr (security stance is kept)."""
+        real_git = tmp_path / "real_git_dir"
+        real_git.mkdir()
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / ".git").symlink_to(real_git)
+        nb = make_notebook([code_cell("x = 1")], tmp_path=root, name="nb.ipynb")
+        r = run_indexer(nb)
+        assert r.returncode == 0, r.stderr
+        assert (root / ".nb_index").exists(), "Symlinked .git must still be rejected"
+        assert "symlink" in r.stderr.lower(), (
+            f"Fallback caused by a symlinked .git must be noted: {r.stderr!r}"
+        )

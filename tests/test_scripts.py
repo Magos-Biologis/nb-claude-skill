@@ -265,10 +265,29 @@ class TestNbRead:
         assert r.returncode != 0
 
     def test_range_dos_guard(self, tmp_path):
+        """Absurd range spans (beyond the parse-time sanity cap) still error."""
         p = make_notebook([{"cell_type": "code", "source": ["x"]}], tmp_path)
-        r = run_read([p, "--cells", "0-99999"])
+        r = run_read([p, "--cells", "0-99999999"])
         assert r.returncode != 0
-        assert "10000" in r.stdout + r.stderr
+        assert "1000000" in r.stdout + r.stderr
+
+    def test_range_end_clamped_to_cell_count(self, tmp_path):
+        """A large-but-sane range end is effectively clamped to the cell count
+        instead of being rejected (valid on huge notebooks)."""
+        p = make_notebook([
+            {"cell_type": "code", "source": ["first_cell"]},
+            {"cell_type": "code", "source": ["second_cell"]},
+        ], tmp_path)
+        r = run_read([p, "--cells", "0-99999"])
+        assert r.returncode == 0, f"clamped range must succeed: {r.stderr!r}"
+        assert "first_cell" in r.stdout
+        assert "second_cell" in r.stdout
+
+    def test_range_starting_beyond_last_cell_matches_nothing(self, tmp_path):
+        """A range entirely beyond the last cell shows no cell content."""
+        p = make_notebook([{"cell_type": "code", "source": ["only_cell"]}], tmp_path)
+        r = run_read([p, "--cells", "5-10"])
+        assert "only_cell" not in r.stdout
 
 
 # ---------------------------------------------------------------------------

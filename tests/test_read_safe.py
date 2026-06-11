@@ -348,3 +348,57 @@ class TestOutputSummary:
         assert "│ ── (1 output" in r.stdout, (
             f"--no-safe must still show §2.6 canonical summary, got:\n{r.stdout}"
         )
+
+
+# ---------------------------------------------------------------------------
+# § C0 control characters in cell source (safe mode)
+# ---------------------------------------------------------------------------
+
+class TestSourceControlCharSanitisation:
+    """Safe mode strips C0 controls (BEL, backspace, \\r, ...) from source
+    lines, but keeps tabs — \\t is legitimate in source code."""
+
+    def test_bel_and_backspace_stripped_from_source(self, tmp_path):
+        p = _make_nb([{"cell_type": "code",
+                       "source": ["a\x07b\x08c"]}], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "\x07" not in r.stdout, "BEL leaked to stdout in safe mode"
+        assert "\x08" not in r.stdout, "backspace leaked to stdout in safe mode"
+        assert "abc" in r.stdout, "content around controls must be kept"
+
+    def test_carriage_return_in_source_removed_not_line_boundary(self, tmp_path):
+        """A lone \\r inside a source line is removed before splitting, so it
+        can neither overwrite rendered text nor create a fake bare line."""
+        p = _make_nb([{"cell_type": "code",
+                       "source": ["left\rright"]}], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "leftright" in r.stdout, (
+            f"\\r must be stripped (joining the parts), got:\n{r.stdout!r}"
+        )
+
+    def test_tab_survives_in_source(self, tmp_path):
+        p = _make_nb([{"cell_type": "code",
+                       "source": ["if x:\n", "\tprint(1)"]}], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "\tprint(1)" in r.stdout, (
+            f"Tabs are legitimate in source and must survive safe mode:\n{r.stdout!r}"
+        )
+
+    def test_vertical_tab_and_formfeed_stripped(self, tmp_path):
+        p = _make_nb([{"cell_type": "code",
+                       "source": ["x\x0by\x0cz"]}], tmp_path)
+        r = run_read([p])
+        assert r.returncode == 0
+        assert "\x0b" not in r.stdout
+        assert "\x0c" not in r.stdout
+        assert "xyz" in r.stdout
+
+    def test_no_safe_passes_controls_through(self, tmp_path):
+        p = _make_nb([{"cell_type": "code",
+                       "source": ["a\x07b"]}], tmp_path)
+        r = run_read([p, "--no-safe"])
+        assert r.returncode == 0
+        assert "\x07" in r.stdout, "--no-safe must pass C0 controls through"
