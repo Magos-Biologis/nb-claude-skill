@@ -158,118 +158,34 @@ Scripts are installed into a versioned cache directory under `~/.claude/plugins/
 
 `TDD_AUDIT.md` / `TDD_INDEX_AUDIT.md` / `TDD_INDEX_GAPS.md` — adversarial review findings already resolved in the TDD documents.
 
-## TODO — open findings from 2026-06-10 review
 
-Catalogue of known limitations/faults from an adversarial code review. Severity reflects practical impact. Remove items as they are fixed (and bump the plugin version so installed copies update).
+## Review findings (2026-06-10/11) — CLOSED
 
-### Critical — guard is currently ineffective
+An adversarial review catalogued 74 findings across all five scripts, SKILL.md,
+and hooks.json. **All are resolved** — fixed with tests, or accepted with
+rationale (see the gaps section below). The full itemised catalogue lives in
+git history (commits 27dd570..af304ee, the five `fix:` commits); do not
+re-report these. Highlights of what changed: the PreToolUse guard actually
+blocks now (exit 2 + stderr, real tool schemas, NotebookEdit covered,
+case-insensitive); search is git-root-aware with staleness/dedup/scope
+correctness; `--outline` is index-backed and `--outputs` renders placeholders
++ truncation; writes are serialised cross-platform (fcntl/msvcrt), indexing is
+synchronous, non-UTF-8 source is a hard error, no-op patches don't destroy
+outputs; worktree/submodule `.git` files are recognised as repo roots.
 
-- [x] **Guard uses exit 1 + stdout; PreToolUse blocking requires exit 2 + stderr** (`nb-guard.py:148-156`). As shipped, the guard blocks nothing — the tool call proceeds and Claude never sees the redirect message.
-- [x] **MultiEdit detection uses a nonexistent schema** (`nb-guard.py:95-100`). It looks for `file_path` inside `edits[]`, but real MultiEdit payloads have one top-level `file_path`; the branch returns `""` and exits early, so MultiEdit is never detected even with the exit code fixed.
-- [x] **`hooks/hooks.json` hardcodes `python3`** — absent on standard Windows installs, so the hook errors and the guard never runs there. Use the exec-form `command`/`args` pattern (as lean-build does) with a portable interpreter.
-- [x] **`NotebookEdit` bypasses everything**: not in the hook matcher and explicitly fail-opened by `KNOWN_TOOLS` (`nb-guard.py:136-138`). Native notebook edits skip nb-write and auto-indexing, so indexes silently go stale.
-- [x] **Case-sensitive `.ipynb` checks** (`nb-guard.py:124`, `nb-read.py:404`): `foo.IPYNB` bypasses the guard *and* cannot be read by nb-read — both unguarded and unusable.
-- [x] Guard docstring stale: claims invocation is "written into settings.json by install.py" (`nb-guard.py:13`); the plugin uses declarative hooks.json.
-- [x] `Write` to a *new* notebook is redirected to `patch` (`nb-guard.py:151-154`); the correct suggestion is `create`.
+### Harness-assumption vetting (2026-06-11, against code.claude.com docs + live schemas)
 
-### High — SKILL.md interface gaps
+Claude Code behaviors the plugin depends on, and how each was verified:
 
-- [x] **SKILL.md never mentions `nb-search.py`, `nb-index.py`, `--outline`, or `--outputs`** — Claude cannot discover them and falls back to grep/cat on raw JSON, the exact token blowup the plugin prevents. The "Notes" section even says outputs are "not shown" with no sanctioned alternative.
-- [x] **`allowed-tools` frontmatter**: now comma-separated `Bash(cmd *)` entries (the form shown in the skills docs) incl. `Bash(py *)`. Note: docs accept "space- or comma-separated" strings, so the original space-separated form may also have been valid — the original finding overstated this.
-- [x] **Documented output format is stale**: shows `[0:code]` headers but code emits `[0:code:run=1]`; shows `[cell has 2 output(s) … not shown]` but code emits `│ ── (2 outputs, 5 lines) ──`.
-- [x] The output-summary line carries the same `│ ` prefix as source lines — prefix-stripping consumers absorb it as a fake source line, and genuine source starting with `│ ` is ambiguous after stripping. (SKILL.md rule now warns about the summary line; the structural ambiguity for source beginning `│ ` remains.)
-- [x] The `python3 -c` install-path lookup raises bare `StopIteration` for dev checkouts not in `installed_plugins.json`, picks arbitrarily if two marketplaces ship an `nb` plugin, and is duplicated 6× in the file. No failure guidance anywhere in SKILL.md.
-- [x] No SKILL.md guidance on concurrency (lock contention, stale `.nblock`) or what to do when a script fails.
-- [x] This file says SKILL.md defines "9 behavioural rules"; it defines 8.
-
-### High — search returns silently wrong results
-
-- [x] **Searching from a repo subdirectory finds nothing** (`nb-search.py:155-175`): indexes live at `<git-root>/.nb_index/`, above the search root, so the walk never reaches them — exit 1, "no matches".
-- [x] **Relative `notebook_path` resolved against search root, not git root** (`nb-search.py:214`): searching from a parent of several repos resolves every path wrong and silently excludes the notebooks as unsafe.
-- [x] **`--symbol`/`--import` modes never check staleness** — only keyword mode calls `_check_staleness`; stale results print with no `[STALE]` warning.
-- [x] **Unindexed notebooks excluded from keyword results** (`nb-search.py:409-423`) even though keyword mode opens the `.ipynb` anyway; `[UNINDEXED]` goes to stderr only. In symbol/import modes they are invisible with no warning at all.
-- [x] symbols.json fast path drops `--type`/`--section` filtering when the per-notebook index is missing/unreadable (`nb-search.py:535-553, 663-677`) — results that should be excluded are included.
-- [x] Inconsistent case sensitivity: keyword search case-insensitive, symbol/import exact-match only; undocumented.
-- [x] `MAX_FILE_SIZE` (`nb-search.py:33`) defined but never enforced — violates the 100 MB invariant; keyword mode `json.load`s and staleness hashing reads every notebook in full.
-- [x] Staleness "fast path" comment is false (`nb-search.py:136-148`): the full notebook is hashed even when mtime+size match, making every keyword search O(total notebook bytes).
-- [x] `.ipynb_checkpoints` not in `SKIP_DIRS` — Jupyter checkpoint copies generate `[UNINDEXED]` noise and potential duplicate hits.
-- [x] Unguarded `c["i"]` access crashes the whole search on a malformed-but-parseable index file (`nb-search.py:434, 604, 730`); corrupt notebooks in pass 3 are skipped with no signal (`:428-431`).
-- [x] `--limit 0`/negative behaves inconsistently across modes (`nb-search.py:477, 557-561`); no argparse validation.
-- [x] `display` path printed unsanitised in results (`nb-search.py:253-256`) — breaks the sanitise-before-echo invariant.
-- [x] Symlinked directories never followed (`followlinks=False`), no override flag, undocumented.
-
-### High — write/index pipeline reliability
-
-- [x] **Index failures are invisible** (`nb-write.py:449-457`): nb-index.py spawned fire-and-forget, both stdio → DEVNULL, exit code never collected — symbols.json silently diverges with no retry.
-- [x] **symbols.json updates silently dropped under contention** (`nb-index.py:601-607`): `LOCK_EX | LOCK_NB` returns silently if the lock is held; rapid consecutive writes routinely lose symbol updates.
-- [x] **Lock-file unlink race** (`nb-index.py:688-693`): deleting `symbols.nblock` after release lets two processes both hold "the" lock (different inodes) and clobber symbols.json.
-- [x] **Windows lost-update**: no `fcntl` → read-modify-write unserialised (`nb-write.py:53-54`); the second of two concurrent writes silently discards the first. Atomic rename masks the loss.
-- [x] **`patch` unconditionally destroys outputs/execution_count** (`nb-write.py:351-353`) even for a no-op patch — with no `.bak`/undo, one mistaken patch on an untracked notebook irreversibly loses computed outputs.
-- [x] Cell `id` vs nbformat_minor: `make_cell` always emits `id` but insert/patch never bump `nbformat_minor` (`nb-write.py:261-271`) — inserting into a 4.0–4.4 notebook fails strict validation; pre-existing duplicate ids never detected.
-- [x] Exclusive `.nblock` acquired *before* `read_source()` (`nb-write.py:409,415`): a hung stdin producer holds the lock indefinitely, blocking all other writers.
-- [x] latin-1 fallback for `-f` source writes mojibake with only a stderr warning and exit 0 (`nb-write.py:243-251`); inconsistent with nb-write rejecting non-UTF-8 notebooks while nb-index accepts them.
-- [x] Per-notebook index write takes no lock; stat→`os.replace` window (`nb-index.py:917-976`) lets a stale index clobber a fresher one.
-- [x] symbols.json has no garbage collection — deleted/renamed notebooks pollute symbol search forever.
-- [x] `.nblock` files never unlinked — closed as BY DESIGN: unlink-after-release is the inode race (see lock-file unlink item); lockfiles persist and `*.nblock` is gitignored.
-- [x] `except OSError` around `os.link` swallows `FileExistsError`, making the dedicated handler dead code and degrading to a TOCTOU-racy fallback (`nb-write.py:314-326`).
-- [x] 100 MB limit enforced only on load (`nb-write.py:146-149`): a patch can grow the file past the limit, after which no nb-write/nb-index operation can touch it again.
-- [x] `nb["cells"]` checked for presence, not type — malformed notebooks produce raw tracebacks (`nb-write.py:274-278`).
-
-### Medium — rendering correctness (nb-read.py)
-
-- [x] **Truncation warnings carry no cell index and go to stderr** (`nb-read.py:222-225`) — SKILL.md Rule 5 ("re-read truncated cells before patching") is unfollowable; patch-after-truncation source loss is plausible.
-- [x] **Documented index-backed read path not implemented**: the data-flow section above claims `--outline`/`--outputs` read from the index, but nb-read.py unconditionally `json.load`s the full notebook first and `--outputs` never consults the index — zero I/O savings.
-- [x] **Image/HTML/JSON-only outputs vanish silently in `--outputs`** (`nb-read.py:274-297`): `_render_output_block` returns None and nothing prints — "no output" indistinguishable from "plot exists".
-- [x] **`--outputs` applies no truncation** (`nb-read.py:306-320`): a 100k-line stream output prints in full; `--truncate` only affects source. Very wide single lines never wrapped/capped.
-- [x] Output summary reads `out["text"]` instead of `data["text/plain"]` (`nb-read.py:241-253`) — execute_results report "0 lines"; traceback line count uses list length, not actual lines; summary disagrees with `--outputs` for the same cell.
-- [x] Safe mode strips ANSI from source but not C0 controls (`nb-read.py:213-214`) — raw BEL/backspace/`\r` in source pass through, weakening the documented sanitisation invariant.
-- [x] Outline mode trusts index structure: cells missing `"i"` raise uncaught `KeyError` instead of falling back (`nb-read.py:454-455`); freshness check validates mtime/size only, not schema.
-- [x] Freshness is mtime+size only (`nb-read.py:129-137`): same-size writes within mtime granularity (or `cp -p`/git checkout) yield falsely-fresh outlines with no `[STALE INDEX]` warning.
-- [x] `_extract_output_text` joins parts with `""` (`nb-read.py:299`) — closed as BY DESIGN: `""`-joining is correct Jupyter stream semantics (partial writes form one logical line); deliberately restored in the 2026-06-11 --outputs fix.
-- [x] `MAX_RANGE_SIZE = 10_000` rejects valid `--cells` ranges on genuinely huge notebooks, no override (`nb-read.py:159-161`).
-- [x] Markdown `attachments` (embedded images) and raw-cell mimetypes never rendered or summarised.
-
-### Medium — indexing quality (nb-index.py)
-
-- [x] **Git worktrees and submodules not recognised** (`.git`-as-file rejected, `nb-index.py:146`): submodule notebooks index under the superproject; worktrees fall back to per-directory `.nb_index` — same notebook indexed in different places.
-- [x] R-kernel check is a substring test (`"r" in lang and "ir" not in lang`, `nb-index.py:434`) — Rust/Ruby/Perl/Erlang kernels misclassified as R, garbage symbols indexed; the `ir` exclusion excludes nothing useful (IRkernel's language is `"R"`).
-- [x] Python symbol extraction misses `async def`, tuple assignment, `import a, b` beyond the first module, `import x as y` aliases, and annotations containing `.`/`|`/quotes (`nb-index.py:74-77`); false positives for `def`/`=` at column 0 inside triple-quoted strings.
-- [x] ReDoS guard drops lines > 500 chars entirely (`nb-index.py:109-118`) — symbols on long generated lines silently vanish.
-- [x] mtime+size match with unreadable file reports the index **fresh** (`nb-index.py:297-300`).
-- [x] `_update_gitignore` is a non-atomic unlocked read-modify-write of the repo's `.gitignore` (`nb-index.py:202-225`).
-- [x] symbols.json location strings use `:` separator, ambiguous when paths contain colons (`nb-index.py:569-580`).
-- [x] >20 directory levels, symlinked `.git`, or st_dev boundary silently fragments to per-directory `.nb_index` with no warning (`nb-index.py:139-162`).
-
-### Open findings from 2026-06-11 adversarial review of commit 799a973
-
-- [x] **Duplicate results, no cross-index dedup** (`nb-search.py`): a notebook with a legacy pre-`git init` per-directory `.nb_index` plus a git-root index is reachable via both walks — matches print twice, `--limit` consumed by duplicates. Needs result dedup by resolved notebook path (and ideally legacy-index GC).
-- [x] **Symlinked `.nb_index` divergence** (`nb-search.py:186` vs nb-index): upward walk rejects a symlinked `.nb_index` silently while nb-index writes through one — writes succeed, searches find nothing, no warning.
-- [x] **Indexed-but-unsearchable notebooks** (`nb-search.py` `_collect_index_files`): nb-index writes indexes for notebooks under `venv/`/`node_modules/` etc., but search prunes those names inside the index mirror — written, invisible, and no `[UNINDEXED]` warning either.
-- [x] **Route-dependent depth budgets** (`nb-search.py`): downward walk caps `MAX_WALK_DEPTH` from search_root, `_collect_index_files` caps from the `.nb_index` dir (~double effective budget); nested `.nb_index` dirs under a discovered one are collected under the wrong `index_base` instead of being yielded separately.
-- [x] Synthetic `--outputs` placeholder/truncation-marker lines are spoofable: genuine output text identical to them renders byte-for-byte the same (`nb-read.py` `_render_output_block`); related to the open `│ `-prefix ambiguity item.
-- [x] `_find_upward_index_dir` is a third divergently-shaped copy of the git-root walk (`nb-search.py:164`; canonical `_find_index_dir` at `:59`) — when the worktree `.git`-as-file fix lands it must cover all three; make it a thin wrapper.
-- [x] `_join_text` (`nb-read.py:312`) duplicates `_coerce_source` (`:184`); the text/plain-vs-legacy-`text` classification also lives in both `_placeholder_mimes` and the render branch — fold into one `_rich_text(out)` helper.
-- [x] The validate→warn→`_in_scope`→display sequence is copy-pasted at 5 call sites in `nb-search.py` (keyword serial, symbol fast+serial, import fast+serial) — extract one `_resolve_candidate` helper; the fast paths also validate every location string twice (`_validate_location_string` discards its resolved Path; caller re-validates — second None-check is dead code).
-- [x] Upward index path eagerly opens/parses every index file in the git-root `.nb_index` before scope filtering — a path-prefix filter on the mirrored layout would skip out-of-scope files before any I/O; `index_base.resolve()` is also re-run per entry though loop-invariant.
-- [x] `--outputs` truncation materialises and sanitises all lines (100k for a big stream) before slicing to `truncate` — stop accumulating at `truncate`+1.
-- [x] Re-read hint strings are built separately in `render_source` and `_render_output_block` with different wording — extract a shared hint builder.
-- [x] `test_search_from_subdirectory_symbols_json_fast_path` never forces the fast path (serial scan satisfies the same assertions) — false coverage; corrupt the per-notebook index to make it real.
-- [x] **Keyword search matches cell source only, never output text** (`nb-search.py` keyword pass): "find the notebook that printed this error" returns nothing even though the index stores `output_text` — either search indexed output text too (opt-in flag or by default) or document the limitation in SKILL.md. Found during 2026-06-11 smoke testing.
-- [x] Summary/`--outputs` placeholder agreement is a bolt-on `+1` against a structurally different counter — derive the summary count from the renderer (blocked on the still-open `out["text"]` vs `data["text/plain"]` summary item).
-
-### Harness-assumption vetting (2026-06-11, against code.claude.com docs)
-
-Items in this TODO that depend on Claude Code harness behavior were checked against the official docs (hooks, plugins-reference, skills, tools-reference):
-
-| Assumption behind an item | Status |
+| Assumption | Status |
 |---|---|
-| PreToolUse exit 2 blocks + stderr fed to Claude; exit 1 non-blocking (guard fix) | **Verified** — quoted verbatim in hooks docs |
-| Exec-form hooks (`"command"` + `"args"`) and `${CLAUDE_PLUGIN_ROOT}` expansion (hooks.json fix) | **Verified** — plugins reference, which recommends exec form for plugin paths |
+| PreToolUse exit 2 blocks + stderr fed to Claude; exit 1 non-blocking (guard) | **Verified** — quoted verbatim in hooks docs |
+| Exec-form hooks (`"command"` + `"args"`) and `${CLAUDE_PLUGIN_ROOT}` expansion | **Verified** — plugins reference, which recommends exec form for plugin paths |
 | Env vars do not persist across Bash tool calls (SKILL.md `NB_SCRIPTS` guidance) | **Verified** — tools reference: "An export in one command will not be available in the next" |
 | Pipe-separated hook matchers incl. `NotebookEdit`; `"if"` filter field | **Verified** — plugins/hooks references |
 | `allowed-tools` format (skills frontmatter) | **Partially documented** — "space- or comma-separated string, or a YAML list"; in-paren example form is `Bash(git add *)`. Current frontmatter uses that form. |
-| MultiEdit payload = one top-level `file_path` + `edits[]` without per-edit paths (guard fix) | **Not documented** — based on observed tool schema; fails open if wrong. Black-box test against a live session pending. |
-| NotebookEdit payload field is `notebook_path` (guard fix) | **Not documented** — tool existence/matcher verified, field name from observed schema; fails open if wrong. Black-box test pending. |
+| NotebookEdit payload field is `notebook_path` (guard) | **Verified 2026-06-11** — live tool schema: `notebook_path` is a required property |
+| MultiEdit payload = one top-level `file_path` + `edits[]` (guard) | **Unverifiable** — MultiEdit is absent from current Claude Code toolsets (not in docs, not loadable via tool search); the guard's handling is legacy compat for older versions and fails open |
 
 ### Documented-discretionary gaps (vetted 2026-06-11 against nbformat/JEP-62 and Python docs — accepted, not bugs)
 
@@ -281,11 +197,3 @@ Items in this TODO that depend on Claude Code harness behavior were checked agai
 - **Triple-quoted-string false positives in symbol extraction:** `def`/`=` at column 0 inside docstrings index phantom symbols. Fixing requires a real parser; regex extraction is the deliberate trade-off.
 - **Symlinked directories not followed in search walks** (`followlinks=False`, except explicitly-yielded `.nb_index` symlinks): deliberate security stance against walk cycles/escapes.
 - **Colon location strings in symbols.json:** analysed 2026-06-11 — `rsplit(":", 1)` + int validation cannot mis-parse because keys always end in `.ipynb` (never `:<digits>`); documented at the construction site.
-
-### Suggested fix order
-
-1. Guard: exit 2 + stderr, top-level `file_path` for MultiEdit, exec-form hook command, add `NotebookEdit` to matcher, case-insensitive suffix check.
-2. SKILL.md: document `--outline`/`--outputs`/`nb-search`, fix `allowed-tools`, update output-format examples.
-3. nb-read: cell index in truncation warnings; placeholder block for non-text outputs; truncate `--outputs`.
-4. Search: index discovery from subdirectories, staleness checks in symbol/import modes, include unindexed notebooks in keyword results.
-5. Write/index: surface nb-index failures, fix symbols.json locking, gitignore + clean up `.nblock`.
