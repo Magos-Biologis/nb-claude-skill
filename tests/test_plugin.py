@@ -52,6 +52,44 @@ class TestPluginManifest:
 
 
 # ---------------------------------------------------------------------------
+# marketplace.json
+# ---------------------------------------------------------------------------
+
+class TestMarketplaceManifest:
+    """The repo self-hosts as a single-plugin marketplace so
+    `/plugin marketplace add owner/repo` works — plugin install has no
+    direct-from-repo-URL form."""
+
+    def _load(self):
+        return json.loads((REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+
+    def test_marketplace_json_exists(self):
+        assert (REPO_ROOT / ".claude-plugin" / "marketplace.json").exists()
+
+    def test_marketplace_json_is_valid_json(self):
+        data = self._load()
+        assert isinstance(data, dict)
+
+    def test_marketplace_has_name_and_owner(self):
+        data = self._load()
+        assert data.get("name", "").strip()
+        assert isinstance(data.get("owner"), dict) and data["owner"].get("name", "").strip()
+
+    def test_marketplace_lists_exactly_the_nb_plugin(self):
+        plugins = self._load()["plugins"]
+        assert len(plugins) == 1
+        assert plugins[0]["name"] == "nb"
+
+    def test_marketplace_source_is_repo_root(self):
+        source = self._load()["plugins"][0]["source"]
+        assert source.startswith("./"), f"relative source must start with ./ : {source!r}"
+
+    def test_marketplace_plugin_name_matches_plugin_json(self):
+        plugin = json.loads((REPO_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        assert self._load()["plugins"][0]["name"] == plugin["name"]
+
+
+# ---------------------------------------------------------------------------
 # hooks/hooks.json
 # ---------------------------------------------------------------------------
 

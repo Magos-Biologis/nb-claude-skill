@@ -236,7 +236,7 @@ if not rest or (rest[0].startswith("-") and not rest[0][1:].isdigit()):
 
 ### 2.11 Fix hardcoded paths in `test_read_independent.py` and `test_write_independent.py`
 
-**Problem:** Both files hardcode `/home/anakin/.claude/skills/nb/scripts/nb-read.py`. Fresh-clone `pytest` fails with `FileNotFoundError`.
+**Problem:** Both files hardcode `/home/<user>/.claude/skills/nb/scripts/nb-read.py`. Fresh-clone `pytest` fails with `FileNotFoundError`.
 
 **Solution:** Use a path relative to the test file:
 ```python

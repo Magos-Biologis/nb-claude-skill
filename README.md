@@ -16,15 +16,28 @@ A `PreToolUse` hook enforces this: if Claude tries to `Read`, `Edit`, or `Notebo
 
 ## Quick start
 
-```bash
-claude plugin install <repo-url>
-# Restart Claude Code, then open any .ipynb file
+Inside Claude Code:
+
 ```
+/plugin marketplace add Magos-Biologis/nb-claude-skill
+/plugin install nb@nb-claude-skill
+```
+
+Or from a shell:
+
+```bash
+claude plugin marketplace add Magos-Biologis/nb-claude-skill
+claude plugin install nb@nb-claude-skill
+```
+
+Restart Claude Code, then open any `.ipynb` file. (The repo is its own single-plugin marketplace via `.claude-plugin/marketplace.json` — there is no direct install-from-repo-URL command.)
 
 ## What gets installed
 
+Plugins land in a versioned cache directory under `~/.claude/plugins/cache/` (Windows: `%USERPROFILE%\.claude\plugins\cache\`); the exact path is recorded in `~/.claude/plugins/installed_plugins.json`. The installed tree:
+
 ```
-~/.claude/plugins/nb/         (Windows: %USERPROFILE%\.claude\plugins\nb\)
+<install-path>/
 ├── skills/nb/SKILL.md        ← auto-loaded by Claude Code as a skill
 ├── hooks/hooks.json          ← declarative PreToolUse hook registration
 ├── .claude-plugin/plugin.json ← plugin manifest
@@ -32,7 +45,7 @@ claude plugin install <repo-url>
     ├── nb-guard.py           ← PreToolUse hook (blocks direct .ipynb access)
     ├── nb-read.py            ← token-efficient notebook reader
     ├── nb-write.py           ← surgical cell editor (patch / insert / delete / create)
-    ├── nb-index.py           ← persistent JSON index builder (fire-and-forget)
+    ├── nb-index.py           ← persistent JSON index builder (run after every write)
     └── nb-search.py          ← cross-notebook keyword / symbol / import search
 ```
 
@@ -41,12 +54,13 @@ The `hooks/hooks.json` registers `nb-guard.py` as a `PreToolUse` hook on `Read|E
 ## Repository layout
 
 ```
-nb-claude-plugin/
+nb-claude-skill/
 ├── README.md
 ├── CLAUDE.md                    ← guidance for Claude Code when working in this repo
 ├── LICENSE
 ├── .claude-plugin/
-│   └── plugin.json              ← plugin manifest
+│   ├── plugin.json              ← plugin manifest
+│   └── marketplace.json         ← self-hosting marketplace catalog (single plugin)
 ├── hooks/
 │   └── hooks.json               ← declarative hook registration
 ├── skills/
@@ -120,7 +134,7 @@ Key design decisions:
 
 `nb-read.py` renders notebooks as indexed, truncated cell source (default 80 lines/cell). All status messages go to stderr; stdout is pure cell content. Source lines are prefixed with `│ ` to prevent cell content from being mistaken for cell boundary markers.
 
-`nb-write.py` makes atomic edits: `patch`, `insert`, `delete`, or `create`. Writes use `tempfile.mkstemp` + `fsync` + `os.replace` — no partial writes, no `.bak`. After each write, it fire-and-forgets `nb-index.py` to keep the index current.
+`nb-write.py` makes atomic edits: `patch`, `insert`, `delete`, or `create`. Writes use `tempfile.mkstemp` + `fsync` + `os.replace` — no partial writes, no `.bak`. After each write, it runs `nb-index.py` synchronously to keep the index current (failures surface as `[warn]` on stderr).
 
 `nb-index.py` builds a compact JSON index per notebook (cell metadata, first lines, sections, symbols, output text) stored under `.nb_index/`. Enables fast outline, output, and search queries without re-parsing the full notebook JSON.
 

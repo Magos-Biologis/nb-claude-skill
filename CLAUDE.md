@@ -144,6 +144,7 @@ Tests are written TDD-first against the spec before implementation. All black-bo
 The plugin uses the Claude Code native plugin format:
 
 - `.claude-plugin/plugin.json` — manifest (name, description, version, author, license)
+- `.claude-plugin/marketplace.json` — self-hosting single-plugin marketplace catalog (`source: "./"`); required because `claude plugin install` only resolves plugins through marketplaces, never a bare repo URL
 - `hooks/hooks.json` — declarative `PreToolUse` hook using `${CLAUDE_PLUGIN_ROOT}`; shell-form with a `command -v python3 || command -v python` fallback chain (exec-form cannot solve interpreter naming: `python3` is absent on stock Windows, and shell-form runs under Git Bash there, which Claude Code requires)
 - `skills/nb/SKILL.md` — the skill file, auto-loaded by Claude Code
 
