@@ -1,5 +1,5 @@
 """
-Tests for Windows encoding and path compatibility gaps — TDD_INDEX.md §15 plus the Windows compatibility patch audit.
+Tests for Windows encoding and path compatibility gaps.
 
 All tests correspond to issues identified in the post-audit of commit 5523dad
 (the Windows compatibility patch).  Issues:
@@ -376,7 +376,7 @@ class TestAtomicWriteRetry:
 
 
 # ===========================================================================
-# Portable lock helper — fcntl → msvcrt fallback (2026-06 concurrency batch)
+# Portable lock helper — fcntl → msvcrt fallback
 # ===========================================================================
 
 import importlib.util

@@ -1,5 +1,5 @@
 """
-Tests for nb-read.py --outputs mode (TDD_INDEX.md §10).
+Tests for nb-read.py --outputs mode.
 
 All tests are RED until nb-read.py implements --outputs.
 
@@ -499,7 +499,7 @@ class TestOutputTruncation:
 
 
 # ---------------------------------------------------------------------------
-# § 2026-06-11 review fixes: empty text/plain, stream join, \r handling
+# § Empty text/plain, stream join, \r handling
 # ---------------------------------------------------------------------------
 
 class TestReviewFixes:

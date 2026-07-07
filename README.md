@@ -49,7 +49,7 @@ Plugins land in a versioned cache directory under `~/.claude/plugins/cache/` (Wi
     └── nb-search.py          ← cross-notebook keyword / symbol / import search
 ```
 
-The `hooks/hooks.json` registers `nb-guard.py` as a `PreToolUse` hook on `Read|Edit|Write|MultiEdit|NotebookEdit` using `${CLAUDE_PLUGIN_ROOT}`, with a shell-form interpreter fallback (`python3` → `python`) so it works on Windows where `python3` is absent — no `settings.json` patching required.
+The `hooks/hooks.json` registers `nb-guard.py` as a `PreToolUse` hook on `Read|Edit|Write|MultiEdit|NotebookEdit` using `${CLAUDE_PLUGIN_ROOT}`, with a shell-form interpreter fallback (`python3` → `python`) so it works on Windows where `python3` is absent.
 
 ## Repository layout
 
@@ -72,22 +72,22 @@ nb-claude-skill/
 │   ├── nb-write.py
 │   ├── nb-index.py
 │   └── nb-search.py
-├── tests/
-│   ├── test_plugin.py
-│   ├── test_scripts.py
-│   ├── test_encoding.py
-│   ├── test_read_independent.py
-│   ├── test_read_safe.py
-│   ├── test_read_outline.py
-│   ├── test_read_outputs.py
-│   ├── test_write_independent.py
-│   ├── test_write_new.py
-│   ├── test_nb_guard_py.py
-│   ├── test_nb_guard_hardened.py
-│   ├── test_nb_index.py
-│   ├── test_nb_search.py
-│   └── test_windows_compat.py
-└── TDD_INDEX.md                 ← technical design document (index + search spec)
+└── tests/
+    ├── test_plugin.py
+    ├── test_scripts.py
+    ├── test_encoding.py
+    ├── test_conventions.py
+    ├── test_read_independent.py
+    ├── test_read_safe.py
+    ├── test_read_outline.py
+    ├── test_read_outputs.py
+    ├── test_write_independent.py
+    ├── test_write_new.py
+    ├── test_nb_guard_py.py
+    ├── test_nb_guard_hardened.py
+    ├── test_nb_index.py
+    ├── test_nb_search.py
+    └── test_windows_compat.py
 ```
 
 ## Running the tests

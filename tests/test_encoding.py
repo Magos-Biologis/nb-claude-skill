@@ -1,7 +1,7 @@
 """
 Tests for non-UTF-8 source file handling in nb-write.py.
 
-Behaviour (spec, 2026-06 concurrency/data-safety batch):
+Behaviour:
   - Source files are read as UTF-8 (utf-8-sig: a leading BOM is tolerated).
   - A file containing bytes that are not valid UTF-8 is a HARD ERROR:
     clear message on stderr, non-zero exit, notebook left untouched.

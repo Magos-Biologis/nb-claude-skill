@@ -201,6 +201,7 @@ python3 "$NB_SCRIPTS/nb-read.py" analysis.ipynb --cells 4          # 4. verify
 
 ## Notes
 
+- **Index location:** `.nb_index/` is created at the git root (or next to the notebook when outside a repo); the indexer adds it to `.gitignore` automatically. Never edit index files by hand.
 - **JSON indentation:** `nb-write.py` normalises indentation to 1 space on every write — a large first-edit diff is expected.
 - **nbformat 4 only.** nbformat 3 notebooks (`worksheets` key): convert first with `jupyter nbconvert`.
 - **Guard limits:** the nb-guard hook covers `Read`/`Edit`/`Write`/`MultiEdit`; `cat`/`grep` via Bash bypasses it. Don't do that (Rule 1).

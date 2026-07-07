@@ -1,8 +1,7 @@
 # nb Skill — Independent Behavioural Test Scenarios
 
-> Author: QA derivation from SKILL.md specification only.  
-> Date: 2026-05-26  
-> Scope: These tests verify that Claude, when the `nb` skill is active, obeys every rule and respects the `allowed-tools` constraint. No prior test documents were consulted.
+> Derived from the SKILL.md specification only; no prior test documents were consulted.
+> Scope: These tests verify that Claude, when the `nb` skill is active, obeys every rule and respects the `allowed-tools` constraint.
 
 ---
 

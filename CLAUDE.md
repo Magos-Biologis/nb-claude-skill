@@ -51,7 +51,7 @@ User reads notebook
   → nb-search.py (reads .nb_index/ dirs; keyword mode also opens .ipynb)
 ```
 
-### Index location algorithm (§1)
+### Index location algorithm
 
 `nb-index.py`, `nb-read.py`, and `nb-search.py` all use identical `_find_index_dir()` / `_index_file_path()` logic (copied verbatim — no shared import between standalone scripts):
 
@@ -74,31 +74,6 @@ _NB_INDEX_SIBLING = Path(__file__).parent / "nb-index.py"  # unresolved; module-
 
 `create` does **not** trigger indexing. If nb-index.py is absent, a warning is printed to stderr and the write still exits 0.
 
-### nb-read.py output format
-
-Standard mode — code cell headers include execution count since the §11 change:
-```
-notebook.ipynb | 12 cells | python3
-
-[0:code:run=1] ──────────────────────────────────
-│ import pandas as pd
-│ ── (2 outputs, 5 lines) ──
-
-[1:markdown] ────────────────────────────────────
-│ ## Analysis
-```
-
-`│ ` prefix on source lines is structural (prevents fake boundary injection). Do not include it when writing patches.
-
-`--outline` mode: one compact line per cell, reads from fresh index when available:
-```
-[0:code:run=1 ] import pandas as pd
-[1:markdown   ] ## Analysis
-[2:code:run=——] (empty)
-```
-
-`--outputs` mode: renders `output_text` from index (or notebook fallback) with `[output] ───` header.
-
 ### Security invariants shared across all scripts
 
 - ANSI/CSI/OSC sequences and C0 control characters are stripped from any user-controlled string before echoing (prevents terminal injection).
@@ -108,6 +83,7 @@ notebook.ipynb | 12 cells | python3
 
 ## Key Constraints / Invariants
 
+- **Output format is user-facing contract.** All three nb-read.py mode formats (with examples) are documented in `skills/nb/SKILL.md` and asserted by tests — CLAUDE.md is never loaded at plugin runtime, so runtime-relevant details must live in the skill. The `│ ` source-line prefix is structural (prevents fake cell-boundary injection).
 - **nbformat 4 only.** Rejects v3 (`worksheets` key) and malformed files.
 - **100 MB file size limit** on all scripts.
 - **UTF-8-sig** used for reading (handles BOM transparently); non-UTF-8 `-f` source files are a hard error in nb-write.py (no latin-1 fallback).
@@ -134,8 +110,8 @@ Tests are written TDD-first against the spec before implementation. All black-bo
 | `test_write_new.py` | `create`, `patch -1` error, PermissionError message, concurrent writes |
 | `test_nb_guard_py.py` | nb-guard.py exit codes, path sanitisation, fail-open |
 | `test_nb_guard_hardened.py` | Injection, subdirectory bypass, MultiEdit payloads |
-| `test_nb_index.py` | §1–§8, §13–§14: index location, staleness, sections, symbols, outputs, symbols.json |
-| `test_nb_search.py` | §12: walk, keyword/symbol/import search, filters, security, streaming |
+| `test_nb_index.py` | Index location, staleness, sections, symbols, outputs, symbols.json |
+| `test_nb_search.py` | Walk, keyword/symbol/import search, filters, security, streaming |
 | `test_windows_compat.py` | Cross-platform encoding, path normalisation, py launcher, atomic-write retry |
 | `test_plugin.py` | Plugin manifest, hooks.json, skill file placement, no installer files |
 
@@ -148,18 +124,16 @@ The plugin uses the Claude Code native plugin format:
 - `hooks/hooks.json` — declarative `PreToolUse` hook using `${CLAUDE_PLUGIN_ROOT}`; shell-form with a `command -v python3 || command -v python` fallback chain (exec-form cannot solve interpreter naming: `python3` is absent on stock Windows, and shell-form runs under Git Bash there, which Claude Code requires)
 - `skills/nb/SKILL.md` — the skill file, auto-loaded by Claude Code
 
-The hook command uses `${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py`, which Claude Code expands to the plugin's installation directory at runtime. No settings.json patching is required.
+The hook command uses `${CLAUDE_PLUGIN_ROOT}/scripts/nb-guard.py`, which Claude Code expands to the plugin's installation directory at runtime.
 
 Scripts are installed into a versioned cache directory under `~/.claude/plugins/cache/`. The exact path is recorded in `~/.claude/plugins/installed_plugins.json` under the `installPath` key for the `nb@*` entry. The SKILL.md resolves this dynamically at runtime via a `python3 -c` lookup — do not hardcode the path.
 
 ## TDD Documents
 
-`TDD_INDEX.md` — living spec for nb-index.py (§0–§14) and nb-search.py (§12–§15), with full schema, staleness algorithm, symbol extraction regexes, output pipeline, and section hierarchy. Tests cite its § numbers.
-
-Removed historical docs (in git history, up to commit e3620b6): `TDD.md` (installer-era migration plan — its still-true parts are covered by this file, `tests/BEHAVIOR_TESTS*.md`, and the tests), plus the resolved audit catalogues `TDD_AUDIT.md` / `TDD_INDEX_AUDIT.md` / `TDD_INDEX_GAPS.md`.
+All retired; this file, `tests/BEHAVIOR_TESTS*.md`, and the tests are the current documentation. In git history: `TDD_INDEX.md` (index/search spec — the `§N` citations in script/test comments refer to its sections), `TDD.md` (installer-era migration plan), and the resolved audit catalogues `TDD_AUDIT.md` / `TDD_INDEX_AUDIT.md` / `TDD_INDEX_GAPS.md`.
 
 
-## Review findings (2026-06-10/11) — CLOSED
+## Review findings — CLOSED
 
 An adversarial review catalogued 74 findings across all five scripts, SKILL.md,
 and hooks.json. **All are resolved** — fixed with tests, or accepted with
@@ -173,7 +147,7 @@ correctness; `--outline` is index-backed and `--outputs` renders placeholders
 synchronous, non-UTF-8 source is a hard error, no-op patches don't destroy
 outputs; worktree/submodule `.git` files are recognised as repo roots.
 
-### Harness-assumption vetting (2026-06-11, against code.claude.com docs + live schemas)
+### Harness-assumption vetting (against code.claude.com docs + live schemas)
 
 Claude Code behaviors the plugin depends on, and how each was verified:
 
@@ -184,16 +158,16 @@ Claude Code behaviors the plugin depends on, and how each was verified:
 | Env vars do not persist across Bash tool calls (SKILL.md `NB_SCRIPTS` guidance) | **Verified** — tools reference: "An export in one command will not be available in the next" |
 | Pipe-separated hook matchers incl. `NotebookEdit`; `"if"` filter field | **Verified** — plugins/hooks references |
 | `allowed-tools` format (skills frontmatter) | **Partially documented** — "space- or comma-separated string, or a YAML list"; in-paren example form is `Bash(git add *)`. Current frontmatter uses that form. |
-| NotebookEdit payload field is `notebook_path` (guard) | **Verified 2026-06-11** — live tool schema: `notebook_path` is a required property |
+| NotebookEdit payload field is `notebook_path` (guard) | **Verified** — live tool schema: `notebook_path` is a required property |
 | MultiEdit payload = one top-level `file_path` + `edits[]` (guard) | **Unverifiable** — MultiEdit is absent from current Claude Code toolsets (not in docs, not loadable via tool search); the guard's handling is legacy compat for older versions and fails open |
 
-### Documented-discretionary gaps (vetted 2026-06-11 against nbformat/JEP-62 and Python docs — accepted, not bugs)
+### Documented-discretionary gaps (vetted against nbformat/JEP-62 and Python docs — accepted, not bugs)
 
 - **Duplicate cell ids: warn, never repair.** The nbformat spec requires unique ids in written notebooks, but JEP-62 leaves repair to the tool's discretion; "match the file" (minimal-diff surgical editing) was the chosen policy. Revisit only if a downstream consumer rejects the warned files.
 - **NFS caveat on locking:** where `flock` is emulated via `fcntl()` (some NFS mounts), cross-host exclusion is not guaranteed and closing any fd to the file releases the lock. Each process opens its `.nblock` exactly once and all close-without-unlock paths exit immediately, so the designed degradation (warned skip / process-exit release) covers it.
 
-- **mtime+size freshness (nb-read outline, nb-search):** same-size writes within mtime granularity can read as fresh. Accepted for read/search speed (consistent fast-path decision across both); the indexer's §A3 hash remains the authoritative rebuild check.
+- **mtime+size freshness (nb-read outline, nb-search):** same-size writes within mtime granularity can read as fresh. Accepted for read/search speed (consistent fast-path decision across both); the indexer's content hash remains the authoritative rebuild check.
 - **Spoofable synthetic lines / `│ ` prefix ambiguity:** output text identical to a placeholder/truncation-marker (or source beginning `│ `) is byte-indistinguishable from the synthetic line. Inherent without an escaping scheme that would break the compact format; SKILL.md Rule 9 warns consumers. Revisit only if an injection incident occurs.
 - **Triple-quoted-string false positives in symbol extraction:** `def`/`=` at column 0 inside docstrings index phantom symbols. Fixing requires a real parser; regex extraction is the deliberate trade-off.
 - **Symlinked directories not followed in search walks** (`followlinks=False`, except explicitly-yielded `.nb_index` symlinks): deliberate security stance against walk cycles/escapes.
-- **Colon location strings in symbols.json:** analysed 2026-06-11 — `rsplit(":", 1)` + int validation cannot mis-parse because keys always end in `.ipynb` (never `:<digits>`); documented at the construction site.
+- **Colon location strings in symbols.json:** `rsplit(":", 1)` + int validation cannot mis-parse because keys always end in `.ipynb` (never `:<digits>`); documented at the construction site.

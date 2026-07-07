@@ -1,5 +1,5 @@
 """
-Test suite for nb-index.py — derived from TDD_INDEX.md §0–§8, §13–§14.
+Test suite for nb-index.py.
 
 All tests use subprocess to invoke nb-index.py (and nb-write.py where §8 is
 concerned) as black-box CLI tools.  Tests are written tests-first against the
@@ -1648,7 +1648,7 @@ class TestWriteIntegration:
             f"got: {lines[1]!r}"
         )
 
-    # -- synchronous indexing (2026-06 concurrency batch) -------------------
+    # -- synchronous indexing ------------------------------------------------
 
     def test_sync_indexing_index_fresh_when_patch_returns(self, tmp_path):
         """Indexing is synchronous: by the time nb-write patch returns, the
@@ -1841,7 +1841,7 @@ class TestSymbolCache:
                     f"Cell index in location must be a non-negative integer, got: {index_part!r}"
                 )
 
-    # -- GC + lockfile persistence (2026-06 concurrency batch) --------------
+    # -- GC + lockfile persistence -------------------------------------------
 
     def test_symbols_gc_removes_entries_for_deleted_notebook(self, tmp_path):
         """Location entries whose notebook no longer exists on disk are dropped
@@ -2595,7 +2595,7 @@ class TestOutlineHeaderLimits:
 
 
 # ---------------------------------------------------------------------------
-# Indexing-quality fixes (2026-06 batch): worktree/submodule .git files,
+# Indexing-quality fixes: worktree/submodule .git files,
 # symbol-extraction gaps, gitignore locking, walk-boundary notes
 # ---------------------------------------------------------------------------
 

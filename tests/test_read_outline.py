@@ -1,5 +1,5 @@
 """
-Tests for nb-read.py --outline mode (TDD_INDEX.md §9).
+Tests for nb-read.py --outline mode.
 
 All tests are RED until nb-read.py implements --outline.
 

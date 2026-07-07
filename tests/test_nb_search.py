@@ -1,5 +1,5 @@
 """
-Test suite for nb-search.py — derived from TDD_INDEX.md §12.
+Test suite for nb-search.py.
 
 All tests use subprocess to invoke nb-search.py as a black-box CLI tool.
 Tests are written tests-first against the specification; they will fail
@@ -1294,7 +1294,7 @@ class TestGitRepoResolution:
 
 
 # ---------------------------------------------------------------------------
-# 2026-06-11 review fix: symbols.json freshness must see NESTED index files
+# symbols.json freshness must see NESTED index files
 # ---------------------------------------------------------------------------
 
 class TestSymbolsJsonNestedFreshness:
@@ -1335,7 +1335,7 @@ class TestSymbolsJsonNestedFreshness:
 
 
 # ---------------------------------------------------------------------------
-# 2026-06-11 fixes — staleness in symbol/import modes (Fix #1)
+# Staleness in symbol/import modes
 # ---------------------------------------------------------------------------
 
 class TestSymbolImportStaleness:

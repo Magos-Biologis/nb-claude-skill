@@ -4,8 +4,6 @@ Tests for new/fixed nb-write.py features:
   - `patch -1` error message (clear "negative index" wording)
   - PermissionError on os.replace gives a useful message
   - File locking serialises concurrent writers (POSIX only)
-
-2026-06 concurrency/data-safety batch:
   - no-op patch leaves the file byte-identical and skips the reindex
   - cell ids follow the notebook's nbformat_minor (>= 4.5 only)
   - duplicate pre-existing cell ids produce a stderr warning
