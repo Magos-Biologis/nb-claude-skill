@@ -1,5 +1,5 @@
 """
-Test suite for nb-index.py — derived from TDD §0–§8, §13–§14.
+Test suite for nb-index.py — derived from TDD_INDEX.md §0–§8, §13–§14.
 
 All tests use subprocess to invoke nb-index.py (and nb-write.py where §8 is
 concerned) as black-box CLI tools.  Tests are written tests-first against the

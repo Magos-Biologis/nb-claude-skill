@@ -250,9 +250,9 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        # Must use the canonical TDD §2.6 format: '│ ── (N output'
+        # Must use the canonical output-summary format: '│ ── (N output'
         assert "│ ── (1 output" in r.stdout, (
-            f"Expected canonical §2.6 summary '│ ── (1 output' in stdout, got:\n{r.stdout}"
+            f"Expected canonical summary '│ ── (1 output' in stdout, got:\n{r.stdout}"
         )
 
     def test_output_summary_shows_count_and_lines(self, tmp_path):
@@ -306,7 +306,7 @@ class TestOutputSummary:
         }], tmp_path)
         r = run_read([p])
         assert r.returncode == 0
-        # The TDD §2.6 format is '│ ── (N outputs, M lines) ──'
+        # The canonical format is '│ ── (N outputs, M lines) ──'
         # Check that the summary line starts with the canonical prefix
         summary_lines = [l for l in r.stdout.splitlines() if l.startswith("│ ── (")]
         assert summary_lines, (

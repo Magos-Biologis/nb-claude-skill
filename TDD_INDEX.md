@@ -1,8 +1,6 @@
 # TDD — nb-index: Persistent RAG Index for Jupyter Notebooks
 
-*Revised after three-agent adversarial audit (security · architecture · performance).*
-*See TDD_INDEX_AUDIT.md for the full finding catalogue.*
-*Gap-analysis pass applied — see TDD_INDEX_GAPS.md for the 20-item gap catalogue.*
+*Revised after three-agent adversarial audit (security · architecture · performance) and a 20-item gap-analysis pass. The finding catalogues (formerly TDD_INDEX_AUDIT.md / TDD_INDEX_GAPS.md) are fully resolved in this document; the originals live in git history.*
 
 ---
 
@@ -1333,7 +1331,8 @@ Affected sites (as of the 5523dad patch):
 On Windows, antivirus scanners transiently hold file handles on newly
 written files (CPython issue #46003). The nb-index.py atomic write
 (temp file + `os.replace`) may fail with `PermissionError` on Windows
-in this window. Since nb-index.py is fire-and-forget, a transient
+in this window. Indexing is best-effort — the notebook write in the
+caller (nb-write.py) has already succeeded — so a transient
 `PermissionError` must:
 - NOT call `_die()` (which exits 1) — the write still succeeded in
   the caller (nb-write.py); reporting a fatal error is misleading.
@@ -1371,12 +1370,10 @@ this specific handler — Python exception handling uses MRO, so the
 | Path | Changes |
 |------|---------|
 | `scripts/nb-read.py` | `--outline`, `--outputs`, exec+section in header (§9–§11); index discovery (§15) |
-| `scripts/nb-write.py` | `_NB_INDEX_SCRIPT` constant (§0.1); fire-and-forget Popen after save (§8) |
-| `SKILL.md` | Rule 0 (index first); `nb-index.py` / `nb-search.py` usage |
+| `scripts/nb-write.py` | `_NB_INDEX_SIBLING` constant (§0.1); synchronous best-effort `subprocess.run` after save (§8) |
+| `SKILL.md` | `nb-index.py` / `nb-search.py` usage |
 | `tests/test_scripts.py` | Update `[N:code]` header assertions → `[N:code:run=` (§11 breaking change) |
 | `tests/test_read_independent.py` | Same header format update as above |
-| `install.py` | Copy `nb-index.py` and `nb-search.py` to `scripts_dst`; make executable on POSIX |
-| `uninstall.py` | No functional change; ensure it does not reference removed files |
 
 ## Out of scope (v1)
 

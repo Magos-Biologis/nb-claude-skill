@@ -1,5 +1,5 @@
 """
-Tests for Windows encoding and path compatibility gaps — TDD §2.14 / §15.
+Tests for Windows encoding and path compatibility gaps — TDD_INDEX.md §15 plus the Windows compatibility patch audit.
 
 All tests correspond to issues identified in the post-audit of commit 5523dad
 (the Windows compatibility patch).  Issues:

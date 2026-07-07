@@ -154,11 +154,9 @@ Scripts are installed into a versioned cache directory under `~/.claude/plugins/
 
 ## TDD Documents
 
-`TDD.md` — spec for nb-guard.py, nb-read.py safe/outline/outputs, nb-write.py create/locking.
+`TDD_INDEX.md` — living spec for nb-index.py (§0–§14) and nb-search.py (§12–§15), with full schema, staleness algorithm, symbol extraction regexes, output pipeline, and section hierarchy. Tests cite its § numbers.
 
-`TDD_INDEX.md` — spec for nb-index.py (§0–§14) and nb-search.py (§12–§15), with full schema, staleness algorithm, symbol extraction regexes, output pipeline, and section hierarchy.
-
-`TDD_AUDIT.md` / `TDD_INDEX_AUDIT.md` / `TDD_INDEX_GAPS.md` — adversarial review findings already resolved in the TDD documents.
+Removed historical docs (in git history, up to commit e3620b6): `TDD.md` (installer-era migration plan — its still-true parts are covered by this file, `tests/BEHAVIOR_TESTS*.md`, and the tests), plus the resolved audit catalogues `TDD_AUDIT.md` / `TDD_INDEX_AUDIT.md` / `TDD_INDEX_GAPS.md`.
 
 
 ## Review findings (2026-06-10/11) — CLOSED

@@ -1,5 +1,5 @@
 """
-Test suite for nb-search.py — derived from TDD §12.
+Test suite for nb-search.py — derived from TDD_INDEX.md §12.
 
 All tests use subprocess to invoke nb-search.py as a black-box CLI tool.
 Tests are written tests-first against the specification; they will fail

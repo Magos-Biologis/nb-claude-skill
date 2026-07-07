@@ -87,7 +87,7 @@ nb-claude-skill/
 │   ├── test_nb_index.py
 │   ├── test_nb_search.py
 │   └── test_windows_compat.py
-└── TDD.md / TDD_INDEX.md        ← technical design documents
+└── TDD_INDEX.md                 ← technical design document (index + search spec)
 ```
 
 ## Running the tests
