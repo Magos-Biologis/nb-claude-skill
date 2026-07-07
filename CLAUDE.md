@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
-This repo is the **nb** Claude Code plugin — a token-efficient Jupyter notebook interface. Raw `.ipynb` files are 10–50× larger in tokens than needed; this plugin renders them compactly and enables surgical cell-level edits. It uses the Claude Code native plugin format (`claude plugin install`) and does not require a manual installer.
+This repo is the **nb** Claude Code plugin — a token-efficient Jupyter notebook interface. Raw `.ipynb` files are 10–50× larger in tokens than needed; this plugin renders them compactly and makes surgical cell-level edits. It uses the Claude Code native plugin format (`claude plugin install`) and does not require a manual installer.
 
 ## Commands
 

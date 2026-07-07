@@ -998,7 +998,7 @@ stored `max_indexed_at` field for an O(1) freshness check:
 2. Compare `symbols.json["generated_at"]` against `symbols.json["max_indexed_at"]`:
    `generated_at` must be strictly greater (i.e., `symbols.json` was built
    after all the per-notebook indices it covers).
-3. Additionally, check that no per-notebook `.json` file in the index
+3. Also check that no per-notebook `.json` file in the index
    directory has an `os.path.getmtime` newer than `generated_at`. Use a
    single `os.scandir` call on the `.nb_index/` directory — this is O(N)
    syscalls but no JSON parsing.
